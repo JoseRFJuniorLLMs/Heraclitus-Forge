@@ -1,4 +1,6 @@
-# ESPECIFICAÇÃO DE ARQUITETURA DE PRODUTO: HERACLITUS SUITE (v6.0)
+# Fabric (Conecta) ➔ Forge (Compila) ➔ Runner (Executa) ➔ HeraclitusDB (Guarda) ➔ HQLEngine (Consulta) ➔ index.html (Exibe).
+
+ESPECIFICAÇÃO DE ARQUITETURA DE PRODUTO: HERACLITUS SUITE (v6.0)
 
 **Classificação:** Documento de Engenharia de Produto & Especificação de Linha de Negócios
 

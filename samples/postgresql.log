@@ -1,0 +1,9 @@
+2026-06-26 01:20:00.001 UTC [14801] LOG:  database system is ready to accept connections
+2026-06-26 01:20:05.123 UTC [14802] FATAL:  password authentication failed for user "admin"
+2026-06-26 01:20:06.230 UTC [14803] FATAL:  password authentication failed for user "admin"
+2026-06-26 01:20:07.410 UTC [14804] FATAL:  password authentication failed for user "admin"
+2026-06-26 01:20:08.560 UTC [14805] FATAL:  password authentication failed for user "admin"
+2026-06-26 01:20:09.700 UTC [14806] FATAL:  password authentication failed for user "admin"
+2026-06-26 01:20:11.500 UTC [14808] admin@prod LOG:  connection authorized: user=admin database=prod
+2026-06-26 01:20:12.000 UTC [14808] admin@prod LOG:  statement: SELECT * FROM salaries;
+2026-06-26 01:20:13.000 UTC [14809] guest@prod ERROR:  permission denied for table salaries
