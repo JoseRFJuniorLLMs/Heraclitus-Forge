@@ -66,6 +66,30 @@ fn main() {
 
     let r = db.verify();
     println!("    verify(): {} (Fatos: {})", r.status, r.facts);
+
+    // --- 3. Zero-copy: ler 'action' do payload fbfact vs parsear JSON ---
+    let sample = runner2.process_observation(SAMPLES[1]).unwrap();
+    let fb = heraclitus::fbfact::encode(&sample);
+    let js = serde_json::to_vec(&sample).unwrap();
+    let reads = n;
+    let t2 = Instant::now();
+    let mut a1 = 0usize;
+    for _ in 0..reads {
+        a1 += heraclitus::fbfact::action(&fb).map(|s| s.len()).unwrap_or(0);
+    }
+    let dt_fb = t2.elapsed().as_secs_f64().max(1e-9);
+    let t3 = Instant::now();
+    let mut a2 = 0usize;
+    for _ in 0..reads {
+        let v: serde_json::Value = serde_json::from_slice(&js).unwrap();
+        a2 += v["fact.behavior"]["action"].as_str().map(|s| s.len()).unwrap_or(0);
+    }
+    let dt_js = t3.elapsed().as_secs_f64().max(1e-9);
+    println!("\n[3] Ler campo 'action' ({reads} leituras) — payload fbfact {}B vs JSON {}B", fb.len(), js.len());
+    println!("    fbfact zero-copy: {:.3}s ({:.0}/s)", dt_fb, reads as f64 / dt_fb);
+    println!("    JSON parse      : {:.3}s ({:.0}/s)", dt_js, reads as f64 / dt_js);
+    println!("    speedup zero-copy: {:.0}x  (chk {a1}/{a2})", dt_js / dt_fb);
+
     let _ = fs::remove_file(DB_PATH);
     let _ = fs::remove_file(format!("{DB_PATH}.anchor"));
 }

@@ -126,7 +126,7 @@ pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, 
         if start + payload_len > data.len() {
             break;
         }
-        let fact: Value = serde_json::from_slice(&data[start..start + payload_len])
+        let fact: Value = crate::fbfact::decode(&data[start..start + payload_len])
             .map_err(|e| e.to_string())?;
         pos = start + payload_len;
 

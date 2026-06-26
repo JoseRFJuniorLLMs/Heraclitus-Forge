@@ -12,7 +12,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 
-use serde_json::{Map, Value};
+use serde_json::Value;
+
+use crate::fbfact;
 
 /// Magic(4) + LSN(8) + Timestamp(8) + Confidence(4) + EvidenceHash(32) + PayloadLen(4)
 pub const HEADER_SIZE: usize = 60;
@@ -21,12 +23,10 @@ fn b3_hex(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
 
-/// Serializacao canonica do Fato SEM `fact.integrity` (evita circularidade na folha).
-/// serde_json usa `Map` ordenado por chave => bytes deterministicos em escrita e verify.
+/// Bytes canônicos do Fato SEM `fact.integrity` (folha BLAKE3). Codec binário
+/// determinístico FlatBuffers-style (zero JSON no caminho quente).
 fn core_bytes(fact: &Value) -> Vec<u8> {
-    let mut obj: Map<String, Value> = fact.as_object().cloned().unwrap_or_default();
-    obj.remove("fact.integrity");
-    serde_json::to_vec(&Value::Object(obj)).unwrap()
+    fbfact::encode_core(fact)
 }
 
 /// Avanca a cadeia Merkle rolante: root := BLAKE3(root_anterior || folha).
@@ -100,7 +100,7 @@ impl HeraclitusDB {
 
         let ts = fact["fact.time"]["system_timestamp"].as_i64().unwrap_or(0) as u64;
         let conf = fact["fact.confidence"].as_f64().unwrap_or(0.9) as f32;
-        let payload = serde_json::to_vec(fact).unwrap();
+        let payload = fbfact::encode(fact);
 
         let mut block = Vec::with_capacity(HEADER_SIZE + payload.len());
         block.extend_from_slice(b"FACT");
@@ -163,7 +163,7 @@ impl HeraclitusDB {
         if lsn != self.current_lsn + 1 {
             return Err(format!("LSN fora de ordem: esperado {}, recebido {lsn}", self.current_lsn + 1));
         }
-        let fact: Value = serde_json::from_slice(&block[HEADER_SIZE..])
+        let fact: Value = fbfact::decode(&block[HEADER_SIZE..])
             .map_err(|_| format!("payload invalido no LSN {lsn}"))?;
 
         let leaf = b3_hex(&core_bytes(&fact));
@@ -220,7 +220,7 @@ impl HeraclitusDB {
                                       message: format!("Payload truncado no LSN {lsn}") };
             }
             let payload = &data[start..start + payload_len];
-            let fact: Value = match serde_json::from_slice(payload) {
+            let fact: Value = match fbfact::decode(payload) {
                 Ok(v) => v,
                 Err(_) => return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(),
                                                 message: format!("Payload corrompido no LSN {lsn}") },
@@ -264,11 +264,12 @@ impl HeraclitusDB {
             let payload_len = u32::from_be_bytes(header[56..60].try_into().unwrap()) as usize;
             let start = pos + HEADER_SIZE;
             if lsn == target_lsn {
-                let marker = b"\"raw_observation_hash\":\"b3:";
-                let region = &data[start..start + payload_len];
-                let idx = region.windows(marker.len()).position(|w| w == marker).unwrap_or(0);
-                let off = start + idx + marker.len();
-                data[off] = if data[off] == b'1' { b'0' } else { b'1' };
+                let off = {
+                    let payload = &data[start..start + payload_len];
+                    crate::fbfact::evidence_hash_offset(payload).unwrap_or(0)
+                };
+                let abs = start + off;
+                data[abs] = if data[abs] == b'1' { b'0' } else { b'1' };
                 fs::write(&self.db_path, &data)?;
                 return Ok(true);
             }

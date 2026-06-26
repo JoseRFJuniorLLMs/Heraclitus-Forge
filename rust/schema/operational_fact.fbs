@@ -1,0 +1,48 @@
+// IDL FlatBuffers do Fato Operacional (spec Operational-Fact.md, secao 1).
+// Quando o `flatc` estiver disponivel:
+//   flatc --rust -o src/ schema/operational_fact.fbs
+// e o codec gerado substitui o `fbfact.rs` (que implementa o MESMO layout
+// determinístico zero-copy a mao, por ora, pois o flatc nao esta instalado).
+
+namespace Heraclitus.Core;
+
+enum RiskLevel : byte { Low = 0, Medium = 1, High = 2, Critical = 3 }
+
+table Identity {
+  actor_id: string;
+  actor_name: string;
+  target_id: string;
+  source_ip: string;
+}
+
+table Behavior {
+  behavior_class: string;
+  behavior_action: string;
+  risk: RiskLevel;
+}
+
+table Integrity {
+  leaf_hash: string;
+  merkle_root_anchor: string;
+  signature: string;
+}
+
+table OperationalFact {
+  fact_id: string;
+  identity: Identity;
+  system_timestamp: long;
+  log_sequence_number: ulong;
+  behavior: Behavior;
+  evidence_hash: string;
+  carimbo_tempo_legal: string;
+  lineage: [string];
+  input_source: string;
+  matched_rule: string;
+  confidence: double;
+  knowledge_version: string;
+  reasoning_version: string;
+  ontology_version: string;
+  integrity: Integrity;
+}
+
+root_type OperationalFact;

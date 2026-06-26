@@ -6,6 +6,7 @@
 //! lendo os artefatos `.hcx` ja homologados.
 
 pub mod fact;
+pub mod fbfact;
 pub mod db;
 pub mod runner;
 pub mod raft;
