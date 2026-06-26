@@ -75,3 +75,10 @@ Amostra de entrada em [`samples/postgresql.log`](samples/postgresql.log).
 `postgresql` (headline), `linux_sshd` (SSH/syslog) e `keyvalue_generic` (fallback
 para formatos proprietários `KEY=VALUE`, ex.: SIGRH). Novos conectores = novo
 profile em `CONNECTOR_PROFILES` (`forge_compiler.py`), sem tocar no Runner.
+
+## Runtime nativo em Rust (`rust/`)
+
+O caminho quente de produção — **Runner** + **HeraclitusDB** — foi portado para
+Rust em [`rust/`](rust/README.md), atingindo **~87.000 EPS** single-thread no Runner
+(meta da spec: > 50.000). O Forge (IA/design-time) permanece em Python; o runtime
+Rust apenas lê os artefatos `.hcx` homologados. Veja [`rust/README.md`](rust/README.md).

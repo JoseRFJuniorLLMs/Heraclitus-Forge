@@ -1,0 +1,30 @@
+[package]
+name = "heraclitus-forge"
+version = "0.1.0"
+edition = "2021"
+description = "Heraclitus Runner + HeraclitusDB — runtime nativo line-rate (port Rust)"
+
+[lib]
+name = "heraclitus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "connector_postgresql"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+regex = "1"
+blake3 = "1"
+uuid = { version = "1", features = ["v7"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
