@@ -20,6 +20,10 @@ path = "src/bin/bench.rs"
 name = "cluster_demo"
 path = "src/bin/cluster_demo.rs"
 
+[[bin]]
+name = "gateway"
+path = "src/bin/gateway.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,6 +31,9 @@ serde_yaml = "0.9"
 regex = "1"
 blake3 = "1"
 uuid = { version = "1", features = ["v7"] }
+# Gateway de ingestao (backend do dashboard) — stack Rust recomendada
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+axum = "0.7"
 
 [profile.release]
 opt-level = 3

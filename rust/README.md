@@ -21,6 +21,7 @@ Forge (Python, design-time)  ──>  .hcx  ──>  Runner + HeraclitusDB (Rust
 | `src/main.rs` | Conector PostgreSQL ponta a ponta (bin `connector_postgresql`). |
 | `src/bin/bench.rs` | Benchmark de EPS (bin `bench`). |
 | `src/bin/cluster_demo.rs` | Demo de cluster Raft de 3 nós (bin `cluster_demo`). |
+| `src/bin/gateway.rs` | Gateway de ingestão axum/tokio — backend REST do dashboard (bin `gateway`). |
 
 ## Pré-requisito de toolchain (Windows)
 
@@ -48,7 +49,24 @@ cargo run --release --bin bench -- 1000000
 
 # Cluster Raft de 3 nós (eleição -> replicação -> partição -> fast-sync)
 cargo run --release --bin cluster_demo
+
+# Gateway de ingestão (backend do dashboard) em http://127.0.0.1:7480
+cargo run --release --bin gateway
 ```
+
+## Gateway de ingestão (backend do dashboard)
+
+`gateway` (axum + tokio) é o backend REST que liga o dashboard ao runtime. Roda um
+stream de ingestão contínuo (Runner → HeraclitusDB) e expõe, com CORS aberto:
+
+| Rota | Resposta |
+| --- | --- |
+| `GET /facts?limit=N` | `{ "facts": [ <OperationalFact>, … ] }` (mais recentes 1º) |
+| `GET /stats` | `{ "head", "events", "lsn" }` (KPIs / badge "ao vivo") |
+| `GET /healthz` | `ok` |
+
+Escuta em `127.0.0.1:7480` (a `7475` é do HeraclitusDB de produção, que responde
+`panta rhei`). No dashboard, clique no badge e aponte para `http://127.0.0.1:7480`.
 
 ## Replicação Raft (spec §11)
 
