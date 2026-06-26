@@ -16,9 +16,9 @@ import os
 import re
 import time
 import uuid
-import hashlib
 from functools import lru_cache
 
+import blake3
 import yaml
 
 
@@ -44,12 +44,8 @@ def uuid7() -> str:
 
 
 def evidence_hash(raw_line: str) -> str:
-    """
-    Hash bruto da observacao de origem. A spec pede blake3; a stdlib so traz
-    blake2b, usado aqui como stand-in funcional (mesmo papel forense de 32 bytes).
-    """
-    digest = hashlib.blake2b(raw_line.encode("utf-8"), digest_size=32).hexdigest()
-    return f"blake2b:{digest}"
+    """Hash bruto BLAKE3 (32 bytes) da observacao de origem (spec secoes 2 e 8)."""
+    return f"b3:{blake3.blake3(raw_line.encode('utf-8')).hexdigest()}"
 
 
 @lru_cache(maxsize=512)

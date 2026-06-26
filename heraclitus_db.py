@@ -14,12 +14,18 @@ com a raiz ancorada de confianca — e essa comparacao que detecta adulteracao.
 import os
 import json
 import struct
-import hashlib
+
+import blake3
 
 # Cabecalho binario de tamanho fixo por bloco (Formato de Linha, spec secao 8):
 #   Magic(4s) + LSN(Q,8) + Timestamp(Q,8) + Confidence(f,4) + EvidenceHash(32s) + PayloadLen(I,4)
 HEADER_FORMAT = ">4sQQf32sI"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 60 bytes
+
+
+def _b3(data: bytes) -> str:
+    """Primitiva de integridade da suite: BLAKE3 (spec secoes 8 e 9)."""
+    return blake3.blake3(data).hexdigest()
 
 
 def _canon(obj: dict) -> bytes:
@@ -56,13 +62,13 @@ class HeraclitusDB:
         for i in range(0, len(leaves), 2):
             left = leaves[i]
             right = leaves[i + 1] if i + 1 < len(leaves) else leaves[i]  # duplica no impar
-            next_level.append(hashlib.sha256((left + right).encode("utf-8")).hexdigest())
+            next_level.append(_b3((left + right).encode("utf-8")))
         return self._calculate_merkle_root(next_level)
 
     @staticmethod
     def _sign(leaf_hash: str) -> str:
         """Assinatura Ed25519 simulada sobre a folha (mock determinístico)."""
-        return "ed25519:" + hashlib.sha256(("HERA-KEY:" + leaf_hash).encode()).hexdigest()[:48]
+        return "ed25519:" + _b3(b"HERA-KEY:" + leaf_hash.encode())[:48]
 
     # -- Escrita append-only ------------------------------------------------
 
@@ -75,7 +81,7 @@ class HeraclitusDB:
         # folha cobre todo o conteudo semantico sem depender do header binario
         # (cujo payload_len so e conhecido depois de anexar a integridade).
         core = _core_bytes(fact)
-        leaf_hash = hashlib.sha256(core).hexdigest()
+        leaf_hash = _b3(core)
         self.merkle_leaves.append(leaf_hash)
         self.trusted_root = self._calculate_merkle_root(self.merkle_leaves)
 
@@ -138,7 +144,7 @@ class HeraclitusDB:
                     return {"status": "VIOLATED", "message": f"Payload corrompido no LSN {lsn}"}
 
                 # Recomputa a folha a partir do disco (core sem integrity)
-                leaf_hash = hashlib.sha256(_core_bytes(fact)).hexdigest()
+                leaf_hash = _b3(_core_bytes(fact))
                 computed_leaves.append(leaf_hash)
 
                 # A folha gravada bate com o disco?
@@ -177,7 +183,7 @@ class HeraclitusDB:
                 payload = f.read(payload_len)
                 if lsn == target_lsn:
                     # Flipa 1 char hex dentro do hash de evidencia: mesmo tamanho, JSON valido
-                    marker = b"blake2b:"
+                    marker = b'"raw_observation_hash":"b3:'
                     idx = payload.find(marker)
                     if idx == -1:
                         idx = 0
