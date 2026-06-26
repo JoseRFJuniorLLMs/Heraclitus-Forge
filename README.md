@@ -1,88 +1,69 @@
 # Heraclitus-Forge
 
-Implementação de referência (simulação em Python) da **Heraclitus Suite v6.0** — a
-pipeline que transforma observações heterogêneas (logs) em **Fatos Operacionais**
-determinísticos, criptograficamente verificáveis.
+Implementação da **Heraclitus Suite v6.0** — transforma observações heterogêneas
+(logs) em **Fatos Operacionais** determinísticos e criptograficamente verificáveis.
+
+A divisão de linguagem segue a spec: o **runtime (caminho quente)** é todo **Rust**;
+o que é **Design-Time / Knowledge-Cloud** (não line-rate) fica em **Python**.
 
 ```
-Fabric (conecta) -> Forge (compila .hcx) -> Runner (executa) -> HeraclitusDB (grava)
-                                                              -> HQLEngine (consulta)
+Python (Design-Time / Cloud)            Rust (Runtime / Line-Rate)
+  Forge  ── compila .hcx ──────────────►  Runner ─► HeraclitusDB ─► HQL
+  Forge AI (Claude)                       Fabric (edge) ─► Gateway ─► Raft
+  CKE (clusteriza quarentena) ◄── quarantine.log ◄── Fabric
 ```
 
-## Módulos
+## Python — Design-Time / Cloud (o que **deve** ser Python)
 
-| Arquivo | Papel (produto da suite) |
+| Arquivo | Papel |
 | --- | --- |
-| `heraclitus_fabric.py` | **Fabric** — descobre ativos, baixa/compila o `.hcx`, sobe Runners, detecta Schema Drift, aciona o CKE. |
-| `cke.py` | **CKE** (Knowledge Cloud) — clusteriza a quarentena (Schema Drift) e gera sementes de novos conectores. |
-| `forge_ai.py` | **Forge AI** (opcional) — deriva conector via Claude (`messages.parse` + Pydantic) p/ formatos desconhecidos. |
-| `forge_compiler.py` | **Forge** — compila conhecimento em um artefato `.hcx` v6 declarativo (Design-Time). |
-| `runner_engine.py` | **Runner** — Planner (Kahn) + Reasoner (regras) + Behavior Engine (janela deslizante). |
-| `heraclitus_db.py` | **HeraclitusDB** — armazenamento append-only `.hdb` + `verify()` (cadeia Merkle). |
-| `hql_engine.py` | **HQL** — consulta pericial sobre os Fatos (gramática EBNF da spec §10). |
-| `connector_postgresql.py` | **Caso de uso 1** — conector de log do PostgreSQL, ponta a ponta. |
+| `forge_compiler.py` | **Forge** — compila o conhecimento num artefato `.hcx` v6 declarativo. O Coverage é validado pelo **runner Rust real** (bin `coverage`), não por um runner Python. |
+| `forge_ai.py` | **Forge AI** (opcional) — deriva conector de formatos desconhecidos via **Claude** (`messages.parse` + Pydantic, `claude-opus-4-8`). |
+| `cke.py` | **CKE** (Knowledge Cloud) — clusteriza a quarentena (`quarantine.log` do Fabric) e gera sementes de novos conectores. |
 
-O comportamento de cada conector vive **inteiramente** no artefato `.hcx` (DSL
-declarativa), nunca em código Python — exatamente o guardrail de segurança da spec.
-Anatomia gerada pelo Forge (spec §5):
+> Latência de IA/compilação não afeta produção; orquestrar agentes e validar schema
+> é muito mais ágil em Python — por isso o Forge **permanece** em Python (spec).
+
+## Rust — Runtime / Line-Rate (todo o caminho quente)
+
+Vive em [`rust/`](rust/README.md): **Runner** (Planner+Reasoner+Behavior), **HeraclitusDB**
+(append-only + cadeia Merkle BLAKE3 + payload **zero-copy** `fbfact`), **HQL** nativo,
+**Fabric** de borda (descoberta + Schema Drift), **Gateway** (axum/tokio) e **replicação
+Raft**. Runner ~**87k EPS**; ponta-a-ponta ~**72k EPS**. Veja [`rust/README.md`](rust/README.md).
+
+## Anatomia do `.hcx` (gerada pelo Forge, spec §5)
 
 ```
 postgresql.hcx/
-├── manifest.yaml       # metadados / governança
-├── architecture.yaml   # DAG declarativa (depends_on) p/ o Planner
-├── ontology.yaml       # core binding + confiança
-├── reasoning.yaml      # regras de inferência do Reasoner
-├── behavior.model      # assinaturas do Behavior Engine
-├── test_matrix.json    # testes de regressão sintática (Coverage)
-├── benchmarks.json     # selo metrológico (EPS, latência, coverage)
-└── signature.sig       # assinatura Ed25519 (mock)
+├── manifest.yaml      ├── reasoning.yaml     ├── benchmarks.json
+├── architecture.yaml  ├── behavior.model     └── signature.sig
+├── ontology.yaml      └── test_matrix.json
 ```
 
 ## Como rodar
 
-Requisitos: Python 3 + PyYAML + BLAKE3 (`pip install -r requirements.txt`).
-
-> A integridade forense (hash de evidência, folha e árvore Merkle) usa **BLAKE3**,
-> conforme a spec (§8 wire checksum, §9 Merkle, "aplica o hash blake3").
+Requisitos: Python 3 + PyYAML + BLAKE3 (`pip install -r requirements.txt`); Rust (MSVC
+no Windows — ver [`rust/README.md`](rust/README.md)).
 
 ```bash
-# Caso de uso 1 — conector PostgreSQL ponta a ponta (recomendado)
-python connector_postgresql.py
+# 1. Design-Time (Python): compila os conectores em registry/*.hcx
+python forge_compiler.py            # PostgreSQL (Coverage via runner Rust)
 
-# Ciclo de vida "Segunda-Feira" do Fabric (descobre + compila + ingere 3 fontes)
-python heraclitus_fabric.py
+# 2. Runtime (Rust): compila e roda o caminho quente
+cd rust && cargo build --release
+cargo run --release --bin connector_postgresql   # ingestão -> Fatos -> verify -> tamper
+cargo run --release --bin fabric                 # ciclo de borda -> quarantine.log
+cargo run --release --bin hql                    # consulta pericial HQL
+cargo run --release --bin cluster_demo           # replicação Raft (3 nós)
+cargo run --release --bin gateway                # backend REST do dashboard (:7480)
+cargo run --release --bin bench -- 1000000       # benchmark de EPS
 
-# Módulos isolados (cada um tem demo no __main__)
-python forge_compiler.py     # compila o postgresql.hcx
-python runner_engine.py      # executa o linux_sshd.hcx
-python heraclitus_db.py      # grava + verify() + detecção de adulteração
-python hql_engine.py         # consulta HQL
+# 3. Cloud (Python): o CKE evolui o conhecimento a partir da quarentena
+python cke.py rust/quarantine.log   # clusteriza -> sementes de conector p/ o Forge
 ```
 
-## Caso de uso 1 — Conector PostgreSQL
+## Conectores
 
-Lê o log textual padrão do PostgreSQL (`log_line_prefix = '%m [%p] %q%u@%d '`) e
-detecta, sem regex manual em produção:
-
-- `authentication.failure` — `FATAL: password authentication failed for user "..."`
-  → escala para `brute_force_attack` (Critical) após 5 falhas em 60s (Behavior Engine).
-- `authentication.success` — `connection authorized: user=... database=...`
-- `query.execute` — `statement: ...`
-- `authorization.failure` — `permission denied ...`
-
-Amostra de entrada em [`samples/postgresql.log`](samples/postgresql.log).
-
-## Conectores disponíveis
-
-`postgresql` (headline), `linux_sshd` (SSH/syslog) e `keyvalue_generic` (fallback
-para formatos proprietários `KEY=VALUE`, ex.: SIGRH). Novos conectores = novo
-profile em `CONNECTOR_PROFILES` (`forge_compiler.py`), sem tocar no Runner.
-
-## Runtime nativo em Rust (`rust/`)
-
-O caminho quente de produção — **Runner** + **HeraclitusDB** — foi portado para
-Rust em [`rust/`](rust/README.md), atingindo **~87.000 EPS** single-thread no Runner
-(meta da spec: > 50.000). O Forge (IA/design-time) permanece em Python; o runtime
-Rust apenas lê os artefatos `.hcx` homologados. Inclui **replicação Raft** orientada a
-LSN (eleição, `AppendEntries` com `Previous_Merkle_Root`, fast-sync) — `cluster_demo`
-mostra 3 nós convergindo após partição de rede. Veja [`rust/README.md`](rust/README.md).
+`postgresql` (headline), `linux_sshd`, `keyvalue_generic` (fallback). Formatos
+**desconhecidos** vão para a quarentena → o CKE propõe a semente → o Forge compila o
+novo `.hcx` (com `forge_ai.py` + `ANTHROPIC_API_KEY`, a derivação é feita pelo Claude).

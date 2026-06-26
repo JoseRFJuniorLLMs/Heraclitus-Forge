@@ -16,6 +16,7 @@ conector `.hcx` completo) é o passo opcional de IA em `forge_ai.py`
 """
 
 import math
+import os
 import re
 from collections import defaultdict
 
@@ -140,18 +141,25 @@ def analyze(quarantine):
 
 
 if __name__ == "__main__":
-    # Quarentena simulada: 2 formatos proprietários desconhecidos + ruído.
-    quarantine = [
-        "2026-06-26 03:11:01 UTC FORTI devid=FGT60D type=traffic srcip=10.0.0.5 action=deny",
-        "2026-06-26 03:11:02 UTC FORTI devid=FGT60D type=traffic srcip=10.0.0.9 action=deny",
-        "2026-06-26 03:11:05 UTC FORTI devid=FGT61D type=traffic srcip=10.0.0.7 action=accept",
-        "SIGRH|user=carlos|op=DELETE|tbl=beneficios|status=erro",
-        "SIGRH|user=ana|op=UPDATE|tbl=folha|status=ok",
-        "SIGRH|user=joao|op=DELETE|tbl=beneficios|status=erro",
-        "!@#$ corrupted blob 9fa8 ::: ???",
-    ]
+    import sys
 
-    print("=== Heraclitus CKE — analise da quarentena ===\n")
+    # Lê a quarentena de um arquivo (handoff do Fabric Rust: `quarantine.log`),
+    # ou usa um conjunto de demonstração se nenhum arquivo for passado.
+    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+        with open(sys.argv[1], encoding="utf-8") as f:
+            quarantine = [ln.strip() for ln in f if ln.strip()]
+        print(f"=== Heraclitus CKE — quarentena de {sys.argv[1]} ({len(quarantine)} linhas) ===\n")
+    else:
+        quarantine = [
+            "2026-06-26 03:11:01 UTC FORTI devid=FGT60D type=traffic srcip=10.0.0.5 action=deny",
+            "2026-06-26 03:11:02 UTC FORTI devid=FGT60D type=traffic srcip=10.0.0.9 action=deny",
+            "2026-06-26 03:11:05 UTC FORTI devid=FGT61D type=traffic srcip=10.0.0.7 action=accept",
+            "SIGRH|user=carlos|op=DELETE|tbl=beneficios|status=erro",
+            "SIGRH|user=ana|op=UPDATE|tbl=folha|status=ok",
+            "SIGRH|user=joao|op=DELETE|tbl=beneficios|status=erro",
+            "!@#$ corrupted blob 9fa8 ::: ???",
+        ]
+        print("=== Heraclitus CKE — quarentena de demonstracao ===\n")
     result = analyze(quarantine)
     print(f"Total: {result['total_quarantine']} | clusters: {result['num_clusters']} | "
           f"entropia: {result['entropy_bits']} bits\n")

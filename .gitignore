@@ -10,6 +10,7 @@ registry/
 *.hdb
 *.hdb.anchor
 storage.hdb*
+quarantine.log
 
 # Rust
 target/

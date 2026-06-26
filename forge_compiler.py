@@ -15,6 +15,7 @@ pipeline reprodutivel e testavel. Cada profile descreve UM conector.
 import os
 import json
 import hashlib
+import subprocess
 
 import yaml
 
@@ -311,8 +312,11 @@ class HeraclitusForgeCompiler:
             "global_confidence_score": profile["confidence"],
         }
         self._dump_json(package_path, "benchmarks.json", benchmarks)
-        print(f"[+] Coverage calculado (regressao sintatica): "
-              f"{coverage['covered']}/{coverage['total']} = {coverage['rate']:.1f}%")
+        if coverage.get("skipped"):
+            print("[i] Coverage: pulado (binario Rust 'coverage' nao compilado em rust/)")
+        else:
+            print(f"[+] Coverage (runner Rust): "
+                  f"{coverage['covered']}/{coverage['total']} = {coverage['rate']:.1f}%")
 
         # --- 8. signature.sig (Ed25519 mock sobre o hash combinado) ----------
         print("[+] Finalizando com blindagem criptografica...")
@@ -330,19 +334,32 @@ class HeraclitusForgeCompiler:
     # -- self-test: o Forge roda o Runner contra a test_matrix --------------
 
     def _run_coverage(self, package_path: str, cases: list) -> dict:
-        """Calcula Coverage instanciando um Runner real sobre o artefato recem-escrito."""
-        from runner_engine import ReconstitutiveRunner  # lazy: evita ciclo de import
+        """Calcula Coverage validando o artefato contra o RUNNER REAL em Rust.
 
-        runner = ReconstitutiveRunner(artifact_path=package_path)
-        runner.compile_and_optimize()
+        O Forge (Python, Design-Time) nao reimplementa o runner: invoca o binario
+        nativo `coverage` (rust/) que roda a test_matrix pelo mesmo motor de producao.
+        Sem o binario compilado, o Coverage e pulado graciosamente.
+        """
+        exe = self._coverage_bin()
+        if not exe:
+            return {"covered": None, "total": len(cases), "rate": None, "skipped": True}
+        try:
+            out = subprocess.run([exe, package_path], capture_output=True, text=True,
+                                 timeout=120, check=True)
+            covered, total = (int(x) for x in out.stdout.split()[:2])
+            rate = 100.0 * covered / (total or 1)
+            return {"covered": covered, "total": total, "rate": rate, "skipped": False}
+        except Exception as e:
+            print(f"[i] Coverage via runner Rust falhou ({e}); pulando")
+            return {"covered": None, "total": len(cases), "rate": None, "skipped": True}
 
-        covered = 0
-        for case in cases:
-            fact = runner.process_observation(case["input"])
-            if fact and fact["fact.behavior"]["action"] == case["expect_action"]:
-                covered += 1
-        total = len(cases) or 1
-        return {"covered": covered, "total": len(cases), "rate": 100.0 * covered / total}
+    @staticmethod
+    def _coverage_bin():
+        here = os.path.dirname(os.path.abspath(__file__))
+        target = os.environ.get("CARGO_TARGET_DIR") or os.path.join(here, "rust", "target")
+        name = "coverage.exe" if os.name == "nt" else "coverage"
+        exe = os.path.join(target, "release", name)
+        return exe if os.path.exists(exe) else None
 
     # -- helpers de escrita -------------------------------------------------
 

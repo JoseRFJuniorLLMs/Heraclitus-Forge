@@ -23,6 +23,10 @@ Forge (Python, design-time)  ──>  .hcx  ──>  Runner + HeraclitusDB (Rust
 | `src/bin/bench.rs` | Benchmark de EPS (bin `bench`). |
 | `src/bin/cluster_demo.rs` | Demo de cluster Raft de 3 nós (bin `cluster_demo`). |
 | `src/bin/gateway.rs` | Gateway de ingestão axum/tokio — backend REST do dashboard (bin `gateway`). |
+| `src/hql.rs` + `src/bin/hql.rs` | HQL nativo (parser EBNF + projeção) varrendo o `.hdb` (bin `hql`). |
+| `src/bin/probe.rs` | Probe de ingestão de ponta — socket **UDP syslog** real + Schema Drift (bin `probe`). |
+| `src/bin/fabric.rs` | **Fabric** de borda nativo — discover → deploy runners → drift → `quarantine.log` (bin `fabric`). |
+| `src/bin/coverage.rs` | Valida o `.hcx` contra o runner real; usado pelo Forge Python p/ calcular Coverage (bin `coverage`). |
 
 ## Pré-requisito de toolchain (Windows)
 
