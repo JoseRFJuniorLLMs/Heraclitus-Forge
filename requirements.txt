@@ -1,2 +1,6 @@
 pyyaml>=6.0
 blake3>=1.0
+# Opcional: forja de conector via IA (forge_ai.py). Sem isto, o Forge usa
+# os profiles estaticos e o fallback key-value. Requer tambem ANTHROPIC_API_KEY.
+anthropic>=0.40
+pydantic>=2.0

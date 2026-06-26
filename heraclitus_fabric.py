@@ -22,6 +22,7 @@ class HeraclitusFabric:
         self.db_path = db_path
         self.active_runners = {}
         self.local_db = HeraclitusDB(db_path=self.db_path)
+        self.quarantine = []  # observacoes desviadas por Schema Drift (alimentam o CKE)
 
     def discover_assets(self, subnet: str) -> List[Dict[str, Any]]:
         """1. DISCOVERY ENGINE — varre a subrede (simulado) por emissores ativos."""
@@ -63,6 +64,7 @@ class HeraclitusFabric:
 
         fact = runner.process_observation(raw_observation)
         if fact is None:
+            self.quarantine.append(raw_observation)
             print(f"[SCHEMA DRIFT] IP {asset_ip}: payload quebrou a validacao do "
                   f"artefato v{runner.manifest['version']}")
             print(f"   -> [QUARENTENA -> CKE] '{raw_observation[:60]}'")
@@ -71,6 +73,22 @@ class HeraclitusFabric:
         lsn = self.local_db.write_fact(fact)
         b = fact["fact.behavior"]
         print(f"   -> {asset_ip} | LSN {lsn} | {b['action']} | class={b['class']} | risk={b['risk_level']}")
+
+    def run_cke(self):
+        """Knowledge Cloud / CKE: clusteriza a quarentena e propoe novos conectores."""
+        if not self.quarantine:
+            print("\n[CKE] Quarentena vazia — nada a evoluir.")
+            return
+        import cke
+        print(f"\n=== [Knowledge Cloud / CKE] Analisando {len(self.quarantine)} "
+              f"observacoes em quarentena ===")
+        result = cke.analyze(self.quarantine)
+        print(f"[CKE] {result['num_clusters']} formato(s) candidato(s) "
+              f"(entropia {result['entropy_bits']} bits):")
+        for i, c in enumerate(result["clusters"], 1):
+            print(f"  [{i}] {c['count']}x ({c['coverage_pct']}%) template: {c['template']}")
+            print(f"      seed -> Forge: {c['suggested_regex'][:78]}...")
+        print("[CKE] Sementes prontas: o Forge compilaria estes em novos .hcx homologados.")
 
 
 if __name__ == "__main__":
@@ -94,6 +112,17 @@ if __name__ == "__main__":
     for _ in range(6):
         fabric.monitor_stream("10.0.4.15", pg_sample)
 
-    print("\n--- Teste de Schema Drift (fabricante mudou o formato do log) ---")
-    fabric.monitor_stream("10.0.4.12",
-                          "<13> TIME=2026-06-26 user=admin EVENT=auth_error platform_target=root")
+    print("\n--- Teste de Schema Drift (formatos desconhecidos -> quarentena) ---")
+    desconhecidos = [
+        "<13> TIME=2026-06-26 user=admin EVENT=auth_error platform_target=root",
+        "2026-06-26 03:11:01 UTC FORTI devid=FGT60D type=traffic srcip=10.0.0.5 action=deny",
+        "2026-06-26 03:11:02 UTC FORTI devid=FGT60D type=traffic srcip=10.0.0.9 action=deny",
+        "2026-06-26 03:11:05 UTC FORTI devid=FGT61D type=traffic srcip=10.0.0.7 action=accept",
+        "SIGRH|user=carlos|op=DELETE|tbl=beneficios|status=erro",
+        "SIGRH|user=ana|op=UPDATE|tbl=folha|status=ok",
+    ]
+    for ln in desconhecidos:
+        fabric.monitor_stream("10.0.4.12", ln)
+
+    # Passo 6: Learn — o CKE clusteriza a quarentena e propoe novos conectores
+    fabric.run_cke()

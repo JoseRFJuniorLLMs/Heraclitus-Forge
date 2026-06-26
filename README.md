@@ -13,7 +13,9 @@ Fabric (conecta) -> Forge (compila .hcx) -> Runner (executa) -> HeraclitusDB (gr
 
 | Arquivo | Papel (produto da suite) |
 | --- | --- |
-| `heraclitus_fabric.py` | **Fabric** — descobre ativos, baixa/compila o `.hcx`, sobe Runners, detecta Schema Drift. |
+| `heraclitus_fabric.py` | **Fabric** — descobre ativos, baixa/compila o `.hcx`, sobe Runners, detecta Schema Drift, aciona o CKE. |
+| `cke.py` | **CKE** (Knowledge Cloud) — clusteriza a quarentena (Schema Drift) e gera sementes de novos conectores. |
+| `forge_ai.py` | **Forge AI** (opcional) — deriva conector via Claude (`messages.parse` + Pydantic) p/ formatos desconhecidos. |
 | `forge_compiler.py` | **Forge** — compila conhecimento em um artefato `.hcx` v6 declarativo (Design-Time). |
 | `runner_engine.py` | **Runner** — Planner (Kahn) + Reasoner (regras) + Behavior Engine (janela deslizante). |
 | `heraclitus_db.py` | **HeraclitusDB** — armazenamento append-only `.hdb` + `verify()` (cadeia Merkle). |

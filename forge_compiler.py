@@ -222,15 +222,29 @@ class HeraclitusForgeCompiler:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-    def _resolve_profile(self, fingerprint: str) -> dict:
-        return CONNECTOR_PROFILES.get(fingerprint) or CONNECTOR_PROFILES["keyvalue_generic"]
+    def _resolve_profile(self, fingerprint: str, vendor: str = None, sample_log: str = None) -> dict:
+        # Formatos conhecidos: profile determinístico (rápido, reprodutível).
+        if fingerprint in CONNECTOR_PROFILES:
+            return CONNECTOR_PROFILES[fingerprint]
+        # Formato desconhecido: tenta o agente Claude real (forge_ai), se disponível.
+        if vendor is not None and sample_log is not None:
+            try:
+                import forge_ai
+                if forge_ai.available():
+                    print("[Forge AI] formato desconhecido -> derivando conector via Claude "
+                          "(claude-opus-4-8)...")
+                    return forge_ai.derive_profile(fingerprint, vendor, [sample_log])
+                print("[Forge AI] sem ANTHROPIC_API_KEY/anthropic -> fallback key-value generico")
+            except Exception as e:
+                print(f"[Forge AI] indisponivel ({e}) -> fallback key-value generico")
+        return CONNECTOR_PROFILES["keyvalue_generic"]
 
     def compile_knowledge(self, artifact_id: str, vendor: str, sample_log: str) -> str:
         print("=== [Heraclitus Forge] Iniciando Compilacao de Conhecimento ===")
         print(f"[*] Analisando amostra molecular do provedor: {vendor}")
         print(f"[*] Amostra: {sample_log[:80]}")
 
-        profile = self._resolve_profile(artifact_id)
+        profile = self._resolve_profile(artifact_id, vendor=vendor, sample_log=sample_log)
         print(f"[+] Agentes Ativos: Format Detector & Semantic Mapper "
               f"(profile='{artifact_id}', engine='{profile['parse']['engine']}')")
 
