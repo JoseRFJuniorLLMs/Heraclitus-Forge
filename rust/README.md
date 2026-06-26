@@ -17,8 +17,10 @@ Forge (Python, design-time)  ──>  .hcx  ──>  Runner + HeraclitusDB (Rust
 | `src/runner.rs` | Planner (Kahn) + Parser (regex/keyvalue) + Reasoner (regras `.hcx`) + Behavior Engine (janela deslizante). |
 | `src/db.rs` | Append-only `.hdb`, cadeia Merkle rolante BLAKE3 (O(1)/append), `verify()`, detecção de adulteração. |
 | `src/fact.rs` | Primitivas: UUIDv7, evidence hash BLAKE3, timestamp µs. |
+| `src/raft.rs` | Replicação Raft orientada a LSN: eleição, `AppendEntries` com `Previous_Merkle_Root`, validação do follower, fast-sync. |
 | `src/main.rs` | Conector PostgreSQL ponta a ponta (bin `connector_postgresql`). |
 | `src/bin/bench.rs` | Benchmark de EPS (bin `bench`). |
+| `src/bin/cluster_demo.rs` | Demo de cluster Raft de 3 nós (bin `cluster_demo`). |
 
 ## Pré-requisito de toolchain (Windows)
 
@@ -43,7 +45,29 @@ cargo run --release --bin connector_postgresql
 
 # Benchmark (N eventos, default 1.000.000)
 cargo run --release --bin bench -- 1000000
+
+# Cluster Raft de 3 nós (eleição -> replicação -> partição -> fast-sync)
+cargo run --release --bin cluster_demo
 ```
+
+## Replicação Raft (spec §11)
+
+Raft modificado para logs **imutáveis append-only**: a ordem global é o **LSN** e cada
+`AppendEntries` carrega o `Previous_Merkle_Root`. Um follower só aplica um bloco se
+`Last_LSN == Current_LSN − 1` **e** se a raiz da cadeia Merkle local, após recalcular,
+bater com a âncora embutida pelo líder (`db.append_replicated_block`). Inconsistência
+→ rejeição → o líder retrocede o `next_index` e faz **fast-sync** (re-stream dos blocos
+a partir do último ponto de integridade comum — o backtracking de log do Raft).
+
+`cluster_demo` exercita: eleição de líder → replicação de Fatos → **partição de rede**
+isolando um nó enquanto novos Fatos são commitados → **cura** com fast-sync. Ao final os
+3 nós convergem para o mesmo LSN e a **mesma raiz Merkle**, com `verify() == INTEG_OK`
+em todos — a garantia de alta disponibilidade da spec.
+
+> Simulação determinística dirigida por ticks (sem rede real, reproduzível). Em produção
+> os mesmos `Msg` viajam pelo Wire Protocol TCP (§8). Como o log é imutável, o follower
+> persiste no aceite (otimização da spec); eleição usa timeouts distintos — PreVote e
+> persistência de `term`/`votedFor` ficam como evolução.
 
 ## Desempenho (single-thread, release)
 

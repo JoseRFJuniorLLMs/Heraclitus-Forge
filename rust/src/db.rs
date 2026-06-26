@@ -138,6 +138,54 @@ impl HeraclitusDB {
         Ok(self.current_lsn)
     }
 
+    /// Grava localmente (lider Raft) e devolve `(lsn, raiz, bytes do bloco)` para
+    /// que o bloco seja replicado byte-a-byte aos followers.
+    pub fn commit_local(&mut self, fact: &mut Value) -> std::io::Result<(u64, String, Vec<u8>)> {
+        let block = self.build_block(fact);
+        let mut f = OpenOptions::new().append(true).open(&self.db_path)?;
+        f.write_all(&block)?;
+        fs::write(&self.anchor_path, &self.trusted_root)?;
+        Ok((self.current_lsn, self.trusted_root.clone(), block))
+    }
+
+    /// Follower Raft (spec secao 11): valida um bloco replicado e o aplica.
+    /// Confere LSN sequencial, recomputa a folha e a cadeia Merkle local e exige
+    /// que batam com a ancora embutida pelo lider antes de persistir.
+    pub fn append_replicated_block(&mut self, block: &[u8]) -> Result<u64, String> {
+        if block.len() < HEADER_SIZE || &block[..4] != b"FACT" {
+            return Err("bloco invalido".into());
+        }
+        let lsn = u64::from_be_bytes(block[4..12].try_into().unwrap());
+        let payload_len = u32::from_be_bytes(block[56..60].try_into().unwrap()) as usize;
+        if HEADER_SIZE + payload_len != block.len() {
+            return Err("tamanho de bloco inconsistente".into());
+        }
+        if lsn != self.current_lsn + 1 {
+            return Err(format!("LSN fora de ordem: esperado {}, recebido {lsn}", self.current_lsn + 1));
+        }
+        let fact: Value = serde_json::from_slice(&block[HEADER_SIZE..])
+            .map_err(|_| format!("payload invalido no LSN {lsn}"))?;
+
+        let leaf = b3_hex(&core_bytes(&fact));
+        let integ = fact.get("fact.integrity");
+        let emb_leaf = integ.and_then(|i| i.get("leaf_hash")).and_then(|v| v.as_str()).unwrap_or("");
+        if emb_leaf != leaf {
+            return Err(format!("folha divergente no LSN {lsn}"));
+        }
+        let new_root = fold_chain(&self.trusted_root, &leaf);
+        let emb_root = integ.and_then(|i| i.get("merkle_root_anchor")).and_then(|v| v.as_str()).unwrap_or("");
+        if emb_root != new_root {
+            return Err(format!("cadeia Merkle divergente no LSN {lsn}"));
+        }
+
+        let mut f = OpenOptions::new().append(true).open(&self.db_path).map_err(|e| e.to_string())?;
+        f.write_all(block).map_err(|e| e.to_string())?;
+        self.current_lsn = lsn;
+        self.trusted_root = new_root;
+        fs::write(&self.anchor_path, &self.trusted_root).ok();
+        Ok(lsn)
+    }
+
     /// `db.verify()` — reconstroi a cadeia Merkle do disco e detecta adulteracao.
     pub fn verify(&self) -> VerifyResult {
         let mut data = Vec::new();
