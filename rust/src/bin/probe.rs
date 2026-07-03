@@ -11,6 +11,9 @@
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
+use tracing::{info, warn, error};
+
 use heraclitus::db::HeraclitusDB;
 use heraclitus::runner::ReconstitutiveRunner;
 
@@ -39,20 +42,22 @@ fn strip_syslog_pri(s: &str) -> &str {
     s
 }
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
     let selftest = std::env::args().any(|a| a == "--selftest");
 
     let _ = std::fs::remove_file(DB);
     let _ = std::fs::remove_file(format!("{DB}.anchor"));
 
-    let mut runner = ReconstitutiveRunner::load(ARTIFACT).expect("artefato .hcx (rode o Forge antes)");
-    let mut db = HeraclitusDB::new(DB)?;
-    let sock = UdpSocket::bind(BIND)?;
-    sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let mut runner = ReconstitutiveRunner::load(ARTIFACT).context("artefato .hcx (rode o Forge antes)")?;
+    let mut db = HeraclitusDB::new(DB).context("Falha ao abrir db")?;
+    let sock = UdpSocket::bind(BIND).context("Falha no bind do UdpSocket")?;
+    sock.set_read_timeout(Some(Duration::from_millis(500))).context("Falha ao setar read_timeout")?;
 
-    println!("[Fabric Probe] escutando syslog UDP em {BIND}  (artefato: postgresql.hcx)");
+    info!("[Fabric Probe] escutando syslog UDP em {BIND}  (artefato: postgresql.hcx)");
     if selftest {
-        println!("[selftest] enviando {} datagramas a si mesmo...\n", SELFTEST_LINES.len());
+        info!("[selftest] enviando {} datagramas a si mesmo...", SELFTEST_LINES.len());
         std::thread::spawn(|| {
             let s = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
             for line in SELFTEST_LINES {
@@ -61,7 +66,7 @@ fn main() -> std::io::Result<()> {
             }
         });
     } else {
-        println!("Envie linhas (ex.: logger/rsyslog). Ctrl+C para sair.\n");
+        info!("Envie linhas (ex.: logger/rsyslog). Ctrl+C para sair.");
     }
 
     let mut buf = [0u8; 65536];
@@ -82,10 +87,10 @@ fn main() -> std::io::Result<()> {
                     }
                     match runner.process_observation(line) {
                         Some(mut f) => {
-                            let lsn = db.write_fact(&mut f)?;
+                            let lsn = db.write_fact(&mut f).context("Erro gravando fato")?;
                             sealed += 1;
                             let b = &f["fact.behavior"];
-                            println!(
+                            info!(
                                 "[{src}] LSN {lsn} | {:<22} | {:<18} | {}",
                                 b["action"].as_str().unwrap_or(""),
                                 b["class"].as_str().unwrap_or(""),
@@ -94,8 +99,7 @@ fn main() -> std::io::Result<()> {
                         }
                         None => {
                             quarantine += 1;
-                            println!("[{src}] [SCHEMA DRIFT -> quarentena] {}",
-                                     &line[..line.len().min(56)]);
+                            warn!("[{src}] [SCHEMA DRIFT -> quarentena] {}", &line[..line.len().min(56)]);
                         }
                     }
                 }
@@ -108,18 +112,23 @@ fn main() -> std::io::Result<()> {
                     break; // sem mais datagramas: encerra o auto-teste
                 }
                 if last_stats.elapsed() >= Duration::from_secs(10) {
-                    println!("-- stats: selados={sealed} quarentena={quarantine} --");
+                    info!("-- stats: selados={sealed} quarentena={quarantine} --");
                     last_stats = Instant::now();
                 }
             }
-            Err(e) => eprintln!("erro recv: {e}"),
+            Err(e) => error!("erro recv: {e}"),
         }
     }
 
-    println!("\n[selftest] resultado: selados={sealed} quarentena={quarantine}");
+    info!("[selftest] resultado: selados={sealed} quarentena={quarantine}");
     let ok = sealed == 7 && quarantine == 1;
-    println!("[selftest] {}", if ok { "OK (7 selados, 1 quarentena)" } else { "FALHOU" });
+    info!("[selftest] {}", if ok { "OK (7 selados, 1 quarentena)" } else { "FALHOU" });
+    
     let _ = std::fs::remove_file(DB);
     let _ = std::fs::remove_file(format!("{DB}.anchor"));
-    std::process::exit(if ok { 0 } else { 1 });
+    
+    if !ok {
+        std::process::exit(1);
+    }
+    Ok(())
 }

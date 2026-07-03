@@ -13,6 +13,7 @@
 //! + bytes UTF-8. Escalares i64/u64/f64 em 8 bytes big-endian. lineage = u32 count + N strings.
 
 use serde_json::{json, Value};
+use crate::error::HeraclitusError;
 
 const MAGIC: &[u8; 4] = b"HFB1";
 
@@ -27,28 +28,40 @@ fn put_str(b: &mut Vec<u8>, s: Option<&str>) {
         }
     }
 }
-fn get_str(d: &[u8], p: &mut usize) -> Option<String> {
-    let len = u32::from_be_bytes(d[*p..*p + 4].try_into().unwrap());
+fn get_str(d: &[u8], p: &mut usize) -> Result<Option<String>, HeraclitusError> {
+    if *p + 4 > d.len() {
+        return Err(HeraclitusError::FactEncodingError("Unexpected EOF reading string length".into()));
+    }
+    let len = u32::from_be_bytes(d[*p..*p + 4].try_into()?);
     *p += 4;
     if len == u32::MAX {
-        return None;
+        return Ok(None);
     }
     let len = len as usize;
+    if *p + len > d.len() {
+        return Err(HeraclitusError::FactEncodingError("Unexpected EOF reading string data".into()));
+    }
     let s = String::from_utf8_lossy(&d[*p..*p + len]).into_owned();
     *p += len;
-    Some(s)
+    Ok(Some(s))
 }
 /// Pula um campo string e devolve a fatia (&str) sem alocar — base do zero-copy.
-fn skip_str<'a>(d: &'a [u8], p: &mut usize) -> Option<&'a str> {
-    let len = u32::from_be_bytes(d[*p..*p + 4].try_into().unwrap());
+fn skip_str<'a>(d: &'a [u8], p: &mut usize) -> Result<Option<&'a str>, HeraclitusError> {
+    if *p + 4 > d.len() {
+        return Err(HeraclitusError::FactEncodingError("Unexpected EOF reading string length".into()));
+    }
+    let len = u32::from_be_bytes(d[*p..*p + 4].try_into()?);
     *p += 4;
     if len == u32::MAX {
-        return None;
+        return Ok(None);
     }
     let len = len as usize;
+    if *p + len > d.len() {
+        return Err(HeraclitusError::FactEncodingError("Unexpected EOF reading string data".into()));
+    }
     let s = std::str::from_utf8(&d[*p..*p + len]).unwrap_or("");
     *p += len;
-    Some(s)
+    Ok(Some(s))
 }
 
 fn sget<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
@@ -127,34 +140,43 @@ fn s(v: Option<String>) -> Value {
 }
 
 /// Reconstrói a `Value` (mesmas chaves que o Runner produz).
-pub fn decode(d: &[u8]) -> Result<Value, String> {
+pub fn decode(d: &[u8]) -> Result<Value, HeraclitusError> {
     if d.len() < 4 || &d[..4] != MAGIC {
-        return Err("payload fbfact invalido".into());
+        return Err(HeraclitusError::FactEncodingError("payload fbfact invalido".into()));
     }
     let mut p = 4usize;
-    let fact_id = get_str(d, &mut p);
-    let actor_id = get_str(d, &mut p);
-    let actor_name = get_str(d, &mut p);
-    let target_id = get_str(d, &mut p);
-    let source_ip = get_str(d, &mut p);
-    let ts = i64::from_be_bytes(d[p..p + 8].try_into().unwrap()); p += 8;
-    let lsn = u64::from_be_bytes(d[p..p + 8].try_into().unwrap()); p += 8;
-    let bclass = get_str(d, &mut p);
-    let baction = get_str(d, &mut p);
-    let brisk = get_str(d, &mut p);
-    let ev_hash = get_str(d, &mut p);
-    let carimbo = get_str(d, &mut p);
-    let nsteps = u32::from_be_bytes(d[p..p + 4].try_into().unwrap()) as usize; p += 4;
+    let fact_id = get_str(d, &mut p)?;
+    let actor_id = get_str(d, &mut p)?;
+    let actor_name = get_str(d, &mut p)?;
+    let target_id = get_str(d, &mut p)?;
+    let source_ip = get_str(d, &mut p)?;
+    
+    if p + 16 > d.len() { return Err(HeraclitusError::FactEncodingError("Unexpected EOF".into())); }
+    let ts = i64::from_be_bytes(d[p..p + 8].try_into()?); p += 8;
+    let lsn = u64::from_be_bytes(d[p..p + 8].try_into()?); p += 8;
+    
+    let bclass = get_str(d, &mut p)?;
+    let baction = get_str(d, &mut p)?;
+    let brisk = get_str(d, &mut p)?;
+    let ev_hash = get_str(d, &mut p)?;
+    let carimbo = get_str(d, &mut p)?;
+    
+    if p + 4 > d.len() { return Err(HeraclitusError::FactEncodingError("Unexpected EOF".into())); }
+    let nsteps = u32::from_be_bytes(d[p..p + 4].try_into()?) as usize; p += 4;
+    
     let mut steps = Vec::with_capacity(nsteps);
     for _ in 0..nsteps {
-        steps.push(s(get_str(d, &mut p)));
+        steps.push(s(get_str(d, &mut p)?));
     }
-    let input_source = get_str(d, &mut p);
-    let matched_rule = get_str(d, &mut p);
-    let conf = f64::from_be_bytes(d[p..p + 8].try_into().unwrap()); p += 8;
-    let kver = get_str(d, &mut p);
-    let rver = get_str(d, &mut p);
-    let over = get_str(d, &mut p);
+    let input_source = get_str(d, &mut p)?;
+    let matched_rule = get_str(d, &mut p)?;
+    
+    if p + 8 > d.len() { return Err(HeraclitusError::FactEncodingError("Unexpected EOF".into())); }
+    let conf = f64::from_be_bytes(d[p..p + 8].try_into()?); p += 8;
+    
+    let kver = get_str(d, &mut p)?;
+    let rver = get_str(d, &mut p)?;
+    let over = get_str(d, &mut p)?;
 
     let mut fact = json!({
         "fact_id": s(fact_id),
@@ -173,9 +195,9 @@ pub fn decode(d: &[u8]) -> Result<Value, String> {
 
     if p < d.len() && d[p] == 1 {
         p += 1;
-        let leaf = get_str(d, &mut p);
-        let root = get_str(d, &mut p);
-        let sig = get_str(d, &mut p);
+        let leaf = get_str(d, &mut p)?;
+        let root = get_str(d, &mut p)?;
+        let sig = get_str(d, &mut p)?;
         fact["fact.integrity"] = json!({
             "leaf_hash": s(leaf), "merkle_root_anchor": s(root), "signature": s(sig)
         });
@@ -191,10 +213,11 @@ pub fn action(d: &[u8]) -> Option<&str> {
         return None;
     }
     let mut p = 4usize;
-    for _ in 0..5 { skip_str(d, &mut p); } // fact_id + 4 de identity
+    for _ in 0..5 { skip_str(d, &mut p).ok()?; } // fact_id + 4 de identity
     p += 16; // ts + lsn
-    skip_str(d, &mut p); // behavior.class
-    skip_str(d, &mut p) // behavior.action
+    if p > d.len() { return None; }
+    skip_str(d, &mut p).ok()??; // behavior.class
+    skip_str(d, &mut p).ok()? // behavior.action
 }
 
 /// Offset (dentro do payload) do 1º byte do conteúdo de `raw_observation_hash`.
@@ -204,9 +227,11 @@ pub fn evidence_hash_offset(d: &[u8]) -> Option<usize> {
         return None;
     }
     let mut p = 4usize;
-    for _ in 0..5 { skip_str(d, &mut p); } // fact_id + 4 de identity
+    for _ in 0..5 { skip_str(d, &mut p).ok()?; } // fact_id + 4 de identity
     p += 16; // ts + lsn
-    for _ in 0..3 { skip_str(d, &mut p); } // class, action, risk
+    if p > d.len() { return None; }
+    for _ in 0..3 { skip_str(d, &mut p).ok()?; } // class, action, risk
+    if p + 4 > d.len() { return None; }
     let len = u32::from_be_bytes(d[p..p + 4].try_into().ok()?);
     p += 4;
     if len == u32::MAX || len == 0 {
@@ -221,10 +246,10 @@ pub fn target_id(d: &[u8]) -> Option<&str> {
         return None;
     }
     let mut p = 4usize;
-    skip_str(d, &mut p); // fact_id
-    skip_str(d, &mut p); // actor.id
-    skip_str(d, &mut p); // actor.name
-    skip_str(d, &mut p) // target.id
+    skip_str(d, &mut p).ok()??; // fact_id
+    skip_str(d, &mut p).ok()??; // actor.id
+    skip_str(d, &mut p).ok()??; // actor.name
+    skip_str(d, &mut p).ok()? // target.id
 }
 
 #[cfg(test)]

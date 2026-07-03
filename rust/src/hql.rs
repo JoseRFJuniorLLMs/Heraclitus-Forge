@@ -10,7 +10,6 @@
 use std::fs::File;
 use std::io::Read;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use serde_json::{Map, Value};
@@ -108,7 +107,7 @@ pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, 
 
     let cutoff = match (plan.amount, plan.unit.as_deref()) {
         (Some(a), Some(u)) => {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
+            let now = crate::fact::now_micros().unwrap_or(0);
             Some(now - a * unit_secs(u) * 1_000_000)
         }
         _ => None,
@@ -121,7 +120,8 @@ pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, 
         if &header[..4] != b"FACT" {
             break;
         }
-        let payload_len = u32::from_be_bytes(header[56..60].try_into().unwrap()) as usize;
+        let payload_len_bytes = header[56..60].try_into().unwrap_or([0; 4]);
+        let payload_len = u32::from_be_bytes(payload_len_bytes) as usize;
         let start = pos + HEADER_SIZE;
         if start + payload_len > data.len() {
             break;

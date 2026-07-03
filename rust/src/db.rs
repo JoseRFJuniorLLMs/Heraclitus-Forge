@@ -151,35 +151,37 @@ impl HeraclitusDB {
     /// Follower Raft (spec secao 11): valida um bloco replicado e o aplica.
     /// Confere LSN sequencial, recomputa a folha e a cadeia Merkle local e exige
     /// que batam com a ancora embutida pelo lider antes de persistir.
-    pub fn append_replicated_block(&mut self, block: &[u8]) -> Result<u64, String> {
+    pub fn append_replicated_block(&mut self, block: &[u8]) -> Result<u64, crate::error::HeraclitusError> {
         if block.len() < HEADER_SIZE || &block[..4] != b"FACT" {
-            return Err("bloco invalido".into());
+            return Err(crate::error::HeraclitusError::DatabaseCorruption("bloco invalido".into()));
         }
-        let lsn = u64::from_be_bytes(block[4..12].try_into().unwrap());
-        let payload_len = u32::from_be_bytes(block[56..60].try_into().unwrap()) as usize;
+        let lsn_bytes = block[4..12].try_into().map_err(|_| crate::error::HeraclitusError::DatabaseCorruption("lsn invalido".into()))?;
+        let lsn = u64::from_be_bytes(lsn_bytes);
+        let payload_len_bytes = block[56..60].try_into().map_err(|_| crate::error::HeraclitusError::DatabaseCorruption("payload_len invalido".into()))?;
+        let payload_len = u32::from_be_bytes(payload_len_bytes) as usize;
         if HEADER_SIZE + payload_len != block.len() {
-            return Err("tamanho de bloco inconsistente".into());
+            return Err(crate::error::HeraclitusError::DatabaseCorruption("tamanho de bloco inconsistente".into()));
         }
         if lsn != self.current_lsn + 1 {
-            return Err(format!("LSN fora de ordem: esperado {}, recebido {lsn}", self.current_lsn + 1));
+            return Err(crate::error::HeraclitusError::DatabaseCorruption(format!("LSN fora de ordem: esperado {}, recebido {lsn}", self.current_lsn + 1)));
         }
         let fact: Value = fbfact::decode(&block[HEADER_SIZE..])
-            .map_err(|_| format!("payload invalido no LSN {lsn}"))?;
+            .map_err(|_| crate::error::HeraclitusError::DatabaseCorruption(format!("payload invalido no LSN {lsn}")))?;
 
         let leaf = b3_hex(&core_bytes(&fact));
         let integ = fact.get("fact.integrity");
         let emb_leaf = integ.and_then(|i| i.get("leaf_hash")).and_then(|v| v.as_str()).unwrap_or("");
         if emb_leaf != leaf {
-            return Err(format!("folha divergente no LSN {lsn}"));
+            return Err(crate::error::HeraclitusError::DatabaseCorruption(format!("folha divergente no LSN {lsn}")));
         }
         let new_root = fold_chain(&self.trusted_root, &leaf);
         let emb_root = integ.and_then(|i| i.get("merkle_root_anchor")).and_then(|v| v.as_str()).unwrap_or("");
         if emb_root != new_root {
-            return Err(format!("cadeia Merkle divergente no LSN {lsn}"));
+            return Err(crate::error::HeraclitusError::DatabaseCorruption(format!("cadeia Merkle divergente no LSN {lsn}")));
         }
 
-        let mut f = OpenOptions::new().append(true).open(&self.db_path).map_err(|e| e.to_string())?;
-        f.write_all(block).map_err(|e| e.to_string())?;
+        let mut f = OpenOptions::new().append(true).open(&self.db_path).map_err(|e| crate::error::HeraclitusError::Io(e))?;
+        f.write_all(block).map_err(|e| crate::error::HeraclitusError::Io(e))?;
         self.current_lsn = lsn;
         self.trusted_root = new_root;
         fs::write(&self.anchor_path, &self.trusted_root).ok();
@@ -212,8 +214,10 @@ impl HeraclitusDB {
                 return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(),
                                       message: "Assinatura de bloco corrompida.".into() };
             }
-            let lsn = u64::from_be_bytes(header[4..12].try_into().unwrap());
-            let payload_len = u32::from_be_bytes(header[56..60].try_into().unwrap()) as usize;
+            let lsn_bytes = header[4..12].try_into().unwrap_or([0; 8]);
+            let lsn = u64::from_be_bytes(lsn_bytes);
+            let payload_len_bytes = header[56..60].try_into().unwrap_or([0; 4]);
+            let payload_len = u32::from_be_bytes(payload_len_bytes) as usize;
             let start = pos + HEADER_SIZE;
             if start + payload_len > data.len() {
                 return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(),
@@ -260,8 +264,10 @@ impl HeraclitusDB {
         let mut pos = 8usize;
         while pos + HEADER_SIZE <= data.len() {
             let header = &data[pos..pos + HEADER_SIZE];
-            let lsn = u64::from_be_bytes(header[4..12].try_into().unwrap());
-            let payload_len = u32::from_be_bytes(header[56..60].try_into().unwrap()) as usize;
+            let lsn_bytes = header[4..12].try_into().unwrap_or([0; 8]);
+            let lsn = u64::from_be_bytes(lsn_bytes);
+            let payload_len_bytes = header[56..60].try_into().unwrap_or([0; 4]);
+            let payload_len = u32::from_be_bytes(payload_len_bytes) as usize;
             let start = pos + HEADER_SIZE;
             if lsn == target_lsn {
                 let off = {

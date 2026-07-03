@@ -47,6 +47,10 @@ serde_yaml = "0.9"
 regex = "1"
 blake3 = "1"
 uuid = { version = "1", features = ["v7"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Gateway de ingestao (backend do dashboard) — stack Rust recomendada
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 axum = "0.7"

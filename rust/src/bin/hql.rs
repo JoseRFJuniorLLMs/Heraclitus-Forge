@@ -2,6 +2,9 @@
 
 use std::fs;
 
+use anyhow::{Context, Result};
+use tracing::{info, error};
+
 use heraclitus::db::HeraclitusDB;
 use heraclitus::hql;
 use heraclitus::runner::ReconstitutiveRunner;
@@ -20,15 +23,17 @@ const SAMPLES: &[&str] = &[
     "2026-06-26 01:20:13.000 UTC [14809] guest@prod ERROR:  permission denied for table salaries",
 ];
 
-fn main() {
+fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
     let _ = fs::remove_file(DB);
     let _ = fs::remove_file(format!("{DB}.anchor"));
 
-    let mut runner = ReconstitutiveRunner::load(ARTIFACT).expect("artefato .hcx (rode o Forge antes)");
-    let mut db = HeraclitusDB::new(DB).expect("abrir db");
+    let mut runner = ReconstitutiveRunner::load(ARTIFACT).context("artefato .hcx (rode o Forge antes)")?;
+    let mut db = HeraclitusDB::new(DB).context("abrir db")?;
     for s in SAMPLES {
         if let Some(mut f) = runner.process_observation(s) {
-            db.write_fact(&mut f).expect("gravar");
+            db.write_fact(&mut f).context("gravar")?;
         }
     }
 
@@ -42,18 +47,20 @@ fn main() {
         .to_string()
     });
 
-    println!("HQL> {query}\n");
+    info!("HQL> {query}");
     match hql::execute_query(DB, &query) {
         Ok(rows) => {
-            println!("[OK] Fatos extraidos: {}", rows.len());
-            println!("{}", serde_json::to_string_pretty(&rows).unwrap());
+            info!("[OK] Fatos extraidos: {}", rows.len());
+            let json_out = serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "Erro de serializacao json".into());
+            info!("{}", json_out);
         }
         Err(e) => {
-            eprintln!("[ERRO] {e}");
+            error!("[ERRO] {e}");
             std::process::exit(1);
         }
     }
 
     let _ = fs::remove_file(DB);
     let _ = fs::remove_file(format!("{DB}.anchor"));
+    Ok(())
 }

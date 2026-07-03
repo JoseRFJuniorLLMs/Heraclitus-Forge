@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 
+use anyhow::{Context, Result};
+use tracing::{info, warn, error};
+
 use heraclitus::db::HeraclitusDB;
 use heraclitus::runner::ReconstitutiveRunner;
 
@@ -50,18 +53,19 @@ fn monitor(
     quarantine: &mut Vec<String>,
     ip: &str,
     lines: &[&str],
-) {
+) -> Result<()> {
     let Some(runner) = runners.get_mut(ip) else {
-        println!("   [!] nenhum runner ativo para {ip}");
-        return;
+        warn!("nenhum runner ativo para {ip}");
+        return Ok(());
     };
     for raw in lines {
         match runner.process_observation(raw) {
             Some(mut f) => {
-                let lsn = db.write_fact(&mut f).expect("gravar");
+                let lsn = db.write_fact(&mut f).context("gravar fato falhou")?;
                 let b = &f["fact.behavior"];
-                println!(
-                    "   {ip} | LSN {lsn} | {:<24} | {:<18} | {}",
+                info!(
+                    "{} | LSN {} | {:<24} | {:<18} | {}",
+                    ip, lsn,
                     b["action"].as_str().unwrap_or(""),
                     b["class"].as_str().unwrap_or(""),
                     b["risk_level"].as_str().unwrap_or("")
@@ -69,18 +73,21 @@ fn monitor(
             }
             None => {
                 quarantine.push((*raw).to_string());
-                println!("   {ip} | [SCHEMA DRIFT -> quarentena] {}", &raw[..raw.len().min(56)]);
+                warn!("{} | [SCHEMA DRIFT -> quarentena] {}", ip, &raw[..raw.len().min(56)]);
             }
         }
     }
+    Ok(())
 }
 
-fn main() {
+fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
     let _ = fs::remove_file(DB_PATH);
     let _ = fs::remove_file(format!("{DB_PATH}.anchor"));
     let _ = fs::remove_file(QUARANTINE);
 
-    println!("=== Heraclitus Fabric (nativo) — ciclo de Segunda-Feira ===\n");
+    info!("=== Heraclitus Fabric (nativo) — ciclo de Segunda-Feira ===");
 
     let assets = [
         Asset { ip: "10.0.4.15", fingerprint: "postgresql", vendor: "PostgreSQL Cluster" },
@@ -88,55 +95,57 @@ fn main() {
     ];
 
     // 1. Discover & Deploy — 1 Runner por ativo (artefato vindo do Registry)
-    println!("[1] Discover & Deploy");
+    info!("[1] Discover & Deploy");
     let mut runners: HashMap<&'static str, ReconstitutiveRunner> = HashMap::new();
     for a in &assets {
         let art = format!("{REGISTRY}/{}.hcx", a.fingerprint);
         if !std::path::Path::new(&art).exists() {
-            println!("   [!] {} ({}): artefato ausente -> rode `python forge_compiler.py` (Design-Time)",
+            warn!("{} ({}): artefato ausente -> rode `python forge_compiler.py` (Design-Time)",
                      a.ip, a.fingerprint);
             continue;
         }
         match ReconstitutiveRunner::load(&art) {
             Ok(r) => {
-                println!("   [OK] {} -> {} ({})", a.ip, a.fingerprint, a.vendor);
+                info!("[OK] {} -> {} ({})", a.ip, a.fingerprint, a.vendor);
                 runners.insert(a.ip, r);
             }
-            Err(e) => println!("   [ERRO] {}: {e}", a.ip),
+            Err(e) => error!("[ERRO] {}: {}", a.ip, e),
         }
     }
     if runners.is_empty() {
-        eprintln!("\nNenhum runner provisionado. Compile os .hcx: `python forge_compiler.py`.");
+        error!("Nenhum runner provisionado. Compile os .hcx: `python forge_compiler.py`.");
         std::process::exit(1);
     }
 
-    let mut db = HeraclitusDB::new(DB_PATH).expect("abrir db");
+    let mut db = HeraclitusDB::new(DB_PATH).context("Falha ao abrir db")?;
     let mut quarantine: Vec<String> = Vec::new();
 
     // 2. Observe — trafego operacional do PostgreSQL (brute force)
-    println!("\n[2] Observe — trafego PostgreSQL (brute force)");
-    monitor(&mut runners, &mut db, &mut quarantine, "10.0.4.15", PG_STREAM);
+    info!("[2] Observe — trafego PostgreSQL (brute force)");
+    monitor(&mut runners, &mut db, &mut quarantine, "10.0.4.15", PG_STREAM)?;
 
     // 3. Schema Drift — formatos desconhecidos vao para a quarentena
-    println!("\n[3] Schema Drift — formatos desconhecidos");
-    monitor(&mut runners, &mut db, &mut quarantine, "10.0.4.12", DRIFT_STREAM);
+    info!("[3] Schema Drift — formatos desconhecidos");
+    monitor(&mut runners, &mut db, &mut quarantine, "10.0.4.12", DRIFT_STREAM)?;
 
     // 4. Learn — handoff para o CKE (Knowledge Cloud, Python)
-    println!("\n[4] Learn — handoff p/ o CKE (Knowledge Cloud)");
+    info!("[4] Learn — handoff p/ o CKE (Knowledge Cloud)");
     if quarantine.is_empty() {
-        println!("   quarentena vazia.");
+        info!("quarentena vazia.");
     } else {
-        let mut f = fs::File::create(QUARANTINE).expect("criar quarantine.log");
+        let mut f = fs::File::create(QUARANTINE).context("Falha ao criar quarantine.log")?;
         for q in &quarantine {
             writeln!(f, "{q}").ok();
         }
-        println!("   {} observacoes -> {QUARANTINE}", quarantine.len());
-        println!("   rode: python cke.py {QUARANTINE}   (clusteriza e gera sementes de conector)");
+        info!("{} observacoes -> {}", quarantine.len(), QUARANTINE);
+        info!("rode: python cke.py {}   (clusteriza e gera sementes de conector)", QUARANTINE);
     }
 
     // 5. Integridade
     let r = db.verify();
-    println!("\n[5] db.verify(): {} (Fatos: {})", r.status, r.facts);
+    info!("[5] db.verify(): {} (Fatos: {})", r.status, r.facts);
     let _ = fs::remove_file(DB_PATH);
     let _ = fs::remove_file(format!("{DB_PATH}.anchor"));
+
+    Ok(())
 }

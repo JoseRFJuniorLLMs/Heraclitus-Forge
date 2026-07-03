@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use axum::{
     extract::{Query, State},
     http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -29,6 +30,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
+use tracing::{info, error};
 
 use heraclitus::db::HeraclitusDB;
 use heraclitus::runner::ReconstitutiveRunner;
@@ -84,13 +86,15 @@ async fn facts(State(st): State<Arc<AppState>>, Query(q): Query<FactsQ>) -> impl
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
     let _ = std::fs::remove_file(DB_PATH);
     let _ = std::fs::remove_file(format!("{DB_PATH}.anchor"));
 
-    let runner = ReconstitutiveRunner::load(ARTIFACT).expect("artefato .hcx ausente");
-    println!("Runner carregado (plano: {})", runner.plan_str());
-    let db = HeraclitusDB::new(DB_PATH).expect("abrir db");
+    let runner = ReconstitutiveRunner::load(ARTIFACT).context("artefato .hcx ausente")?;
+    info!("Runner carregado (plano: {})", runner.plan_str());
+    let db = HeraclitusDB::new(DB_PATH).context("abrir db")?;
 
     let state = Arc::new(AppState {
         recent: Mutex::new(VecDeque::with_capacity(CAP)),
@@ -111,7 +115,9 @@ async fn main() {
                 i += 1;
                 let of = { st.runner.lock().await.process_observation(line) };
                 if let Some(mut f) = of {
-                    let _ = st.db.lock().await.write_fact(&mut f);
+                    if let Err(e) = st.db.lock().await.write_fact(&mut f) {
+                        error!("Erro ao escrever fato: {}", e);
+                    }
                     let mut rec = st.recent.lock().await;
                     rec.push_front(f);
                     while rec.len() > CAP {
@@ -129,8 +135,10 @@ async fn main() {
         .route("/facts", get(facts))
         .with_state(state);
 
-    println!("Heraclitus gateway de ingestao  ->  http://{ADDR}");
-    println!("  GET /facts?limit=N | GET /stats | GET /healthz   (CORS *)");
-    let listener = tokio::net::TcpListener::bind(ADDR).await.expect("bind");
-    axum::serve(listener, app).await.expect("serve");
+    info!("Heraclitus gateway de ingestao  ->  http://{ADDR}");
+    info!("  GET /facts?limit=N | GET /stats | GET /healthz   (CORS *)");
+    let listener = tokio::net::TcpListener::bind(ADDR).await.context("bind falhou")?;
+    axum::serve(listener, app).await.context("serve falhou")?;
+
+    Ok(())
 }

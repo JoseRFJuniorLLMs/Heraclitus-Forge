@@ -2,12 +2,13 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::HeraclitusError;
+
 /// Epoch UNIX em microssegundos (UTC) — `fact.time.system_timestamp`.
-pub fn now_micros() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64
+pub fn now_micros() -> Result<i64, HeraclitusError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_micros() as i64)
 }
 
 /// `fact.id` — UUIDv7 (time-ordered).

@@ -10,6 +10,9 @@
 use std::collections::VecDeque;
 use std::fs;
 
+use anyhow::{Context, Result};
+use tracing::{info, warn, error};
+
 use heraclitus::db::HeraclitusDB;
 use heraclitus::raft::{Msg, RaftNode};
 use heraclitus::runner::ReconstitutiveRunner;
@@ -30,16 +33,16 @@ struct Cluster {
 }
 
 impl Cluster {
-    fn new(n: usize) -> Self {
+    fn new(n: usize) -> Result<Self> {
         let mut nodes = Vec::new();
         for id in 0..n {
             let path = format!("node{id}.hdb");
             let _ = fs::remove_file(&path);
             let _ = fs::remove_file(format!("{path}.anchor"));
             let peers = (0..n).filter(|&p| p != id).collect();
-            nodes.push(RaftNode::new(id, peers, HeraclitusDB::new(&path).unwrap()));
+            nodes.push(RaftNode::new(id, peers, HeraclitusDB::new(&path).context("Erro ao criar DB")?));
         }
-        Self { nodes, queue: VecDeque::new(), partitioned: vec![false; n] }
+        Ok(Self { nodes, queue: VecDeque::new(), partitioned: vec![false; n] })
     }
 
     fn round(&mut self) {
@@ -75,20 +78,21 @@ impl Cluster {
         self.nodes.iter().position(|n| n.is_leader())
     }
 
-    fn submit(&mut self, fact: &mut serde_json::Value) {
-        let lid = self.leader_id().expect("sem lider");
-        let (lsn, root, block) = self.nodes[lid].db.commit_local(fact).unwrap();
+    fn submit(&mut self, fact: &mut serde_json::Value) -> Result<()> {
+        let lid = self.leader_id().context("sem lider")?;
+        let (lsn, root, block) = self.nodes[lid].db.commit_local(fact).context("falha no commit local")?;
         self.nodes[lid].client_commit(lsn, root, block);
+        Ok(())
     }
 
     fn report(&self, titulo: &str) {
-        println!("\n--- {titulo} ---");
+        info!("--- {titulo} ---");
         for n in &self.nodes {
             let v = n.db.verify();
             let root = n.db.trusted_root.clone();
             let root_short = if root.len() >= 12 { &root[..12] } else { &root };
             let part = if self.partitioned[n.id] { " [PARTICIONADO]" } else { "" };
-            println!(
+            info!(
                 "  node{} {:<9} term={} LSN={} root={}… verify={}{}",
                 n.id, n.role_name(), n.term, n.db.current_lsn, root_short, v.status, part
             );
@@ -96,13 +100,15 @@ impl Cluster {
     }
 }
 
-fn main() {
-    println!("{}", "#".repeat(68));
-    println!("#  HERACLITUS (Rust) — REPLICACAO RAFT (LSN + Previous_Merkle_Root)");
-    println!("{}", "#".repeat(68));
+fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
 
-    let mut runner = ReconstitutiveRunner::load(ARTIFACT).expect("carregar artefato .hcx");
-    let mut cluster = Cluster::new(3);
+    info!("{}", "#".repeat(68));
+    info!("#  HERACLITUS (Rust) — REPLICACAO RAFT (LSN + Previous_Merkle_Root)");
+    info!("{}", "#".repeat(68));
+
+    let mut runner = ReconstitutiveRunner::load(ARTIFACT).context("carregar artefato .hcx")?;
+    let mut cluster = Cluster::new(3)?;
 
     // 1. Eleicao
     let mut elected = false;
@@ -114,29 +120,32 @@ fn main() {
         }
     }
     assert!(elected, "nenhum lider eleito");
-    println!("\n[1] Eleicao: node{} eleito LIDER (term {})",
-             cluster.leader_id().unwrap(), cluster.nodes[cluster.leader_id().unwrap()].term);
+    let leader_idx = cluster.leader_id().unwrap();
+    info!("[1] Eleicao: node{} eleito LIDER (term {})",
+             leader_idx, cluster.nodes[leader_idx].term);
 
     // 2. Ingestao + replicacao normal
     for line in SAMPLES {
-        let mut f = runner.process_observation(line).unwrap();
-        cluster.submit(&mut f);
+        if let Some(mut f) = runner.process_observation(line) {
+            cluster.submit(&mut f)?;
+        }
     }
     cluster.run(8);
     cluster.report("[2] Replicacao normal (5 Fatos)");
 
     // 3. Particao: isola node2 e commita mais Fatos
-    println!("\n[3] Particao de rede: node2 isolado; lider commita mais 4 Fatos...");
+    info!("[3] Particao de rede: node2 isolado; lider commita mais 4 Fatos...");
     cluster.partitioned[2] = true;
     for i in 0..4 {
-        let mut f = runner.process_observation(SAMPLES[i % SAMPLES.len()]).unwrap();
-        cluster.submit(&mut f);
+        if let Some(mut f) = runner.process_observation(SAMPLES[i % SAMPLES.len()]) {
+            cluster.submit(&mut f)?;
+        }
     }
     cluster.run(6);
     cluster.report("[3] Durante a particao (node2 fica para tras)");
 
     // 4. Cura da particao => fast-sync
-    println!("\n[4] Particao curada: node2 entra em fast-sync (block stream)...");
+    info!("[4] Particao curada: node2 entra em fast-sync (block stream)...");
     cluster.partitioned[2] = false;
     cluster.run(12);
     cluster.report("[4] Apos fast-sync (convergencia)");
@@ -147,19 +156,23 @@ fn main() {
     let converged = roots.iter().all(|r| r == &roots[0]) && lsns.iter().all(|l| l == &lsns[0]);
     let all_ok = cluster.nodes.iter().all(|n| n.db.verify().status == "INTEG_OK");
 
-    println!("\n{}", "#".repeat(68));
+    info!("{}", "#".repeat(68));
     if converged && all_ok {
-        println!("#  CONVERGENCIA OK — todos os nos no LSN {} com raiz {}…",
+        info!("#  CONVERGENCIA OK — todos os nos no LSN {} com raiz {}…",
                  lsns[0], &roots[0][..16]);
-        println!("#  Alta disponibilidade garantida: replicas identicas e integras.");
+        info!("#  Alta disponibilidade garantida: replicas identicas e integras.");
     } else {
-        println!("#  FALHA: convergencia={converged} integridade={all_ok}");
+        error!("#  FALHA: convergencia={converged} integridade={all_ok}");
     }
-    println!("{}", "#".repeat(68));
+    info!("{}", "#".repeat(68));
 
     for id in 0..cluster.nodes.len() {
         let _ = fs::remove_file(format!("node{id}.hdb"));
         let _ = fs::remove_file(format!("node{id}.hdb.anchor"));
     }
-    std::process::exit(if converged && all_ok { 0 } else { 1 });
+    
+    if !(converged && all_ok) {
+        std::process::exit(1);
+    }
+    Ok(())
 }

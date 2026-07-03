@@ -157,24 +157,24 @@ fn yaml_to_string(v: &serde_yaml::Value) -> String {
 }
 
 impl ReconstitutiveRunner {
-    pub fn load(artifact_path: &str) -> Result<Self, String> {
+    pub fn load(artifact_path: &str) -> Result<Self, crate::error::HeraclitusError> {
         let dir = Path::new(artifact_path);
-        let read = |name: &str| -> Result<String, String> {
+        let read = |name: &str| -> Result<String, crate::error::HeraclitusError> {
             std::fs::read_to_string(dir.join(name))
-                .map_err(|_| format!("Componente do artefato ausente: {name}"))
+                .map_err(|_| crate::error::HeraclitusError::ArtifactError(format!("Componente do artefato ausente: {name}")))
         };
-        let parse_yaml = |s: &str, name: &str| -> Result<serde_yaml::Value, String> {
-            serde_yaml::from_str(s).map_err(|e| format!("YAML invalido em {name}: {e}"))
+        let parse_yaml = |s: &str, name: &str| -> Result<serde_yaml::Value, crate::error::HeraclitusError> {
+            serde_yaml::from_str(s).map_err(|e| crate::error::HeraclitusError::ArtifactError(format!("YAML invalido em {name}: {e}")))
         };
 
         let manifest: Manifest =
-            serde_yaml::from_str(&read("manifest.yaml")?).map_err(|e| e.to_string())?;
+            serde_yaml::from_str(&read("manifest.yaml")?).map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?;
         let architecture: Architecture =
-            serde_yaml::from_str(&read("architecture.yaml")?).map_err(|e| e.to_string())?;
+            serde_yaml::from_str(&read("architecture.yaml")?).map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?;
         let reasoning: Reasoning =
-            serde_yaml::from_str(&read("reasoning.yaml")?).map_err(|e| e.to_string())?;
+            serde_yaml::from_str(&read("reasoning.yaml")?).map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?;
         let behavior: BehaviorModel =
-            serde_yaml::from_str(&read("behavior.model")?).map_err(|e| e.to_string())?;
+            serde_yaml::from_str(&read("behavior.model")?).map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?;
         let ontology: Ontology =
             serde_yaml::from_str(&read("ontology.yaml")?).unwrap_or_default();
         // valida que os yaml restantes ao menos parseiam
@@ -192,7 +192,7 @@ impl ReconstitutiveRunner {
                     parse_engine = ParseEngine::Regex;
                     if let serde_yaml::Value::Mapping(m) = &node.config {
                         if let Some(p) = m.get(serde_yaml::Value::from("pattern")).and_then(|v| v.as_str()) {
-                            parse_regex = Some(Regex::new(p).map_err(|e| format!("regex parse: {e}"))?);
+                            parse_regex = Some(Regex::new(p).map_err(|e| crate::error::HeraclitusError::ArtifactError(format!("regex parse: {e}")))?);
                         }
                     }
                 }
@@ -207,7 +207,7 @@ impl ReconstitutiveRunner {
             let mut conds = Vec::new();
             for c in r.when {
                 let matches = match c.matches {
-                    Some(p) => Some(Regex::new(&p).map_err(|e| format!("regex reason: {e}"))?),
+                    Some(p) => Some(Regex::new(&p).map_err(|e| crate::error::HeraclitusError::ArtifactError(format!("regex reason: {e}")))?),
                     None => None,
                 };
                 conds.push(CompiledCond {
@@ -233,7 +233,7 @@ impl ReconstitutiveRunner {
             rules,
             signatures: behavior.signatures,
             state: HashMap::new(),
-            tpl_re: Regex::new(r"\$\{(\w+)\}").unwrap(),
+            tpl_re: Regex::new(r"\$\{(\w+)\}").map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?,
         })
     }
 
@@ -338,7 +338,7 @@ impl ReconstitutiveRunner {
 
     /// Pipeline core: observacao bruta -> Fato Operacional (None = drift/falha).
     pub fn process_observation(&mut self, raw: &str) -> Option<Json> {
-        let ts = fact::now_micros();
+        let ts = fact::now_micros().ok()?;
         let tokens = self.parse(raw)?;
         let sem = self.reason(&tokens);
 
@@ -430,17 +430,17 @@ fn conditions_match(conds: &[CompiledCond], ctx: &mut HashMap<String, String>) -
 }
 
 /// Planner — ordenacao topologica da DAG (Algoritmo de Kahn, spec secao 3).
-fn compile_execution_plan(nodes: &BTreeMap<String, DagNode>) -> Result<Vec<String>, String> {
+fn compile_execution_plan(nodes: &BTreeMap<String, DagNode>) -> Result<Vec<String>, crate::error::HeraclitusError> {
     let mut in_degree: BTreeMap<&str, usize> = nodes.keys().map(|k| (k.as_str(), 0)).collect();
     let mut adj: BTreeMap<&str, Vec<&str>> = nodes.keys().map(|k| (k.as_str(), Vec::new())).collect();
 
     for (u, spec) in nodes {
         for dep in &spec.depends_on {
             if !nodes.contains_key(dep) {
-                return Err(format!("Dependencia inexistente '{dep}' em '{u}'."));
+                return Err(crate::error::HeraclitusError::ArtifactError(format!("Dependencia inexistente '{dep}' em '{u}'.")));
             }
-            adj.get_mut(dep.as_str()).unwrap().push(u.as_str());
-            *in_degree.get_mut(u.as_str()).unwrap() += 1;
+            if let Some(n) = adj.get_mut(dep.as_str()) { n.push(u.as_str()); }
+            if let Some(n) = in_degree.get_mut(u.as_str()) { *n += 1; }
         }
     }
 
@@ -453,15 +453,16 @@ fn compile_execution_plan(nodes: &BTreeMap<String, DagNode>) -> Result<Vec<Strin
     while let Some(u) = queue.pop_front() {
         order.push(u.to_string());
         for &v in &adj[u] {
-            let e = in_degree.get_mut(v).unwrap();
-            *e -= 1;
-            if *e == 0 {
-                queue.push_back(v);
+            if let Some(e) = in_degree.get_mut(v) {
+                *e -= 1;
+                if *e == 0 {
+                    queue.push_back(v);
+                }
             }
         }
     }
     if order.len() != nodes.len() {
-        return Err("Ciclo detectado na DAG de ingestao.".into());
+        return Err(crate::error::HeraclitusError::RunnerError("Ciclo detectado na DAG de ingestao.".into()));
     }
     Ok(order)
 }

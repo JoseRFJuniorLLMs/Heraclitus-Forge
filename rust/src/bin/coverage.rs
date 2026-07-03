@@ -9,20 +9,28 @@
 
 use std::fs;
 
+use anyhow::{Context, Result};
+use tracing::error;
+
 use heraclitus::runner::ReconstitutiveRunner;
 use serde_json::Value;
 
-fn main() {
+fn main() -> Result<()> {
+    // Para logs de erro no stderr, sem quebrar o stdout usado pelo parser Python
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
+
     let art = std::env::args().nth(1).unwrap_or_default();
     if art.is_empty() {
-        eprintln!("uso: coverage <artifact_dir>");
+        error!("uso: coverage <artifact_dir>");
         std::process::exit(2);
     }
 
     let mut runner = match ReconstitutiveRunner::load(&art) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("falha ao carregar artefato: {e}");
+            error!("falha ao carregar artefato: {e}");
             std::process::exit(2);
         }
     };
@@ -43,5 +51,8 @@ fn main() {
             }
         }
     }
+    
+    // ATENÇÃO: NÃO REMOVER OU ALTERAR ESSE PRINTLN. O FORGE PYTHON DEPENDE DELE NO STDOUT.
     println!("{covered} {}", cases.len());
+    Ok(())
 }

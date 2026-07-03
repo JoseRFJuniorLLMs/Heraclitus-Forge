@@ -4,6 +4,8 @@
 //! em velocidade nativa, persistindo Fatos Operacionais no HeraclitusDB Rust.
 
 use std::fs;
+use anyhow::{Context, Result};
+use tracing::{info, warn, error};
 
 use heraclitus::db::HeraclitusDB;
 use heraclitus::runner::ReconstitutiveRunner;
@@ -12,42 +14,40 @@ const ARTIFACT: &str = "../registry/postgresql.hcx";
 const SAMPLE: &str = "../samples/postgresql.log";
 const DB_PATH: &str = "storage_rs.hdb";
 
-fn main() {
+fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
     let _ = fs::remove_file(DB_PATH);
     let _ = fs::remove_file(format!("{DB_PATH}.anchor"));
 
-    println!("{}", "#".repeat(64));
-    println!("#  HERACLITUS (Rust) - CONECTOR POSTGRESQL");
-    println!("{}", "#".repeat(64));
+    info!("{}", "#".repeat(64));
+    info!("#  HERACLITUS (Rust) - CONECTOR POSTGRESQL");
+    info!("{}", "#".repeat(64));
 
     if !std::path::Path::new(ARTIFACT).exists() {
-        eprintln!("\n[ERRO] Artefato {ARTIFACT} ausente.");
-        eprintln!("       Rode o Forge (Python) primeiro:  python forge_compiler.py");
+        error!("\n[ERRO] Artefato {ARTIFACT} ausente.");
+        error!("       Rode o Forge (Python) primeiro:  python forge_compiler.py");
         std::process::exit(1);
     }
 
-    let mut runner = match ReconstitutiveRunner::load(ARTIFACT) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[ERRO] Falha ao carregar artefato: {e}");
-            std::process::exit(1);
-        }
-    };
-    println!("\n[Runner] Artefato carregado. Plano (Kahn): {}", runner.plan_str());
+    let mut runner = ReconstitutiveRunner::load(ARTIFACT)
+        .context("Falha ao carregar artefato")?;
 
-    let mut db = HeraclitusDB::new(DB_PATH).expect("abrir db");
+    info!("[Runner] Artefato carregado. Plano (Kahn): {}", runner.plan_str());
 
-    println!("\n[Ingestao] Processando {SAMPLE}...\n");
-    let content = fs::read_to_string(SAMPLE).expect("ler sample");
+    let mut db = HeraclitusDB::new(DB_PATH).context("Falha ao abrir db")?;
+
+    info!("[Ingestao] Processando {SAMPLE}...");
+    let content = fs::read_to_string(SAMPLE).context("Falha ao ler sample")?;
     for raw in content.lines().filter(|l| !l.trim().is_empty()) {
         match runner.process_observation(raw) {
-            None => println!("  [DRIFT] linha rejeitada: {}", &raw[..raw.len().min(50)]),
+            None => warn!("[DRIFT] linha rejeitada: {}", &raw[..raw.len().min(50)]),
             Some(mut f) => {
-                let lsn = db.write_fact(&mut f).expect("gravar");
+                let lsn = db.write_fact(&mut f).context("Falha ao gravar fato")?;
                 let b = &f["fact.behavior"];
                 let actor = f["fact.identity"]["actor.name"].as_str().unwrap_or("null");
-                println!(
-                    "  LSN {lsn} | {:<24} | class={:<18} | risk={:<8} | actor={actor}",
+                info!(
+                    "LSN {lsn} | {:<24} | class={:<18} | risk={:<8} | actor={actor}",
                     b["action"].as_str().unwrap_or(""),
                     b["class"].as_str().unwrap_or(""),
                     b["risk_level"].as_str().unwrap_or(""),
@@ -56,17 +56,18 @@ fn main() {
         }
     }
 
-    println!("\n[Auditoria] db.verify()");
+    info!("[Auditoria] db.verify()");
     let r1 = db.verify();
-    println!("  inicial: {} (Fatos: {})", r1.status, r1.facts);
+    info!("  inicial: {} (Fatos: {})", r1.status, r1.facts);
 
-    println!("\n[Ataque] adulterando o ultimo LSN no disco...");
-    db.inject_malicious_tamper(db.current_lsn).expect("tamper");
+    info!("[Ataque] adulterando o ultimo LSN no disco...");
+    db.inject_malicious_tamper(db.current_lsn).context("Falha ao injetar tamper")?;
     let r2 = db.verify();
-    println!("  pos-ataque: {} ({})", r2.status, r2.message);
+    info!("  pos-ataque: {} ({})", r2.status, r2.message);
     if r2.status != "INTEG_OK" {
-        println!("  [ALERTA FORENSE] adulteracao detectada.");
+        warn!("[ALERTA FORENSE] adulteracao detectada.");
     }
 
-    println!("\n{}", "#".repeat(64));
+    info!("{}", "#".repeat(64));
+    Ok(())
 }
