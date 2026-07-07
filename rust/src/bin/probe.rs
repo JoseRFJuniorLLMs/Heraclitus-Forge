@@ -41,7 +41,33 @@ use tracing::{info, warn, error};
 use heraclitus::db::HeraclitusDB;
 use heraclitus::runner::ReconstitutiveRunner;
 
-const ARTIFACT: &str = "../registry/postgresql.hcx";
+fn resolve_latest_artifact(base: &str) -> Option<String> {
+    let dir = std::path::Path::new(base);
+    if !dir.exists() || !dir.is_dir() {
+        return None;
+    }
+    let mut highest = (0, 0, 0);
+    let mut highest_path = None;
+
+    for entry in std::fs::read_dir(dir).ok()? {
+        if let Ok(e) = entry {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('v') && name.ends_with(".hcx") {
+                let ver_str = &name[1..name.len() - 4];
+                let parts: Vec<u32> = ver_str.split('.').filter_map(|s| s.parse().ok()).collect();
+                if parts.len() == 3 {
+                    let tuple = (parts[0], parts[1], parts[2]);
+                    if tuple >= highest {
+                        highest = tuple;
+                        highest_path = Some(e.path().to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+    highest_path
+}
+
 const DB: &str = "probe.hdb";
 
 /// Porta UDP: 5514 (514 exigiria privilégio root; 5514 funciona sem admin).
@@ -81,8 +107,11 @@ fn main() -> Result<()> {
     let _ = std::fs::remove_file(DB);
     let _ = std::fs::remove_file(format!("{DB}.anchor"));
 
-    let mut runner = ReconstitutiveRunner::load(ARTIFACT)
-        .context("artefato .hcx ausente — rode: python forge_compiler.py")?;
+    let artifact_path = resolve_latest_artifact("../registry/postgresql")
+        .context("Nenhuma versao do conector postgresql encontrada no registry")?;
+
+    let mut runner = ReconstitutiveRunner::load(&artifact_path)
+        .context("Falha ao carregar artefato .hcx")?;
     let mut db = HeraclitusDB::new(DB).context("Falha ao abrir db")?;
 
     // Canal unificado: todas as fontes entregam (src_addr, log_line) aqui.

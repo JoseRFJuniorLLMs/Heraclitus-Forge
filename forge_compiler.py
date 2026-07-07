@@ -240,6 +240,24 @@ class HeraclitusForgeCompiler:
                 print(f"[Forge AI] indisponivel ({e}) -> fallback key-value generico")
         return CONNECTOR_PROFILES["keyvalue_generic"]
 
+    def _get_next_version(self, vendor_dir: str) -> str:
+        if not os.path.exists(vendor_dir):
+            return "1.0.0"
+        
+        highest = [1, 0, 0]
+        for d in os.listdir(vendor_dir):
+            if d.startswith("v") and d.endswith(".hcx"):
+                ver_str = d[1:-4]
+                try:
+                    parts = [int(x) for x in ver_str.split(".")]
+                    if len(parts) == 3 and parts > highest:
+                        highest = parts
+                except ValueError:
+                    pass
+        
+        # Increment minor version
+        return f"{highest[0]}.{highest[1] + 1}.0"
+
     def compile_knowledge(self, artifact_id: str, vendor: str, sample_log: str) -> str:
         print("=== [Heraclitus Forge] Iniciando Compilacao de Conhecimento ===")
         print(f"[*] Analisando amostra molecular do provedor: {vendor}")
@@ -249,15 +267,17 @@ class HeraclitusForgeCompiler:
         print(f"[+] Agentes Ativos: Format Detector & Semantic Mapper "
               f"(profile='{artifact_id}', engine='{profile['parse']['engine']}')")
 
-        package_path = os.path.join(self.output_dir, f"{artifact_id}.hcx")
+        vendor_dir = os.path.join(self.output_dir, artifact_id)
+        next_version = self._get_next_version(vendor_dir)
+        package_path = os.path.join(vendor_dir, f"v{next_version}.hcx")
         os.makedirs(package_path, exist_ok=True)
-        print(f"[+] Gerando anatomia do artefato: {artifact_id}.hcx")
+        print(f"[+] Gerando anatomia do artefato: {artifact_id} (versao {next_version})")
 
         # --- 1. manifest.yaml ------------------------------------------------
         manifest = {
-            "id": f"br.gov.heraclitus.pipelines.{artifact_id}-v1.0.0",
+            "id": f"br.gov.heraclitus.pipelines.{artifact_id}-v{next_version}",
             "vendor": vendor,
-            "version": "1.0.0",
+            "version": next_version,
             "schema_version": "v9",
             "domain": profile["domain"],
             "compiled_at": "2026-06-26T02:10:00Z",

@@ -145,6 +145,7 @@ pub struct ReconstitutiveRunner {
     signatures: Vec<Signature>,
     state: HashMap<(String, String), VecDeque<i64>>,
     tpl_re: Regex,
+    pub parser_signature: String,
 }
 
 fn yaml_to_string(v: &serde_yaml::Value) -> String {
@@ -222,6 +223,10 @@ impl ReconstitutiveRunner {
             rules.push(CompiledRule { id: r.id, when: conds, set: r.set });
         }
 
+        // --- read signature ---
+        let signature_file = read("signature.sig").unwrap_or_else(|_| "unsigned".to_string());
+        let parser_signature = signature_file.trim().to_string();
+
         Ok(Self {
             manifest_id: manifest.id,
             version: manifest.version,
@@ -234,6 +239,7 @@ impl ReconstitutiveRunner {
             signatures: behavior.signatures,
             state: HashMap::new(),
             tpl_re: Regex::new(r"\$\{(\w+)\}").map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?,
+            parser_signature,
         })
     }
 
@@ -361,15 +367,18 @@ impl ReconstitutiveRunner {
                 "raw_observation_hash": fact::evidence_hash(raw),
                 "carimbo_tempo_legal": "icp_brasil_serpro_tst_recibo",
             },
+            "fact.integrity": {
+                "parser_signature": self.parser_signature.clone(),
+            },
             "fact.lineage": {
                 "transformation_steps": self.execution_plan,
-                "input_source": self.manifest_id,
+                "input_source": self.manifest_id.clone(),
                 "matched_rule": sem.rule_id,
             },
             "fact.confidence": self.confidence,
-            "fact.knowledge_version": self.manifest_id,
+            "fact.knowledge_version": format!("{}@{}", self.manifest_id, self.version),
             "fact.reasoning_version": "reasoner-core-v6.0",
-            "fact.ontology_version": self.schema_version,
+            "fact.ontology_version": self.schema_version.clone(),
         }))
     }
 }

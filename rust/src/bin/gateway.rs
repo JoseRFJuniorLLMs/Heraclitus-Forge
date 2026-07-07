@@ -33,7 +33,33 @@ use heraclitus::db::HeraclitusDB;
 use heraclitus::hql;
 use heraclitus::runner::ReconstitutiveRunner;
 
-const ARTIFACT: &str = "../registry/postgresql.hcx";
+fn resolve_latest_artifact(base: &str) -> Option<String> {
+    let dir = std::path::Path::new(base);
+    if !dir.exists() || !dir.is_dir() {
+        return None;
+    }
+    let mut highest = (0, 0, 0);
+    let mut highest_path = None;
+
+    for entry in std::fs::read_dir(dir).ok()? {
+        if let Ok(e) = entry {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('v') && name.ends_with(".hcx") {
+                let ver_str = &name[1..name.len() - 4];
+                let parts: Vec<u32> = ver_str.split('.').filter_map(|s| s.parse().ok()).collect();
+                if parts.len() == 3 {
+                    let tuple = (parts[0], parts[1], parts[2]);
+                    if tuple >= highest {
+                        highest = tuple;
+                        highest_path = Some(e.path().to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+    highest_path
+}
+
 const DB_PATH: &str = "gateway.hdb";
 /// Porta distinta do HeraclitusDB de produção (7475 = "panta rhei").
 const ADDR: &str = "127.0.0.1:7480";
@@ -190,7 +216,10 @@ async fn main() -> Result<()> {
     let _ = std::fs::remove_file(DB_PATH);
     let _ = std::fs::remove_file(format!("{DB_PATH}.anchor"));
 
-    let runner = ReconstitutiveRunner::load(ARTIFACT).context("artefato .hcx ausente — rode: python forge_compiler.py")?;
+    let artifact_path = resolve_latest_artifact("../registry/postgresql")
+        .context("Nenhuma versao do conector postgresql encontrada no registry")?;
+
+    let runner = ReconstitutiveRunner::load(&artifact_path).context("artefato .hcx ausente — rode: python forge_compiler.py")?;
     info!("Runner carregado (plano: {})", runner.plan_str());
     let db = HeraclitusDB::new(DB_PATH).context("abrir db")?;
 
