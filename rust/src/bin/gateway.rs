@@ -1,18 +1,15 @@
-//! Gateway de ingestao (backend do dashboard) — axum + tokio.
+//! Gateway de ingestão (backend do dashboard) — axum + tokio.
 //!
-//! Le os Fatos do nosso runtime Rust e expoe a API REST que o dashboard
-//! (HeraclitusDB/dashboard/index.html) consome no modo Ao Vivo:
+//! Rotas:
+//!   GET  /healthz          -> "ok"
+//!   GET  /stats            -> { head, events, lsn }
+//!   GET  /facts?limit=N    -> { facts: [...] }       (N mais recentes)
+//!   GET  /query?q=...      -> { results: [...], count: N }  ← HQL nativo
+//!   POST /ingest           -> { ok, lsn, fact }  | { drift, line }
+//!   GET  /verify           -> { status, facts, root, message }
 //!
-//!   GET /facts?limit=N  -> { "facts": [ <OperationalFact>, ... ] }  (mais recentes 1º)
-//!   GET /stats          -> { "head", "lsn", "eps" }                 (badge "ao vivo")
-//!   GET /healthz        -> "ok"
-//!
-//! Uma tarefa de ingestao continua simula o stream de log do PostgreSQL: a cada
-//! ~1,2s um Fato Operacional novo e processado pelo Runner, selado no HeraclitusDB
-//! e publicado no buffer recente — entao o dashboard "respira" em tempo real.
-//!
-//! Nao toca no heraclitus-server de producao. O Forge (IA/design-time) segue em
-//! Python; aqui so roda o runtime determinístico (Runner + DB) sob tokio.
+//! A tarefa de ingestão contínua alimenta o `.hdb` a cada ~1.2s com linhas
+//! do PostgreSQL de exemplo (simula stream ao vivo para o dashboard).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,20 +21,21 @@ use axum::{
     extract::{Query, State},
     http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 
 use heraclitus::db::HeraclitusDB;
+use heraclitus::hql;
 use heraclitus::runner::ReconstitutiveRunner;
 
 const ARTIFACT: &str = "../registry/postgresql.hcx";
 const DB_PATH: &str = "gateway.hdb";
-// 7475 e do HeraclitusDB de producao (responde "panta rhei"); usamos 7480 p/ o gateway.
+/// Porta distinta do HeraclitusDB de produção (7475 = "panta rhei").
 const ADDR: &str = "127.0.0.1:7480";
 const CAP: usize = 200;
 
@@ -52,6 +50,10 @@ const SAMPLES: &[&str] = &[
     "2026-06-26 01:20:13.000 UTC [14809] guest@prod ERROR:  permission denied for table salaries",
 ];
 
+// ---------------------------------------------------------------------------
+// Estado compartilhado
+// ---------------------------------------------------------------------------
+
 struct AppState {
     recent: Mutex<VecDeque<Value>>,
     total: AtomicU64,
@@ -62,6 +64,10 @@ struct AppState {
 fn cors() -> [(axum::http::HeaderName, &'static str); 1] {
     [(ACCESS_CONTROL_ALLOW_ORIGIN, "*")]
 }
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
 
 async fn healthz() -> impl IntoResponse {
     (cors(), "ok")
@@ -85,6 +91,98 @@ async fn facts(State(st): State<Arc<AppState>>, Query(q): Query<FactsQ>) -> impl
     (cors(), Json(json!({ "facts": facts })))
 }
 
+// --- HQL: GET /query?q=FROM FACTS ... ------------------------------------
+
+#[derive(Deserialize)]
+struct HqlQ {
+    q: Option<String>,
+}
+
+/// Endpoint de consulta HQL nativo.
+///
+/// Executa `hql::execute_query` num `spawn_blocking` (I/O síncrono em arquivo)
+/// e devolve os Fatos projetados como JSON, com suporte a zero-copy, wildcards
+/// e LIMIT N conforme o parser EBNF do `hql.rs`.
+async fn query_hql(
+    State(_st): State<Arc<AppState>>,
+    Query(params): Query<HqlQ>,
+) -> impl IntoResponse {
+    let body = match params.q.filter(|s| !s.is_empty()) {
+        None => json!({
+            "error": "parâmetro 'q' obrigatório",
+            "exemplo": "GET /query?q=FROM FACTS MATCH (actor.id) EXECUTES \"*\" AGAINST \"*\" SELECT * LIMIT 10"
+        }),
+        Some(qs) => {
+            let result = tokio::task::spawn_blocking(move || hql::execute_query(DB_PATH, &qs))
+                .await
+                .unwrap_or_else(|e| Err(format!("task panic: {e}")));
+            match result {
+                Ok(rows) => {
+                    let n = rows.len();
+                    json!({ "results": rows, "count": n })
+                }
+                Err(e) => json!({ "error": e }),
+            }
+        }
+    };
+    (cors(), Json(body))
+}
+
+// --- Ingestão avulsa: POST /ingest  (corpo = 1 linha de log) --------------
+
+/// Ingere uma linha de log raw (texto puro no corpo da requisição HTTP).
+///
+/// Retorna o Fato selado se a linha casou com alguma regra do artefato,
+/// ou `{"drift": true}` se caiu em Schema Drift.
+/// Útil para integração com o Probe nativo sem partilha de memória.
+async fn ingest_line(
+    State(st): State<Arc<AppState>>,
+    body: String,
+) -> impl IntoResponse {
+    let line = body.trim().to_string();
+    let body = if line.is_empty() {
+        json!({ "error": "body vazio — envie uma linha de log no corpo da requisição" })
+    } else {
+        let of = st.runner.lock().await.process_observation(&line);
+        match of {
+            None => {
+                warn!("[POST /ingest] Schema Drift: {}", &line[..line.len().min(80)]);
+                json!({ "drift": true, "line": &line[..line.len().min(200)] })
+            }
+            Some(mut f) => {
+                match st.db.lock().await.write_fact(&mut f) {
+                    Err(e) => json!({ "error": e.to_string() }),
+                    Ok(lsn) => {
+                        let fact_copy = f.clone();
+                        let mut rec = st.recent.lock().await;
+                        rec.push_front(fact_copy);
+                        while rec.len() > CAP { rec.pop_back(); }
+                        st.total.fetch_add(1, Ordering::Relaxed);
+                        json!({ "ok": true, "lsn": lsn, "fact": f })
+                    }
+                }
+            }
+        }
+    };
+    (cors(), Json(body))
+}
+
+// --- Integridade: GET /verify ---------------------------------------------
+
+async fn verify_db(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let r = st.db.lock().await.verify();
+    (cors(), Json(json!({
+        "status":  r.status,
+        "facts":   r.facts,
+        "root":    r.root,
+        "message": r.message,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -92,7 +190,7 @@ async fn main() -> Result<()> {
     let _ = std::fs::remove_file(DB_PATH);
     let _ = std::fs::remove_file(format!("{DB_PATH}.anchor"));
 
-    let runner = ReconstitutiveRunner::load(ARTIFACT).context("artefato .hcx ausente")?;
+    let runner = ReconstitutiveRunner::load(ARTIFACT).context("artefato .hcx ausente — rode: python forge_compiler.py")?;
     info!("Runner carregado (plano: {})", runner.plan_str());
     let db = HeraclitusDB::new(DB_PATH).context("abrir db")?;
 
@@ -103,7 +201,7 @@ async fn main() -> Result<()> {
         runner: Mutex::new(runner),
     });
 
-    // Tarefa de ingestao continua (simula o stream do PostgreSQL)
+    // Tarefa de ingestão contínua (simula stream PostgreSQL)
     {
         let st = state.clone();
         tokio::spawn(async move {
@@ -117,12 +215,11 @@ async fn main() -> Result<()> {
                 if let Some(mut f) = of {
                     if let Err(e) = st.db.lock().await.write_fact(&mut f) {
                         error!("Erro ao escrever fato: {}", e);
+                        continue;
                     }
                     let mut rec = st.recent.lock().await;
                     rec.push_front(f);
-                    while rec.len() > CAP {
-                        rec.pop_back();
-                    }
+                    while rec.len() > CAP { rec.pop_back(); }
                     st.total.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -131,14 +228,17 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .route("/stats", get(stats))
-        .route("/facts", get(facts))
+        .route("/stats",   get(stats))
+        .route("/facts",   get(facts))
+        .route("/query",   get(query_hql))    // HQL nativo
+        .route("/ingest",  post(ingest_line)) // ingestão avulsa
+        .route("/verify",  get(verify_db))    // integridade física + criptográfica
         .with_state(state);
 
-    info!("Heraclitus gateway de ingestao  ->  http://{ADDR}");
-    info!("  GET /facts?limit=N | GET /stats | GET /healthz   (CORS *)");
+    info!("Heraclitus gateway  ->  http://{ADDR}");
+    info!("  GET  /facts?limit=N  GET  /stats  GET  /healthz");
+    info!("  GET  /query?q=<HQL>  POST /ingest  GET  /verify   (CORS *)");
     let listener = tokio::net::TcpListener::bind(ADDR).await.context("bind falhou")?;
     axum::serve(listener, app).await.context("serve falhou")?;
-
     Ok(())
 }
