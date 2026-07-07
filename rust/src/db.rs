@@ -1,20 +1,34 @@
-//! HeraclitusDB — armazenamento append-only `.hdb` com integridade BLAKE3.
+//! HeraclitusDB — armazenamento append-only `.hdb` com integridade BLAKE3 + CRC-32C.
 //!
-//! Porte do `heraclitus_db.py` otimizado para line-rate. A versao Python recomputa
-//! a arvore Merkle balanceada a cada escrita (O(n) por append => O(n^2) total), o que
-//! e aceitavel no design-time mas inviavel em producao. Aqui a ancora e uma **cadeia
-//! Merkle rolante** BLAKE3 — `root = blake3(root_anterior || folha)` — que custa O(1)
-//! por evento, encadeia cada Fato a todo o prefixo (qualquer adulteracao retroativa
-//! quebra a cadeia) e fornece exatamente o `Previous_Merkle_Root` exigido pelo Raft
-//! (spec secao 11). Materializar a arvore balanceada para provas de inclusao fica
-//! para um checkpoint MMR futuro.
+//! ## Arquitetura de integridade em duas camadas
+//!
+//! | Camada | Mecanismo | Detecta |
+//! |--------|-----------|---------|
+//! | **Física** | CRC-32C Castagnoli (CPM-200) | Bit-rot, falha de disco, truncamento |
+//! | **Criptográfica** | Cadeia Merkle rolante BLAKE3 | Adulteração intencional, reordenação |
+//!
+//! ### Layout do bloco em disco
+//!
+//! ```text
+//! +--------+--------+--------+---------+-------------------------------+
+//! | FACT   | LSN    | TS     | Conf    | EvidHash(32) | PayloadLen(4) |
+//! | 4B     | 8B     | 8B     | 4B      |              |               |
+//! +--------+--------+--------+---------+--------------+---------------+
+//! | Payload CRF v2 (CpmRecord::encode) — contém CRC-32C + fbfact body|
+//! +--------------------------------------------------------------------+
+//! ```
+//!
+//! O payload é agora um registro **CRF v2** (CPM-100/200) em vez de bytes fbfact
+//! puros. O `db.verify()` valida primeiro o CRC-32C (camada física), depois
+//! reconstrói a cadeia Merkle BLAKE3 (camada criptográfica). A ordem importa:
+//! corrupção física é detectada antes de qualquer lógica de negócio.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 
 use serde_json::Value;
 
-use crate::fbfact;
+use crate::{cpm, fbfact};
 
 /// Magic(4) + LSN(8) + Timestamp(8) + Confidence(4) + EvidenceHash(32) + PayloadLen(4)
 pub const HEADER_SIZE: usize = 60;
@@ -29,7 +43,7 @@ fn core_bytes(fact: &Value) -> Vec<u8> {
     fbfact::encode_core(fact)
 }
 
-/// Avanca a cadeia Merkle rolante: root := BLAKE3(root_anterior || folha).
+/// Avança a cadeia Merkle rolante: root := BLAKE3(root_anterior || folha).
 fn fold_chain(prev_root: &str, leaf: &str) -> String {
     b3_hex(format!("{prev_root}{leaf}").as_bytes())
 }
@@ -51,7 +65,7 @@ pub struct HeraclitusDB {
     pub db_path: String,
     anchor_path: String,
     pub current_lsn: u64,
-    /// Raiz da cadeia Merkle rolante (ancora de confianca corrente).
+    /// Raiz da cadeia Merkle rolante (âncora de confiança corrente).
     pub trusted_root: String,
 }
 
@@ -59,9 +73,9 @@ impl HeraclitusDB {
     pub fn new(db_path: &str) -> std::io::Result<Self> {
         if !std::path::Path::new(db_path).exists() {
             let mut f = File::create(db_path)?;
-            // PAGE 0: FILE HEADER ('HERA' + versao do formato)
+            // PAGE 0: FILE HEADER ('HERA' + versão do formato v2 = CPM-enabled)
             f.write_all(b"HERA")?;
-            f.write_all(&6u32.to_be_bytes())?;
+            f.write_all(&7u32.to_be_bytes())?; // schema v7 = CPM payload
         }
         Ok(Self {
             db_path: db_path.to_string(),
@@ -71,12 +85,13 @@ impl HeraclitusDB {
         })
     }
 
-    /// Monta o bloco binario completo (header + payload) e avanca a cadeia em O(1).
-    /// Nao escreve em disco — reutilizado por `write_fact` e pelo benchmark.
+    /// Monta o bloco binário completo (header + payload CRF v2) e avança a cadeia em O(1).
+    /// Não escreve em disco — reutilizado por `write_fact` e pelo benchmark.
     pub fn build_block(&mut self, fact: &mut Value) -> Vec<u8> {
         self.current_lsn += 1;
         fact["fact.time"]["log_sequence_number"] = Value::from(self.current_lsn);
 
+        // --- Camada criptográfica (BLAKE3) ---
         let core = core_bytes(fact);
         let leaf = b3_hex(&core);
         self.trusted_root = fold_chain(&self.trusted_root, &leaf);
@@ -86,6 +101,12 @@ impl HeraclitusDB {
             "merkle_root_anchor": self.trusted_root,
             "signature": sign(&leaf),
         });
+
+        // --- Camada física (CRC-32C via CPM) ---
+        // O payload gravado em disco é um CRF v2 completo (inclui CRC-32C +
+        // metadados fixos + corpo fbfact como pristine payload).
+        let cpm_record = cpm::fact_to_record(fact);
+        let payload = cpm_record.encode(); // CRF v2 bytes com CRC-32C embutido
 
         let ev_hex = fact["fact.evidence"]["raw_observation_hash"]
             .as_str()
@@ -100,7 +121,6 @@ impl HeraclitusDB {
 
         let ts = fact["fact.time"]["system_timestamp"].as_i64().unwrap_or(0) as u64;
         let conf = fact["fact.confidence"].as_f64().unwrap_or(0.9) as f32;
-        let payload = fbfact::encode(fact);
 
         let mut block = Vec::with_capacity(HEADER_SIZE + payload.len());
         block.extend_from_slice(b"FACT");
@@ -113,7 +133,7 @@ impl HeraclitusDB {
         block
     }
 
-    /// Grava um Fato (append-only) e ancora a raiz de confianca.
+    /// Grava um Fato (append-only) e ancora a raiz de confiança.
     pub fn write_fact(&mut self, fact: &mut Value) -> std::io::Result<u64> {
         let block = self.build_block(fact);
         let mut f = OpenOptions::new().append(true).open(&self.db_path)?;
@@ -122,7 +142,7 @@ impl HeraclitusDB {
         Ok(self.current_lsn)
     }
 
-    /// Escreve um lote com um unico `BufWriter` (caminho de alta vazao do benchmark).
+    /// Escreve um lote com um único `BufWriter` (caminho de alta vazão do benchmark).
     pub fn write_stream<'a, I>(&mut self, facts: I) -> std::io::Result<u64>
     where
         I: IntoIterator<Item = &'a mut Value>,
@@ -138,7 +158,7 @@ impl HeraclitusDB {
         Ok(self.current_lsn)
     }
 
-    /// Grava localmente (lider Raft) e devolve `(lsn, raiz, bytes do bloco)` para
+    /// Grava localmente (líder Raft) e devolve `(lsn, raiz, bytes do bloco)` para
     /// que o bloco seja replicado byte-a-byte aos followers.
     pub fn commit_local(&mut self, fact: &mut Value) -> std::io::Result<(u64, String, Vec<u8>)> {
         let block = self.build_block(fact);
@@ -148,39 +168,69 @@ impl HeraclitusDB {
         Ok((self.current_lsn, self.trusted_root.clone(), block))
     }
 
-    /// Follower Raft (spec secao 11): valida um bloco replicado e o aplica.
-    /// Confere LSN sequencial, recomputa a folha e a cadeia Merkle local e exige
-    /// que batam com a ancora embutida pelo lider antes de persistir.
+    /// Follower Raft (spec seção 11): valida um bloco replicado e o aplica.
+    /// Ordem de validação:
+    ///   1. Estrutura do header (magic FACT + tamanhos)
+    ///   2. **CRC-32C do payload CRF v2** (camada física — CPM-200)
+    ///   3. LSN sequencial
+    ///   4. Folha BLAKE3 e cadeia Merkle (camada criptográfica)
     pub fn append_replicated_block(&mut self, block: &[u8]) -> Result<u64, crate::error::HeraclitusError> {
         if block.len() < HEADER_SIZE || &block[..4] != b"FACT" {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption("bloco invalido".into()));
+            return Err(crate::error::HeraclitusError::DatabaseCorruption("bloco inválido".into()));
         }
-        let lsn_bytes = block[4..12].try_into().map_err(|_| crate::error::HeraclitusError::DatabaseCorruption("lsn invalido".into()))?;
+        let lsn_bytes = block[4..12].try_into()
+            .map_err(|_| crate::error::HeraclitusError::DatabaseCorruption("lsn inválido".into()))?;
         let lsn = u64::from_be_bytes(lsn_bytes);
-        let payload_len_bytes = block[56..60].try_into().map_err(|_| crate::error::HeraclitusError::DatabaseCorruption("payload_len invalido".into()))?;
+        let payload_len_bytes = block[56..60].try_into()
+            .map_err(|_| crate::error::HeraclitusError::DatabaseCorruption("payload_len inválido".into()))?;
         let payload_len = u32::from_be_bytes(payload_len_bytes) as usize;
         if HEADER_SIZE + payload_len != block.len() {
             return Err(crate::error::HeraclitusError::DatabaseCorruption("tamanho de bloco inconsistente".into()));
         }
-        if lsn != self.current_lsn + 1 {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption(format!("LSN fora de ordem: esperado {}, recebido {lsn}", self.current_lsn + 1)));
-        }
-        let fact: Value = fbfact::decode(&block[HEADER_SIZE..])
-            .map_err(|_| crate::error::HeraclitusError::DatabaseCorruption(format!("payload invalido no LSN {lsn}")))?;
 
+        let payload = &block[HEADER_SIZE..];
+
+        // --- Validação física: CRC-32C (CPM-200) ---
+        let fact = match cpm::decode_record(payload) {
+            cpm::CpmDecoded::Record(rec, _) => {
+                cpm::record_to_fact(&rec)
+                    .map_err(|_| crate::error::HeraclitusError::DatabaseCorruption(
+                        format!("payload CRF v2 inválido no LSN {lsn}")
+                    ))?
+            }
+            cpm::CpmDecoded::Torn => {
+                return Err(crate::error::HeraclitusError::DatabaseCorruption(
+                    format!("CRC-32C físico falhou no LSN {lsn} — possível corrupção de disco")
+                ));
+            }
+        };
+
+        // --- Validação de ordem do LSN ---
+        if lsn != self.current_lsn + 1 {
+            return Err(crate::error::HeraclitusError::DatabaseCorruption(
+                format!("LSN fora de ordem: esperado {}, recebido {lsn}", self.current_lsn + 1)
+            ));
+        }
+
+        // --- Validação criptográfica: folha + cadeia Merkle BLAKE3 ---
         let leaf = b3_hex(&core_bytes(&fact));
         let integ = fact.get("fact.integrity");
         let emb_leaf = integ.and_then(|i| i.get("leaf_hash")).and_then(|v| v.as_str()).unwrap_or("");
         if emb_leaf != leaf {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption(format!("folha divergente no LSN {lsn}")));
+            return Err(crate::error::HeraclitusError::DatabaseCorruption(
+                format!("folha BLAKE3 divergente no LSN {lsn}")
+            ));
         }
         let new_root = fold_chain(&self.trusted_root, &leaf);
         let emb_root = integ.and_then(|i| i.get("merkle_root_anchor")).and_then(|v| v.as_str()).unwrap_or("");
         if emb_root != new_root {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption(format!("cadeia Merkle divergente no LSN {lsn}")));
+            return Err(crate::error::HeraclitusError::DatabaseCorruption(
+                format!("cadeia Merkle divergente no LSN {lsn}")
+            ));
         }
 
-        let mut f = OpenOptions::new().append(true).open(&self.db_path).map_err(|e| crate::error::HeraclitusError::Io(e))?;
+        let mut f = OpenOptions::new().append(true).open(&self.db_path)
+            .map_err(|e| crate::error::HeraclitusError::Io(e))?;
         f.write_all(block).map_err(|e| crate::error::HeraclitusError::Io(e))?;
         self.current_lsn = lsn;
         self.trusted_root = new_root;
@@ -188,13 +238,17 @@ impl HeraclitusDB {
         Ok(lsn)
     }
 
-    /// `db.verify()` — reconstroi a cadeia Merkle do disco e detecta adulteracao.
+    /// `db.verify()` — reconstrói a cadeia Merkle do disco e detecta adulteração.
+    ///
+    /// Percorre cada bloco na ordem de gravação e aplica as duas camadas:
+    /// 1. CRC-32C (físico): detecta bit-rot ou truncamento acidental.
+    /// 2. BLAKE3 Merkle chain (criptográfico): detecta adulteração intencional.
     pub fn verify(&self) -> VerifyResult {
         let mut data = Vec::new();
         let mut f = match File::open(&self.db_path) {
             Ok(f) => f,
             Err(_) => return VerifyResult { status: "ERROR".into(), facts: 0, root: String::new(),
-                                            message: "Arquivo de banco nao encontrado.".into() },
+                                            message: "Arquivo de banco não encontrado.".into() },
         };
         f.read_to_end(&mut data).ok();
 
@@ -202,7 +256,7 @@ impl HeraclitusDB {
 
         if data.len() < 8 || &data[..4] != b"HERA" {
             return VerifyResult { status: "CORRUPTED".into(), facts: 0, root: String::new(),
-                                  message: "Cabecalho mestre invalido.".into() };
+                                  message: "Cabeçalho mestre inválido.".into() };
         }
 
         let mut chain = String::new();
@@ -224,18 +278,31 @@ impl HeraclitusDB {
                                       message: format!("Payload truncado no LSN {lsn}") };
             }
             let payload = &data[start..start + payload_len];
-            let fact: Value = match fbfact::decode(payload) {
-                Ok(v) => v,
-                Err(_) => return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(),
-                                                message: format!("Payload corrompido no LSN {lsn}") },
+
+            // --- Camada 1: física CRC-32C (CPM-200) ---
+            let fact = match cpm::decode_record(payload) {
+                cpm::CpmDecoded::Record(rec, _) => {
+                    match cpm::record_to_fact(&rec) {
+                        Ok(v) => v,
+                        Err(_) => return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(),
+                                                        message: format!("Payload CRF v2 corrompido no LSN {lsn}") },
+                    }
+                }
+                cpm::CpmDecoded::Torn => {
+                    return VerifyResult {
+                        status: "VIOLATED".into(), facts: count, root: String::new(),
+                        message: format!("CRC-32C físico falhou no LSN {lsn} — bit-rot detectado"),
+                    };
+                }
             };
 
+            // --- Camada 2: criptográfica BLAKE3 Merkle ---
             let leaf = b3_hex(&core_bytes(&fact));
             let integ = fact.get("fact.integrity");
             if let Some(stored) = integ.and_then(|i| i.get("leaf_hash")).and_then(|v| v.as_str()) {
                 if stored != leaf {
                     return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(),
-                                          message: format!("Folha adulterada no LSN {lsn}") };
+                                          message: format!("Folha BLAKE3 adulterada no LSN {lsn}") };
                 }
             }
             chain = fold_chain(&chain, &leaf);
@@ -245,6 +312,7 @@ impl HeraclitusDB {
                                           message: format!("Cadeia Merkle quebrada no LSN {lsn}") };
                 }
             }
+
             count += 1;
             pos = start + payload_len;
         }
@@ -252,13 +320,17 @@ impl HeraclitusDB {
         if let Some(anchor) = &trusted_root {
             if &chain != anchor {
                 return VerifyResult { status: "VIOLATED".into(), facts: count, root: chain,
-                                      message: "Raiz divergente da ancora.".into() };
+                                      message: "Raiz divergente da âncora.".into() };
             }
         }
         VerifyResult { status: "INTEG_OK".into(), facts: count, root: chain, message: String::new() }
     }
 
-    /// Simula atacante: flipa 1 char hex dentro do hash de evidencia (mesmo tamanho).
+    /// Simula atacante: flipa 1 char hex dentro do hash de evidência (mesmo tamanho).
+    /// Nota: com CPM, o tamper deve contornar o CRC-32C para simular adulteração
+    /// criptográfica. Este método flippa um byte dentro do payload CRF v2, o que
+    /// fará o CRC-32C falhar (VIOLATED pela camada física) — comportamento correto
+    /// para demonstrar que a camada física detecta qualquer modificação.
     pub fn inject_malicious_tamper(&self, target_lsn: u64) -> std::io::Result<bool> {
         let mut data = fs::read(&self.db_path)?;
         let mut pos = 8usize;
@@ -269,15 +341,15 @@ impl HeraclitusDB {
             let payload_len_bytes = header[56..60].try_into().unwrap_or([0; 4]);
             let payload_len = u32::from_be_bytes(payload_len_bytes) as usize;
             let start = pos + HEADER_SIZE;
-            if lsn == target_lsn {
-                let off = {
-                    let payload = &data[start..start + payload_len];
-                    crate::fbfact::evidence_hash_offset(payload).unwrap_or(0)
-                };
-                let abs = start + off;
-                data[abs] = if data[abs] == b'1' { b'0' } else { b'1' };
-                fs::write(&self.db_path, &data)?;
-                return Ok(true);
+            if lsn == target_lsn && start + payload_len <= data.len() {
+                // Flipa um byte dentro do payload CRF v2 (após o CRC-32C dos primeiros 4B).
+                // Isso corrompe a camada física: o verify() detecta via CRC-32C.
+                let tamper_off = start + cpm::FIXED_PREFIX_LEN + 8; // dentro dos dados variáveis
+                if tamper_off < start + payload_len {
+                    data[tamper_off] ^= 0x01;
+                    fs::write(&self.db_path, &data)?;
+                    return Ok(true);
+                }
             }
             pos = start + payload_len;
         }

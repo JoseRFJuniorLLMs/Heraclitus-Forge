@@ -8,6 +8,7 @@
 pub mod error;
 pub mod fact;
 pub mod fbfact;
+pub mod cpm;
 pub mod db;
 pub mod runner;
 pub mod raft;
