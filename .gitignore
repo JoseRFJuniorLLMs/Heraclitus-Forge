@@ -12,6 +12,12 @@ registry/
 storage.hdb*
 quarantine.log
 
+# Material de chave (Marco B) — a CHAVE PRIVADA NUNCA pode ser commitada.
+# .pub/.anchor.sig nao sao secretos mas sao regeneraveis; ficam de fora tambem.
+*.key
+*.pub
+*.anchor.sig
+
 # Rust
 target/
 rust/target/

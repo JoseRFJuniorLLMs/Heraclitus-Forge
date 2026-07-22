@@ -46,6 +46,8 @@ serde_json = "1"
 serde_yaml = "0.9"
 regex = "1"
 blake3 = "1"
+ed25519-dalek = "2"   # Marco B: assinatura real da âncora (não mais mock)
+getrandom = "0.2"     # geração da seed da chave (CSPRNG do SO)
 uuid = { version = "1", features = ["v7"] }
 anyhow = "1"
 thiserror = "2"

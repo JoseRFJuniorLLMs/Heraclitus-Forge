@@ -26,10 +26,69 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde_json::Value;
 
 use crate::raft::BASE_LSN;
 use crate::{cpm, fbfact};
+
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+fn to_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Restringe as permissões de um ficheiro de chave a 0600 (só o dono). No
+/// Windows é no-op (a ACL default do perfil já isola o utilizador); a chave
+/// **tem** de ser protegida/movida para fora da máquina em produção — sem isso
+/// a assinatura da âncora não protege contra um atacante que a leia e re-assine.
+fn restrict_key_perms(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// Carrega a chave de assinatura de `key_path` ou gera uma nova (seed do CSPRNG
+/// do SO). Persiste a chave privada (0600) e a pública ao lado — a pública é o
+/// que o `verify()` usa para conferir a assinatura da âncora.
+fn load_or_create_key(key_path: &str, pub_path: &str) -> std::io::Result<SigningKey> {
+    if let Ok(txt) = fs::read_to_string(key_path) {
+        if let Some(bytes) = from_hex(&txt) {
+            if let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                return Ok(SigningKey::from_bytes(&seed));
+            }
+        }
+        // Ficheiro de chave ilegível: falha alto em vez de gerar outra chave em
+        // silêncio (isso invalidaria a assinatura de toda a âncora existente).
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("chave de assinatura ilegível em {key_path}"),
+        ));
+    }
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("getrandom: {e}")))?;
+    let sk = SigningKey::from_bytes(&seed);
+    fs::write(key_path, to_hex(&seed))?;
+    restrict_key_perms(key_path);
+    fs::write(pub_path, to_hex(sk.verifying_key().as_bytes()))?;
+    Ok(sk)
+}
 
 /// Magic(4) + LSN(8) + Timestamp(8) + Confidence(4) + EvidenceHash(32) + PayloadLen(4)
 pub const HEADER_SIZE: usize = 60;
@@ -49,10 +108,14 @@ fn fold_chain(prev_root: &str, leaf: &str) -> String {
     b3_hex(format!("{prev_root}{leaf}").as_bytes())
 }
 
-fn sign(leaf: &str) -> String {
-    let mut data = b"HERA-KEY:".to_vec();
+/// Tag por-Fato NÃO-autoritativa (BLAKE3 da folha). A assinatura de verdade é a
+/// **ed25519 da âncora** (`<db>.anchor.sig`, conferida no `verify()`); assinar
+/// cada Fato com a chave real mataria a vazão (~87k EPS). Prefixo honesto
+/// `b3tag:` — não é uma assinatura criptográfica.
+fn leaf_tag(leaf: &str) -> String {
+    let mut data = b"HERA-LEAF:".to_vec();
     data.extend_from_slice(leaf.as_bytes());
-    format!("ed25519:{}", &b3_hex(&data)[..48])
+    format!("b3tag:{}", &b3_hex(&data)[..48])
 }
 
 pub struct VerifyResult {
@@ -134,9 +197,16 @@ where
 pub struct HeraclitusDB {
     pub db_path: String,
     anchor_path: String,
+    /// `<db>.anchor.sig` — assinatura ed25519 (hex) sobre a raiz da âncora.
+    anchor_sig_path: String,
+    /// `<db>.pub` — chave pública ed25519 (hex) para o `verify()` conferir.
+    pub_path: String,
     pub current_lsn: u64,
     /// Raiz da cadeia Merkle rolante (âncora de confiança corrente).
     pub trusted_root: String,
+    /// Chave de assinatura ed25519 (privada — nunca sai daqui; persiste em
+    /// `<db>.key` com 0600). Marco B: assina a âncora ao persisti-la.
+    signing_key: SigningKey,
 }
 
 impl HeraclitusDB {
@@ -148,11 +218,17 @@ impl HeraclitusDB {
             f.write_all(b"HERA")?;
             f.write_all(&7u32.to_be_bytes())?; // schema v7 = CPM payload
         }
+        let key_path = format!("{db_path}.key");
+        let pub_path = format!("{db_path}.pub");
+        let signing_key = load_or_create_key(&key_path, &pub_path)?;
         let mut db = Self {
             db_path: db_path.to_string(),
             anchor_path: format!("{db_path}.anchor"),
+            anchor_sig_path: format!("{db_path}.anchor.sig"),
+            pub_path,
             current_lsn: BASE_LSN,
             trusted_root: String::new(),
+            signing_key,
         };
         // RECUPERAÇÃO no reabrir: sem isto, `new()` de um `.hdb` EXISTENTE
         // repunha `current_lsn = BASE_LSN` e `trusted_root = ""`. O próximo
@@ -194,6 +270,17 @@ impl HeraclitusDB {
         Ok(())
     }
 
+    /// Persiste a âncora (raiz da cadeia) E a sua assinatura ed25519. O atacante
+    /// que reescreva o `.hdb` + `.anchor` não consegue produzir um `.anchor.sig`
+    /// válido sem a chave privada — o `verify()` deteta. (Segurança condicionada
+    /// à proteção da chave; ver `restrict_key_perms`.)
+    fn persist_anchor(&self) -> std::io::Result<()> {
+        fs::write(&self.anchor_path, &self.trusted_root)?;
+        let sig = self.signing_key.sign(self.trusted_root.as_bytes());
+        fs::write(&self.anchor_sig_path, to_hex(&sig.to_bytes()))?;
+        Ok(())
+    }
+
     /// Monta o bloco binário completo (header + payload CRF v2) e avança a cadeia em O(1).
     /// Não escreve em disco — reutilizado por `write_fact` e pelo benchmark.
     pub fn build_block(&mut self, fact: &mut Value) -> Vec<u8> {
@@ -208,7 +295,7 @@ impl HeraclitusDB {
         fact["fact.integrity"] = serde_json::json!({
             "leaf_hash": leaf,
             "merkle_root_anchor": self.trusted_root,
-            "signature": sign(&leaf),
+            "signature": leaf_tag(&leaf),
         });
 
         // --- Camada física (CRC-32C via CPM) ---
@@ -249,7 +336,7 @@ impl HeraclitusDB {
         f.write_all(&block)?;
         f.sync_all()?; // fsync ANTES do ack — durabilidade real (o bloco não pode
                        // ser dado como gravado se um corte de energia o perde).
-        fs::write(&self.anchor_path, &self.trusted_root)?;
+        self.persist_anchor()?;
         Ok(self.current_lsn)
     }
 
@@ -268,7 +355,7 @@ impl HeraclitusDB {
         // fsync do lote inteiro antes de ancorar (o `flush` do BufWriter só
         // empurra para o SO; sem `sync_all` a durabilidade não é garantida).
         w.get_ref().sync_all()?;
-        fs::write(&self.anchor_path, &self.trusted_root)?;
+        self.persist_anchor()?;
         Ok(self.current_lsn)
     }
 
@@ -279,7 +366,7 @@ impl HeraclitusDB {
         let mut f = OpenOptions::new().append(true).open(&self.db_path)?;
         f.write_all(&block)?;
         f.sync_all()?; // líder Raft: durável ANTES de replicar/ackar aos followers.
-        fs::write(&self.anchor_path, &self.trusted_root)?;
+        self.persist_anchor()?;
         Ok((self.current_lsn, self.trusted_root.clone(), block))
     }
 
@@ -350,7 +437,7 @@ impl HeraclitusDB {
         f.sync_all().map_err(|e| crate::error::HeraclitusError::Io(e))?; // follower durável antes do ack
         self.current_lsn = lsn;
         self.trusted_root = new_root;
-        fs::write(&self.anchor_path, &self.trusted_root).ok();
+        self.persist_anchor().ok();
         Ok(lsn)
     }
 
@@ -424,8 +511,47 @@ impl HeraclitusDB {
                                               message: "Raiz divergente da âncora.".into() };
                     }
                 }
+                // --- Camada 3: assinatura ed25519 da âncora (Marco B) ---
+                // Fecha o buraco "atacante reescreve .hdb + .anchor consistentes":
+                // sem a chave privada não há `.anchor.sig` válido. Se a chave
+                // pública existe, a assinatura é OBRIGATÓRIA.
+                if let Some(msg) = self.verify_anchor_signature(&chain) {
+                    return VerifyResult { status: "VIOLATED".into(), facts: count, root: chain, message: msg };
+                }
                 VerifyResult { status: "INTEG_OK".into(), facts: count, root: chain, message: String::new() }
             }
+        }
+    }
+
+    /// Confere a assinatura ed25519 da âncora (`<db>.anchor.sig`) sobre a raiz
+    /// recalculada, usando a chave pública `<db>.pub`. Devolve `Some(msg)` se
+    /// houver violação, `None` se OK (ou se o banco é intencionalmente sem
+    /// chave pública — modo legado, sem assinatura). `root` é a raiz que o
+    /// `verify()` acabou de reconstruir do disco.
+    fn verify_anchor_signature(&self, root: &str) -> Option<String> {
+        let pub_hex = match fs::read_to_string(&self.pub_path) {
+            Ok(s) => s,
+            Err(_) => return None, // sem chave pública ⇒ modo legado (Merkle-only)
+        };
+        let vk = from_hex(&pub_hex)
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .and_then(|b| VerifyingKey::from_bytes(&b).ok());
+        let vk = match vk {
+            Some(v) => v,
+            None => return Some("chave pública ed25519 ilegível".into()),
+        };
+        let sig = fs::read_to_string(&self.anchor_sig_path)
+            .ok()
+            .and_then(|s| from_hex(&s))
+            .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
+            .map(|b| Signature::from_bytes(&b));
+        let sig = match sig {
+            Some(s) => s,
+            None => return Some("assinatura da âncora ausente ou ilegível".into()),
+        };
+        match vk.verify(root.as_bytes(), &sig) {
+            Ok(()) => None,
+            Err(_) => Some("assinatura ed25519 da âncora inválida — adulteração".into()),
         }
     }
 
@@ -464,6 +590,19 @@ impl HeraclitusDB {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CTR: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_path(tag: &str) -> String {
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("forge_{}_{}_{}.hdb", tag, std::process::id(), n));
+        let s = p.to_str().unwrap().to_string();
+        for ext in ["", ".anchor", ".anchor.sig", ".key", ".pub"] {
+            let _ = fs::remove_file(format!("{s}{ext}"));
+        }
+        s
+    }
 
     fn fact(action: &str) -> Value {
         json!({
@@ -512,5 +651,57 @@ mod tests {
         }
         let _ = fs::remove_file(p);
         let _ = fs::remove_file(format!("{p}.anchor"));
+    }
+
+    /// Marco B: uma assinatura de âncora corrompida é rejeitada — a integridade
+    /// cripto (camada 3) é imposta, não decorativa.
+    #[test]
+    fn tampered_anchor_signature_is_rejected() {
+        let p = tmp_path("sigtamper");
+        {
+            let mut db = HeraclitusDB::new(&p).unwrap();
+            for i in 0..2 {
+                db.write_fact(&mut fact(&format!("a{i}"))).unwrap();
+            }
+            assert_eq!(db.verify().status, "INTEG_OK");
+        }
+        // Sobrescreve a assinatura com uma de tamanho válido mas errada.
+        fs::write(format!("{p}.anchor.sig"), "0".repeat(128)).unwrap();
+        let db = HeraclitusDB::new(&p).unwrap();
+        assert_eq!(db.verify().status, "VIOLATED", "sig corrompida devia falhar");
+    }
+
+    /// Marco B — a propriedade central: um atacante com acesso de ESCRITA aos
+    /// ficheiros de dados (mas SEM a chave privada) reescreve `.hdb` + `.anchor`
+    /// + `.anchor.sig` de forma internamente consistente, assinando com a SUA
+    /// chave. A chave pública fixada da vítima (`.pub`) rejeita a assinatura
+    /// estranha — o buraco "reescreve tudo consistente" fica fechado.
+    #[test]
+    fn foreign_key_signature_is_rejected() {
+        let victim = tmp_path("victim");
+        {
+            let mut db = HeraclitusDB::new(&victim).unwrap();
+            for i in 0..2 {
+                db.write_fact(&mut fact(&format!("v{i}"))).unwrap();
+            }
+            assert_eq!(db.verify().status, "INTEG_OK");
+        }
+        // Atacante: banco próprio (⇒ chave própria) com Fatos diferentes.
+        let attacker = tmp_path("attacker");
+        {
+            let mut db = HeraclitusDB::new(&attacker).unwrap();
+            for i in 0..3 {
+                db.write_fact(&mut fact(&format!("x{i}"))).unwrap();
+            }
+        }
+        // Substitui os dados da vítima pelos do atacante — MENOS a `.pub`, que
+        // continua a fixar a chave original da vítima.
+        fs::copy(&attacker, &victim).unwrap();
+        fs::copy(format!("{attacker}.anchor"), format!("{victim}.anchor")).unwrap();
+        fs::copy(format!("{attacker}.anchor.sig"), format!("{victim}.anchor.sig")).unwrap();
+
+        let db = HeraclitusDB::new(&victim).unwrap();
+        let r = db.verify();
+        assert_eq!(r.status, "VIOLATED", "assinatura de chave estranha devia ser rejeitada: {}", r.message);
     }
 }

@@ -49,14 +49,23 @@ por impacto para promover a produção.
 - **Comparar com o HeraclitusDB:** lá o consenso é openraft real (eleição +
   quórum + failover + log durável). O Forge diverge disso.
 
-### 2.2 — [ALTO] Assinatura é MOCK
-- `forge_compiler.py:341` "Ed25519 mock"; `db.rs sign()` é BLAKE3 de um prefixo
-  fixo — **sem chave privada**. O `verify()` nem sequer confere a assinatura.
-- Consequência: o banco é **tamper-EVIDENTE** (cadeia Merkle + âncora), mas
-  **não é tamper-PROOF** contra um atacante com acesso de escrita ao ficheiro
-  (que recomputa cadeia + âncora + sig consistentes, tudo em texto plano).
-- O README promete "criptograficamente verificáveis" — **overstatement** face
-  ao que o código entrega.
+### 2.2 — [ALTO] Assinatura era MOCK — ✅ RESOLVIDO (Marco B)
+- **Antes:** `db.rs sign()` era BLAKE3 de um prefixo fixo (sem chave privada) e o
+  `verify()` nem conferia — tamper-EVIDENTE mas não tamper-PROOF contra um
+  atacante que reescrevesse `.hdb` + `.anchor` consistentes.
+- **Agora:** a âncora é assinada com **ed25519 real**. Chave privada fora do
+  `.hdb` (`<db>.key`, 0600), pública fixada em `<db>.pub`, assinatura em
+  `<db>.anchor.sig`. O `verify()` confere a assinatura (camada 3): sig
+  ausente/inválida ⇒ VIOLATED. Testes `tampered_anchor_signature_is_rejected`
+  e `foreign_key_signature_is_rejected` (atacante assina com chave própria ⇒
+  rejeitado pela `.pub` da vítima).
+- **Ressalva residual:** a segurança reduz-se a **proteger a chave** — se o
+  atacante ler `<db>.key`, re-assina. `.key` fica 0600 (no-op no Windows) e a
+  recomendação é mantê-la fora da máquina de dados. A tag por-Fato
+  `fact.integrity.signature` passou a ser honesta (`b3tag:`, não `ed25519:`).
+- **Ainda mock:** a assinatura do **artefato `.hcx`** (`forge_compiler.py:341`)
+  — é outro objeto (o pacote de conhecimento, não o store de Fatos). Follow-up
+  separado (assinar o `.hcx` com a mesma chave / uma chave de publicação).
 
 ### 2.3 — [MÉDIO] Ingestão e conectores são de demonstração
 - Gateway: `gateway.rs:238` alimenta o `.hdb` com um array `SAMPLES` fixo num
@@ -100,9 +109,12 @@ por impacto para promover a produção.
   `read_to_end` do ficheiro inteiro. O `payload_len` do disco é limitado pelos
   bytes restantes antes de alocar.
 
-**Marco B — Cripto real (§2.2)**
-- [ ] Chave ed25519 de verdade (assinar a âncora/raiz, não um hash fixo);
-  guardar a chave fora do `.hdb`; `verify()` passa a conferir a assinatura.
+**Marco B — Cripto real (§2.2) — ✅ FEITO**
+- [x] Chave ed25519 de verdade a assinar a âncora/raiz (`ed25519-dalek`);
+  chave privada em `<db>.key` (0600, `.gitignore`), pública em `<db>.pub`,
+  assinatura em `<db>.anchor.sig`; `verify()` confere (camada 3). Cada nó Raft
+  assina a sua própria âncora local. Tag por-Fato honesta (`b3tag:`).
+- [ ] (residual) Assinar também o artefato `.hcx` no `forge_compiler.py`.
 
 **Marco C — Consenso de produção (§2.1)**
 - [ ] Persistir `term`/`voted_for`/log Raft (à la `meta.bin` do HeraclitusDB).
