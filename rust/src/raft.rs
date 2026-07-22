@@ -22,7 +22,7 @@ pub enum Role {
     Leader,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     pub term: u64,
     pub lsn: u64,
@@ -30,7 +30,7 @@ pub struct LogEntry {
     pub block: Vec<u8>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum Msg {
     RequestVote { term: u64, candidate: usize, last_lsn: u64, last_term: u64 },
     RequestVoteResp { term: u64, granted: bool },

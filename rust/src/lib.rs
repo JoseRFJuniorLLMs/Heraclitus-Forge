@@ -12,4 +12,5 @@ pub mod cpm;
 pub mod db;
 pub mod runner;
 pub mod raft;
+pub mod wire;
 pub mod hql;

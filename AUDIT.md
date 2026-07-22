@@ -37,7 +37,7 @@ Estas são **escolhas assumidas no código** (rotuladas como simulação/mock). 
 foram "corrigidas" porque mudá-las é trabalho de produto, não de patch. Listadas
 por impacto para promover a produção.
 
-### 2.1 — [ALTO] Consenso Raft — segurança ✅ FEITA (Marco C.1); transporte TCP pendente (C.2)
+### 2.1 — [ALTO] Consenso Raft — ✅ RESOLVIDO (Marco C completo)
 - **Estado durável (✅):** `term` / `voted_for` persistem em `<db>.raftmeta` e o
   log Raft (com termos) em `<db>.raftlog`, reconstruídos no arranque. Um nó já
   não vota duas vezes no mesmo termo através de um restart (fecha o split-brain
@@ -46,11 +46,13 @@ por impacto para promover a produção.
   índice cuja entrada é do termo corrente (§5.4.2 do Raft) — entradas de termos
   anteriores comprometem-se indiretamente. Teste
   `figure8_does_not_commit_previous_term_by_count_alone`.
-- **Transporte (⏳ C.2):** ainda dirigido por **ticks** (`raft.rs` "simulacao
-  determinística"). O mesmo state machine `Msg` roda sobre a simulação; falta o
-  **Wire Protocol TCP (spec §8)** para correr sobre uma rede real. É plumbing de
-  I/O — não afeta as propriedades de segurança acima (que agora estão corretas e
-  testadas). Alternativa: reusar o transporte do HeraclitusDB (openraft).
+- **Transporte TCP (✅ C.2):** módulo `wire.rs` — Wire Protocol TCP real (spec
+  §8). Mensagens `Msg` serializadas (`bincode`), enquadradas (`u32` LE + payload)
+  sobre `TcpStream`; o relógio lógico é um `tokio::time::interval`. O MESMO state
+  machine `RaftNode` da simulação corre sobre a rede. Teste de integração
+  `tcp_cluster_elects_and_replicates`: 3 nós reais em `127.0.0.1` elegem líder,
+  replicam Fatos e cada um verifica INTEG_OK. (Liga por mensagem, best-effort —
+  pool de ligações fica como otimização, como no `net.rs` do HeraclitusDB.)
 
 ### 2.2 — [ALTO] Assinatura era MOCK — ✅ RESOLVIDO (Marco B)
 - **Antes:** `db.rs sign()` era BLAKE3 de um prefixo fixo (sem chave privada) e o
@@ -119,12 +121,13 @@ por impacto para promover a produção.
   assina a sua própria âncora local. Tag por-Fato honesta (`b3tag:`).
 - [ ] (residual) Assinar também o artefato `.hcx` no `forge_compiler.py`.
 
-**Marco C — Consenso de produção (§2.1) — segurança ✅ FEITA; transporte pendente**
+**Marco C — Consenso de produção (§2.1) — ✅ FEITO**
 - [x] Persistir `term`/`voted_for` (`<db>.raftmeta`) + log Raft (`<db>.raftlog`),
   reconstruídos no arranque (à la `meta.bin`/WAL do HeraclitusDB).
 - [x] Regra de commit por termo (Figura-8) em `advance_commit`.
-- [ ] **(C.2)** Transporte TCP real (spec §8) OU reusar o transporte do
-  HeraclitusDB. Não afeta a correção do algoritmo (já testada); é I/O plumbing.
+- [x] **(C.2)** Transporte TCP real (`wire.rs`, spec §8): `Msg` via `bincode`
+  enquadrado sobre `TcpStream`, relógio por `tokio::interval`. Teste de
+  integração com 3 nós reais em localhost (elege + replica + verify por nó).
 
 **Marco D — Ingestão & conectores (§2.3)**
 - [ ] Tail real de PostgreSQL no gateway/fabric.
