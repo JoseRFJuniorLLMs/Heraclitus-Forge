@@ -210,7 +210,13 @@ pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, 
     let cutoff = match (plan.amount, plan.unit.as_deref()) {
         (Some(a), Some(u)) => {
             let now = crate::fact::now_micros().unwrap_or(0);
-            Some(now - a * unit_secs(u) * 1_000_000)
+            // Aritmética saturante: `WITHIN LAST 999999999999 DAYS` transbordava
+            // o `a * unit_secs * 1e6` e o `now - …` fazia underflow (panic em
+            // debug, wrap em release). Satura em 0 = "desde o início".
+            let window = (a as i64)
+                .saturating_mul(unit_secs(u))
+                .saturating_mul(1_000_000);
+            Some(now.saturating_sub(window))
         }
         _ => None,
     };

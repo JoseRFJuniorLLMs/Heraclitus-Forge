@@ -28,6 +28,7 @@ use std::io::{BufWriter, Read, Write};
 
 use serde_json::Value;
 
+use crate::raft::BASE_LSN;
 use crate::{cpm, fbfact};
 
 /// Magic(4) + LSN(8) + Timestamp(8) + Confidence(4) + EvidenceHash(32) + PayloadLen(4)
@@ -71,18 +72,72 @@ pub struct HeraclitusDB {
 
 impl HeraclitusDB {
     pub fn new(db_path: &str) -> std::io::Result<Self> {
-        if !std::path::Path::new(db_path).exists() {
+        let existed = std::path::Path::new(db_path).exists();
+        if !existed {
             let mut f = File::create(db_path)?;
             // PAGE 0: FILE HEADER ('HERA' + versão do formato v2 = CPM-enabled)
             f.write_all(b"HERA")?;
             f.write_all(&7u32.to_be_bytes())?; // schema v7 = CPM payload
         }
-        Ok(Self {
+        let mut db = Self {
             db_path: db_path.to_string(),
             anchor_path: format!("{db_path}.anchor"),
-            current_lsn: 14_812_337,
+            current_lsn: BASE_LSN,
             trusted_root: String::new(),
-        })
+        };
+        // RECUPERAÇÃO no reabrir: sem isto, `new()` de um `.hdb` EXISTENTE
+        // repunha `current_lsn = BASE_LSN` e `trusted_root = ""`. O próximo
+        // `write_fact` então: (a) atribuía um LSN já usado, e (b) dobrava a
+        // cadeia Merkle a partir do vazio em vez de continuar a raiz on-disk —
+        // o `merkle_root_anchor` embutido no bloco novo divergia do que o
+        // `verify()` recalcula sobre TODO o ficheiro ⇒ um append legítimo
+        // pós-restart marcava o banco como VIOLATED. Reconstrói o estado do
+        // disco (mesma filosofia replay-from-log do HeraclitusDB de produção).
+        if existed {
+            db.recover()?;
+        }
+        Ok(db)
+    }
+
+    /// Reconstrói `current_lsn` + `trusted_root` percorrendo o log em disco.
+    /// A raiz recuperada é a cadeia Merkle rolante sobre todos os blocos; o LSN
+    /// é o do último bloco íntegro. Blocos truncados/corrompidos na cauda param
+    /// o replay (a verificação criptográfica fica a cargo do `verify()`).
+    fn recover(&mut self) -> std::io::Result<()> {
+        let data = fs::read(&self.db_path)?;
+        if data.len() < 8 || &data[..4] != b"HERA" {
+            return Ok(()); // cabeçalho inválido: trata como vazio (verify() reporta)
+        }
+        let mut chain = String::new();
+        let mut last_lsn = BASE_LSN;
+        let mut pos = 8usize;
+        while pos + HEADER_SIZE <= data.len() {
+            let header = &data[pos..pos + HEADER_SIZE];
+            if &header[..4] != b"FACT" {
+                break;
+            }
+            let lsn = u64::from_be_bytes(header[4..12].try_into().unwrap_or([0; 8]));
+            let payload_len =
+                u32::from_be_bytes(header[56..60].try_into().unwrap_or([0; 4])) as usize;
+            let start = pos + HEADER_SIZE;
+            if start + payload_len > data.len() {
+                break; // cauda truncada
+            }
+            let payload = &data[start..start + payload_len];
+            let fact = match cpm::decode_record(payload) {
+                cpm::CpmDecoded::Record(rec, _) => match cpm::record_to_fact(&rec) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                },
+                cpm::CpmDecoded::Torn => break,
+            };
+            chain = fold_chain(&chain, &b3_hex(&core_bytes(&fact)));
+            last_lsn = lsn;
+            pos = start + payload_len;
+        }
+        self.current_lsn = last_lsn;
+        self.trusted_root = chain;
+        Ok(())
     }
 
     /// Monta o bloco binário completo (header + payload CRF v2) e avança a cadeia em O(1).
@@ -138,6 +193,8 @@ impl HeraclitusDB {
         let block = self.build_block(fact);
         let mut f = OpenOptions::new().append(true).open(&self.db_path)?;
         f.write_all(&block)?;
+        f.sync_all()?; // fsync ANTES do ack — durabilidade real (o bloco não pode
+                       // ser dado como gravado se um corte de energia o perde).
         fs::write(&self.anchor_path, &self.trusted_root)?;
         Ok(self.current_lsn)
     }
@@ -154,6 +211,9 @@ impl HeraclitusDB {
             w.write_all(&block)?;
         }
         w.flush()?;
+        // fsync do lote inteiro antes de ancorar (o `flush` do BufWriter só
+        // empurra para o SO; sem `sync_all` a durabilidade não é garantida).
+        w.get_ref().sync_all()?;
         fs::write(&self.anchor_path, &self.trusted_root)?;
         Ok(self.current_lsn)
     }
@@ -164,6 +224,7 @@ impl HeraclitusDB {
         let block = self.build_block(fact);
         let mut f = OpenOptions::new().append(true).open(&self.db_path)?;
         f.write_all(&block)?;
+        f.sync_all()?; // líder Raft: durável ANTES de replicar/ackar aos followers.
         fs::write(&self.anchor_path, &self.trusted_root)?;
         Ok((self.current_lsn, self.trusted_root.clone(), block))
     }
@@ -232,6 +293,7 @@ impl HeraclitusDB {
         let mut f = OpenOptions::new().append(true).open(&self.db_path)
             .map_err(|e| crate::error::HeraclitusError::Io(e))?;
         f.write_all(block).map_err(|e| crate::error::HeraclitusError::Io(e))?;
+        f.sync_all().map_err(|e| crate::error::HeraclitusError::Io(e))?; // follower durável antes do ack
         self.current_lsn = lsn;
         self.trusted_root = new_root;
         fs::write(&self.anchor_path, &self.trusted_root).ok();
@@ -354,5 +416,60 @@ impl HeraclitusDB {
             pos = start + payload_len;
         }
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fact(action: &str) -> Value {
+        json!({
+            "fact_id": "019f035c-1823-7fe9-8c54-02b2d1acc30c",
+            "fact.identity": {"actor.id":"a","actor.name":"a","target.id":"t","source.ip":null},
+            "fact.time": {"system_timestamp": 1_782_467_794_979_937i64, "log_sequence_number": 0u64},
+            "fact.behavior": {"class":"c","action":action,"risk_level":"Medium"},
+            "fact.evidence": {"raw_observation_hash":"b3:abcd","carimbo_tempo_legal":"icp"},
+            "fact.lineage": {"transformation_steps":["parse"],"input_source":"pg","matched_rule":"r"},
+            "fact.confidence": 0.9,
+            "fact.knowledge_version":"k-v1","fact.reasoning_version":"r-v6","fact.ontology_version":"v9"
+        })
+    }
+
+    /// Regressão do bug-chave: reabrir um `.hdb` existente TEM de recuperar
+    /// `current_lsn` + `trusted_root` do disco. Sem `recover()`, o append da
+    /// segunda sessão dobrava a cadeia Merkle a partir do vazio e o `verify()`
+    /// marcava um banco íntegro como VIOLATED.
+    #[test]
+    fn reopen_preserves_chain_and_verifies() {
+        let base = std::env::temp_dir().join(format!("forge_reopen_{}.hdb", std::process::id()));
+        let p = base.to_str().unwrap();
+        let _ = fs::remove_file(p);
+        let _ = fs::remove_file(format!("{p}.anchor"));
+
+        // Sessão 1: cria e escreve 3 fatos.
+        {
+            let mut db = HeraclitusDB::new(p).unwrap();
+            for i in 0..3 {
+                let mut f = fact(&format!("a{i}"));
+                db.write_fact(&mut f).unwrap();
+            }
+            assert_eq!(db.verify().status, "INTEG_OK");
+        }
+        // Sessão 2: REABRE e escreve mais 2.
+        {
+            let mut db = HeraclitusDB::new(p).unwrap();
+            assert_eq!(db.current_lsn, BASE_LSN + 3, "LSN não recuperado no reabrir");
+            for i in 3..5 {
+                let mut f = fact(&format!("a{i}"));
+                db.write_fact(&mut f).unwrap();
+            }
+            let r = db.verify();
+            assert_eq!(r.status, "INTEG_OK", "reabrir+append quebrou a cadeia: {}", r.message);
+            assert_eq!(r.facts, 5);
+        }
+        let _ = fs::remove_file(p);
+        let _ = fs::remove_file(format!("{p}.anchor"));
     }
 }

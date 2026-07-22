@@ -241,7 +241,18 @@ impl RaftNode {
                         match_lsn: self.last_lsn(), need_from: self.last_lsn() + 1,
                     })];
                 }
-                self.become_follower(term);
+                // Passa a follower reconhecendo o líder. CRÍTICO: só apagar
+                // `voted_for` quando o TERMO avança. O `become_follower`
+                // incondicional apagava o voto a cada AppendEntries do mesmo
+                // termo — um nó que já votara em A no termo T voltava a poder
+                // votar em B no mesmo T (dois líderes ⇒ split-brain).
+                if term > self.term {
+                    self.become_follower(term);
+                } else {
+                    self.role = Role::Follower;
+                    self.votes = 0;
+                    self.election_elapsed = 0;
+                }
                 self.leader = Some(leader);
 
                 // Validacao do follower (spec secao 11, passo 2)

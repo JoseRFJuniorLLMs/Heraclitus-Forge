@@ -172,8 +172,13 @@ async fn ingest_line(
         let of = st.runner.lock().await.process_observation(&line);
         match of {
             None => {
-                warn!("[POST /ingest] Schema Drift: {}", &line[..line.len().min(80)]);
-                json!({ "drift": true, "line": &line[..line.len().min(200)] })
+                // Truncar por CARACTERES, não por bytes: `&line[..80]` num corpo
+                // HTTP multibyte (UTF-8) que caísse a meio de um caractere
+                // panicava o handler (índice fora de fronteira de char).
+                let short: String = line.chars().take(80).collect();
+                let short200: String = line.chars().take(200).collect();
+                warn!("[POST /ingest] Schema Drift: {}", short);
+                json!({ "drift": true, "line": short200 })
             }
             Some(mut f) => {
                 match st.db.lock().await.write_fact(&mut f) {

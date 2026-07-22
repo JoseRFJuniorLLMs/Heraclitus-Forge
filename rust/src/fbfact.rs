@@ -163,8 +163,11 @@ pub fn decode(d: &[u8]) -> Result<Value, HeraclitusError> {
     
     if p + 4 > d.len() { return Err(HeraclitusError::FactEncodingError("Unexpected EOF".into())); }
     let nsteps = u32::from_be_bytes(d[p..p + 4].try_into()?) as usize; p += 4;
-    
-    let mut steps = Vec::with_capacity(nsteps);
+    // Pré-alocação LIMITADA pelos bytes restantes (cada step ocupa ≥ 4 bytes de
+    // prefixo): um `nsteps` corrompido (o CRC-32C do CPM não é keyed, logo quem
+    // tiver acesso de escrita ao ficheiro forja-o) não pode pedir GiBs. O loop
+    // abaixo falha com `?` no primeiro `get_str` sem bytes.
+    let mut steps = Vec::with_capacity(nsteps.min(d.len().saturating_sub(p) / 4));
     for _ in 0..nsteps {
         steps.push(s(get_str(d, &mut p)?));
     }
