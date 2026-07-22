@@ -25,15 +25,12 @@
 //! Em workloads onde >90% dos blocos são rejeitados pelo filtro, isso elimina
 //! a maioria das alocações.
 
-use std::fs::File;
-use std::io::Read;
 use std::sync::OnceLock;
 
 use regex::Regex;
 use serde_json::{Map, Value};
 
 use crate::cpm;
-use crate::db::HEADER_SIZE;
 
 // ---------------------------------------------------------------------------
 // Estrutura da query compilada
@@ -104,6 +101,98 @@ fn unit_secs(u: &str) -> i64 {
         "HOURS"   => 3600,
         "DAYS"    => 86400,
         _         => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::HeraclitusDB;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CTR: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_with_facts(pairs: &[(&str, &str)]) -> String {
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("forge_hql_{}_{}.hdb", std::process::id(), n));
+        let s = p.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&s);
+        let _ = std::fs::remove_file(format!("{s}.anchor"));
+        let mut db = HeraclitusDB::new(&s).unwrap();
+        for (action, target) in pairs {
+            let mut f = json!({
+                "fact_id": "019f035c-1823-7fe9-8c54-02b2d1acc30c",
+                "fact.identity": {"actor.id":"a","actor.name":"a","target.id":target,"source.ip":null},
+                "fact.time": {"system_timestamp": 1_782_467_794_979_937i64, "log_sequence_number": 0u64},
+                "fact.behavior": {"class":"c","action":action,"risk_level":"Medium"},
+                "fact.evidence": {"raw_observation_hash":"b3:abcd","carimbo_tempo_legal":"icp"},
+                "fact.lineage": {"transformation_steps":["parse"],"input_source":"pg","matched_rule":"r"},
+                "fact.confidence": 0.9,
+                "fact.knowledge_version":"k","fact.reasoning_version":"r","fact.ontology_version":"v9"
+            });
+            db.write_fact(&mut f).unwrap();
+        }
+        s
+    }
+
+    #[test]
+    fn parse_wildcards_select_and_limit() {
+        let q = parse_query(
+            r#"FROM FACTS MATCH (actor.id) EXECUTES "*" AGAINST "salaries" WITHIN LAST 10 DAYS SELECT actor.id,action LIMIT 5"#,
+        )
+        .unwrap();
+        assert_eq!(q.action, "*");
+        assert_eq!(q.target, "salaries");
+        assert_eq!(q.amount, Some(10));
+        assert_eq!(q.unit.as_deref(), Some("DAYS"));
+        assert_eq!(q.fields, vec!["actor.id".to_string(), "action".to_string()]);
+        assert_eq!(q.limit, Some(5));
+    }
+
+    #[test]
+    fn parse_select_star_is_empty_fields() {
+        let q = parse_query(r#"FROM FACTS MATCH (actor.id) EXECUTES "login" AGAINST "*" SELECT *"#).unwrap();
+        assert!(q.fields.is_empty());
+        assert_eq!(q.limit, None);
+    }
+
+    #[test]
+    fn malformed_query_is_rejected() {
+        assert!(parse_query("SELECT * FROM users").is_err());
+    }
+
+    #[test]
+    fn huge_time_window_does_not_panic() {
+        // Regressão: `WITHIN LAST 999999999999999 DAYS` transbordava/underflow.
+        let db = tmp_with_facts(&[("login", "prod")]);
+        let rows = execute_query(
+            &db,
+            r#"FROM FACTS MATCH (actor.id) EXECUTES "*" AGAINST "*" WITHIN LAST 999999999999999 DAYS SELECT *"#,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "janela gigante deve saturar em 'desde o início'");
+    }
+
+    #[test]
+    fn execute_filters_by_action_target_and_limit() {
+        let db = tmp_with_facts(&[
+            ("authentication.failure", "prod"),
+            ("authentication.failure", "prod"),
+            ("authorization.failure", "salaries"),
+        ]);
+
+        // Filtro por ação.
+        let r = execute_query(&db, r#"FROM FACTS MATCH (actor.id) EXECUTES "authentication.failure" AGAINST "*" SELECT *"#).unwrap();
+        assert_eq!(r.len(), 2);
+
+        // Filtro por target.
+        let r = execute_query(&db, r#"FROM FACTS MATCH (actor.id) EXECUTES "*" AGAINST "salaries" SELECT *"#).unwrap();
+        assert_eq!(r.len(), 1);
+
+        // Wildcard total + LIMIT.
+        let r = execute_query(&db, r#"FROM FACTS MATCH (actor.id) EXECUTES "*" AGAINST "*" SELECT * LIMIT 2"#).unwrap();
+        assert_eq!(r.len(), 2, "LIMIT deve cortar o scan cedo");
     }
 }
 
@@ -198,15 +287,6 @@ fn project_all(fact: &Value) -> Map<String, Value> {
 pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, String> {
     let plan = parse_query(q)?;
 
-    let mut data = Vec::new();
-    File::open(db_path)
-        .map_err(|e| e.to_string())?
-        .read_to_end(&mut data)
-        .map_err(|e| e.to_string())?;
-    if data.len() < 8 || &data[..4] != b"HERA" {
-        return Err("cabeçalho mestre do .hdb inválido".into());
-    }
-
     let cutoff = match (plan.amount, plan.unit.as_deref()) {
         (Some(a), Some(u)) => {
             let now = crate::fact::now_micros().unwrap_or(0);
@@ -221,63 +301,43 @@ pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, 
         _ => None,
     };
 
+    // Varredura em STREAMING (Marco A do AUDIT.md): um bloco em RAM de cada
+    // vez via `db::scan_blocks` — a query escala com o tamanho do bloco, não
+    // do banco. Magic/truncagem param o scan (semântica do `break` antigo);
+    // Torn é pulado (o verify() é quem julga a integridade).
     let mut out = Vec::new();
-    let mut pos = 8usize; // pula file header
-    while pos + HEADER_SIZE <= data.len() {
-        // Verifica magic do bloco
-        let header = &data[pos..pos + HEADER_SIZE];
-        if &header[..4] != b"FACT" {
-            break;
-        }
-        let payload_len_bytes = header[56..60].try_into().unwrap_or([0; 4]);
-        let payload_len = u32::from_be_bytes(payload_len_bytes) as usize;
-        let start = pos + HEADER_SIZE;
-        if start + payload_len > data.len() {
-            break;
-        }
-        let raw_payload = &data[start..start + payload_len];
-        pos = start + payload_len;
-
+    let outcome = crate::db::scan_blocks(db_path, |_lsn, raw_payload| {
         // --- Etapa 1: decode CpmRecord (valida CRC-32C — camada física) ---
         let cpm_rec = match cpm::decode_record(raw_payload) {
             cpm::CpmDecoded::Record(rec, _) => rec,
-            cpm::CpmDecoded::Torn => {
-                // Bloco fisicamente corrompido: reporta mas não aborta o scan
-                // (o verify() é quem deve rejeitar; aqui apenas pulamos).
-                continue;
-            }
+            cpm::CpmDecoded::Torn => return true, // pula bloco corrompido
         };
 
         // --- Etapa 2: FILTRO ZERO-COPY — action + target_id direto no fbfact body ---
-        // O pristine payload dentro do CpmRecord é o buffer fbfact.
         let fb = &cpm_rec.payload;
-
-        // Filtra ação (sem alocar)
         if plan.action != "*" {
             match crate::fbfact::action(fb) {
                 Some(a) if a == plan.action => {}
-                _ => continue,
+                _ => return true,
             }
         }
-
-        // Filtra target (sem alocar)
         if plan.target != "*" {
             match crate::fbfact::target_id(fb) {
                 Some(t) if t == plan.target => {}
-                _ => continue,
+                _ => return true,
             }
         }
 
         // --- Etapa 3: decode completo apenas dos blocos que passaram no filtro ---
         let fact = match cpm::record_to_fact(&cpm_rec) {
-            Ok(v)  => v,
-            Err(_) => continue,
+            Ok(v) => v,
+            Err(_) => return true,
         };
 
         // Filtro temporal (WITHIN LAST)
         if let Some(c) = cutoff {
             if fact["fact.time"]["system_timestamp"].as_i64().unwrap_or(0) < c {
-                continue;
+                return true;
             }
         }
 
@@ -294,11 +354,17 @@ pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, 
         out.push(row);
 
         // --- LIMIT: interrompe early se já temos o suficiente ---
-        if let Some(lim) = plan.limit {
-            if out.len() >= lim {
-                break;
-            }
+        match plan.limit {
+            Some(lim) if out.len() >= lim => false,
+            _ => true,
         }
+    });
+
+    match outcome.map_err(|e| e.to_string())? {
+        crate::db::ScanOutcome::NoFile => Err(format!("não foi possível abrir {db_path}")),
+        crate::db::ScanOutcome::BadMaster => Err("cabeçalho mestre do .hdb inválido".into()),
+        // Done / magic corrompido / cauda truncada: devolve o que foi lido
+        // (mesma semântica do `break` do scan antigo).
+        _ => Ok(out),
     }
-    Ok(out)
 }

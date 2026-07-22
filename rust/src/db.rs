@@ -24,7 +24,7 @@
 //! corrupção física é detectada antes de qualquer lógica de negócio.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 
 use serde_json::Value;
 
@@ -60,6 +60,75 @@ pub struct VerifyResult {
     pub facts: usize,
     pub root: String,
     pub message: String,
+}
+
+/// Desfecho de um [`scan_blocks`] (varredura estrutural em streaming).
+pub(crate) enum ScanOutcome {
+    /// Fim limpo (EOF) ou paragem antecipada pelo callback.
+    Done,
+    /// O ficheiro não existe / não abre.
+    NoFile,
+    /// Cabeçalho mestre `HERA` inválido.
+    BadMaster,
+    /// Magic `FACT` de um bloco corrompido.
+    BadBlockMagic,
+    /// `payload_len` declara mais bytes do que o ficheiro tem (cauda truncada).
+    Truncated { lsn: u64 },
+}
+
+/// Varre os blocos do `.hdb` em **streaming** (Marco A §2.5 do AUDIT.md): um
+/// bloco em RAM de cada vez via `BufReader`, nunca `read_to_end` do ficheiro
+/// inteiro — `verify()`/HQL passam a escalar com o tamanho do bloco, não do
+/// banco. O `payload_len` (não confiável, vem do disco) é LIMITADO pelos bytes
+/// restantes do ficheiro antes de qualquer alocação.
+///
+/// Chama `f(lsn, payload)` por bloco estruturalmente íntegro; devolver `false`
+/// interrompe (early-exit do LIMIT do HQL). A validação de CONTEÚDO
+/// (CRC/Merkle) é do callback — aqui é só o enquadramento físico.
+pub(crate) fn scan_blocks<F>(db_path: &str, mut f: F) -> std::io::Result<ScanOutcome>
+where
+    F: FnMut(u64, &[u8]) -> bool,
+{
+    use std::io::{BufReader, Read as _};
+    let file = match File::open(db_path) {
+        Ok(f) => f,
+        Err(_) => return Ok(ScanOutcome::NoFile),
+    };
+    let file_size = file.metadata()?.len();
+    let mut r = BufReader::new(file);
+
+    let mut master = [0u8; 8];
+    if r.read_exact(&mut master).is_err() || &master[..4] != b"HERA" {
+        return Ok(ScanOutcome::BadMaster);
+    }
+
+    let mut pos: u64 = 8;
+    let mut header = [0u8; HEADER_SIZE];
+    let mut payload = Vec::new();
+    loop {
+        // Menos de um header restante = fim limpo (mesma semântica do scan
+        // antigo, que ignorava uma cauda menor que HEADER_SIZE).
+        if file_size - pos < HEADER_SIZE as u64 {
+            return Ok(ScanOutcome::Done);
+        }
+        r.read_exact(&mut header)?;
+        pos += HEADER_SIZE as u64;
+        if &header[..4] != b"FACT" {
+            return Ok(ScanOutcome::BadBlockMagic);
+        }
+        let lsn = u64::from_be_bytes(header[4..12].try_into().unwrap());
+        let payload_len = u32::from_be_bytes(header[56..60].try_into().unwrap()) as u64;
+        if payload_len > file_size - pos {
+            return Ok(ScanOutcome::Truncated { lsn });
+        }
+        payload.clear();
+        payload.resize(payload_len as usize, 0);
+        r.read_exact(&mut payload)?;
+        pos += payload_len;
+        if !f(lsn, &payload) {
+            return Ok(ScanOutcome::Done);
+        }
+    }
 }
 
 pub struct HeraclitusDB {
@@ -104,37 +173,22 @@ impl HeraclitusDB {
     /// é o do último bloco íntegro. Blocos truncados/corrompidos na cauda param
     /// o replay (a verificação criptográfica fica a cargo do `verify()`).
     fn recover(&mut self) -> std::io::Result<()> {
-        let data = fs::read(&self.db_path)?;
-        if data.len() < 8 || &data[..4] != b"HERA" {
-            return Ok(()); // cabeçalho inválido: trata como vazio (verify() reporta)
-        }
         let mut chain = String::new();
         let mut last_lsn = BASE_LSN;
-        let mut pos = 8usize;
-        while pos + HEADER_SIZE <= data.len() {
-            let header = &data[pos..pos + HEADER_SIZE];
-            if &header[..4] != b"FACT" {
-                break;
-            }
-            let lsn = u64::from_be_bytes(header[4..12].try_into().unwrap_or([0; 8]));
-            let payload_len =
-                u32::from_be_bytes(header[56..60].try_into().unwrap_or([0; 4])) as usize;
-            let start = pos + HEADER_SIZE;
-            if start + payload_len > data.len() {
-                break; // cauda truncada
-            }
-            let payload = &data[start..start + payload_len];
+        // Streaming (nunca o ficheiro inteiro em RAM). Replay leniente: o
+        // primeiro bloco ilegível para a recuperação (o verify() é quem julga).
+        let _ = scan_blocks(&self.db_path, |lsn, payload| {
             let fact = match cpm::decode_record(payload) {
                 cpm::CpmDecoded::Record(rec, _) => match cpm::record_to_fact(&rec) {
                     Ok(v) => v,
-                    Err(_) => break,
+                    Err(_) => return false,
                 },
-                cpm::CpmDecoded::Torn => break,
+                cpm::CpmDecoded::Torn => return false,
             };
             chain = fold_chain(&chain, &b3_hex(&core_bytes(&fact)));
             last_lsn = lsn;
-            pos = start + payload_len;
-        }
+            true
+        })?;
         self.current_lsn = last_lsn;
         self.trusted_root = chain;
         Ok(())
@@ -306,55 +360,26 @@ impl HeraclitusDB {
     /// 1. CRC-32C (físico): detecta bit-rot ou truncamento acidental.
     /// 2. BLAKE3 Merkle chain (criptográfico): detecta adulteração intencional.
     pub fn verify(&self) -> VerifyResult {
-        let mut data = Vec::new();
-        let mut f = match File::open(&self.db_path) {
-            Ok(f) => f,
-            Err(_) => return VerifyResult { status: "ERROR".into(), facts: 0, root: String::new(),
-                                            message: "Arquivo de banco não encontrado.".into() },
-        };
-        f.read_to_end(&mut data).ok();
-
         let trusted_root = fs::read_to_string(&self.anchor_path).ok().map(|s| s.trim().to_string());
 
-        if data.len() < 8 || &data[..4] != b"HERA" {
-            return VerifyResult { status: "CORRUPTED".into(), facts: 0, root: String::new(),
-                                  message: "Cabeçalho mestre inválido.".into() };
-        }
-
+        // Streaming (Marco A): um bloco em RAM de cada vez — verify() escala
+        // com o tamanho do BLOCO, não do banco. Semântica de status idêntica.
         let mut chain = String::new();
         let mut count = 0usize;
-        let mut pos = 8usize; // pula file header
-        while pos + HEADER_SIZE <= data.len() {
-            let header = &data[pos..pos + HEADER_SIZE];
-            if &header[..4] != b"FACT" {
-                return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(),
-                                      message: "Assinatura de bloco corrompida.".into() };
-            }
-            let lsn_bytes = header[4..12].try_into().unwrap_or([0; 8]);
-            let lsn = u64::from_be_bytes(lsn_bytes);
-            let payload_len_bytes = header[56..60].try_into().unwrap_or([0; 4]);
-            let payload_len = u32::from_be_bytes(payload_len_bytes) as usize;
-            let start = pos + HEADER_SIZE;
-            if start + payload_len > data.len() {
-                return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(),
-                                      message: format!("Payload truncado no LSN {lsn}") };
-            }
-            let payload = &data[start..start + payload_len];
-
+        let mut violation: Option<String> = None;
+        let outcome = scan_blocks(&self.db_path, |lsn, payload| {
             // --- Camada 1: física CRC-32C (CPM-200) ---
             let fact = match cpm::decode_record(payload) {
-                cpm::CpmDecoded::Record(rec, _) => {
-                    match cpm::record_to_fact(&rec) {
-                        Ok(v) => v,
-                        Err(_) => return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(),
-                                                        message: format!("Payload CRF v2 corrompido no LSN {lsn}") },
+                cpm::CpmDecoded::Record(rec, _) => match cpm::record_to_fact(&rec) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        violation = Some(format!("Payload CRF v2 corrompido no LSN {lsn}"));
+                        return false;
                     }
-                }
+                },
                 cpm::CpmDecoded::Torn => {
-                    return VerifyResult {
-                        status: "VIOLATED".into(), facts: count, root: String::new(),
-                        message: format!("CRC-32C físico falhou no LSN {lsn} — bit-rot detectado"),
-                    };
+                    violation = Some(format!("CRC-32C físico falhou no LSN {lsn} — bit-rot detectado"));
+                    return false;
                 }
             };
 
@@ -363,29 +388,45 @@ impl HeraclitusDB {
             let integ = fact.get("fact.integrity");
             if let Some(stored) = integ.and_then(|i| i.get("leaf_hash")).and_then(|v| v.as_str()) {
                 if stored != leaf {
-                    return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(),
-                                          message: format!("Folha BLAKE3 adulterada no LSN {lsn}") };
+                    violation = Some(format!("Folha BLAKE3 adulterada no LSN {lsn}"));
+                    return false;
                 }
             }
             chain = fold_chain(&chain, &leaf);
             if let Some(stored) = integ.and_then(|i| i.get("merkle_root_anchor")).and_then(|v| v.as_str()) {
                 if stored != chain {
-                    return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(),
-                                          message: format!("Cadeia Merkle quebrada no LSN {lsn}") };
+                    violation = Some(format!("Cadeia Merkle quebrada no LSN {lsn}"));
+                    return false;
                 }
             }
-
             count += 1;
-            pos = start + payload_len;
-        }
+            true
+        });
 
-        if let Some(anchor) = &trusted_root {
-            if &chain != anchor {
-                return VerifyResult { status: "VIOLATED".into(), facts: count, root: chain,
-                                      message: "Raiz divergente da âncora.".into() };
+        if let Some(msg) = violation {
+            return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(), message: msg };
+        }
+        match outcome {
+            Err(e) => VerifyResult { status: "ERROR".into(), facts: count, root: String::new(),
+                                     message: format!("Erro de leitura: {e}") },
+            Ok(ScanOutcome::NoFile) => VerifyResult { status: "ERROR".into(), facts: 0, root: String::new(),
+                                                      message: "Arquivo de banco não encontrado.".into() },
+            Ok(ScanOutcome::BadMaster) => VerifyResult { status: "CORRUPTED".into(), facts: 0, root: String::new(),
+                                                         message: "Cabeçalho mestre inválido.".into() },
+            Ok(ScanOutcome::BadBlockMagic) => VerifyResult { status: "VIOLATED".into(), facts: count,
+                root: String::new(), message: "Assinatura de bloco corrompida.".into() },
+            Ok(ScanOutcome::Truncated { lsn }) => VerifyResult { status: "VIOLATED".into(), facts: count,
+                root: String::new(), message: format!("Payload truncado no LSN {lsn}") },
+            Ok(ScanOutcome::Done) => {
+                if let Some(anchor) = &trusted_root {
+                    if &chain != anchor {
+                        return VerifyResult { status: "VIOLATED".into(), facts: count, root: chain,
+                                              message: "Raiz divergente da âncora.".into() };
+                    }
+                }
+                VerifyResult { status: "INTEG_OK".into(), facts: count, root: chain, message: String::new() }
             }
         }
-        VerifyResult { status: "INTEG_OK".into(), facts: count, root: chain, message: String::new() }
     }
 
     /// Simula atacante: flipa 1 char hex dentro do hash de evidência (mesmo tamanho).

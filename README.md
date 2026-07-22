@@ -1,7 +1,18 @@
 # Heraclitus-Forge
 
 Implementação da **Heraclitus Suite v6.0** — transforma observações heterogêneas
-(logs) em **Fatos Operacionais** determinísticos e criptograficamente verificáveis.
+(logs) em **Fatos Operacionais** determinísticos e **tamper-evidentes**: cada Fato
+é uma folha de uma cadeia Merkle rolante BLAKE3 ancorada em disco, com uma camada
+física CRC-32C (CPM-200) por baixo. Qualquer adulteração ou bit-rot é **detectado**
+no `verify()`.
+
+> **Nota de honestidade (ver [`AUDIT.md`](AUDIT.md)):** integridade é
+> tamper-EVIDENTE, não assinatura criptográfica. O campo `signature` é hoje um
+> **mock** (sem chave ed25519 real) — protege contra corrupção acidental e
+> adulteração detectável, mas não contra um atacante com acesso de escrita ao
+> ficheiro (que recomputa cadeia + âncora consistentes). Assinatura real é o
+> Marco B do roadmap. Da mesma forma, a **replicação Raft é uma simulação**
+> determinística (sem rede/persistência de consenso) — Marco C.
 
 A divisão de linguagem segue a spec: o **runtime (caminho quente)** é todo **Rust**;
 o que é **Design-Time / Knowledge-Cloud** (não line-rate) fica em **Python**.

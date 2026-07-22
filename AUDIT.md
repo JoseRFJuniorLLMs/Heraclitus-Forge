@@ -88,12 +88,17 @@ por impacto para promover a produção.
 
 ## 3. Roadmap de conclusão (ordem sugerida)
 
-**Marco A — Honestidade & robustez (barato, alto valor)**
-- [ ] Alinhar o README: "tamper-evidente via Merkle+âncora", não
-  "criptograficamente assinado", enquanto §2.2 não for resolvido.
-- [ ] Testes para `raft.rs` (convergência 3 nós, split-brain, fast-sync),
-  `hql.rs` (parser + janelas de tempo), `runner.rs` (regra casa/não-casa).
-- [ ] Leitura paginada em `verify()`/HQL (portar a ideia do `scan_capped`).
+**Marco A — Honestidade & robustez (barato, alto valor) — ✅ FEITO (commit desta ronda)**
+- [x] README alinhado: "tamper-EVIDENTE via Merkle+âncora", com nota explícita
+  de que a assinatura é mock e o Raft é simulação (§2.1/§2.2).
+- [x] Testes `raft.rs` (convergência 3 nós + `verify()` por nó; regressão de
+  split-brain "no double vote"; termo-maior reabre voto), `hql.rs` (parser,
+  wildcards, SELECT/LIMIT, saturação da janela de tempo, execução com filtros),
+  `runner.rs` (linha PostgreSQL real casa; ruído vira drift). **18 testes** (era 8).
+- [x] Leitura paginada: novo `db::scan_blocks` em **streaming** (um bloco em RAM
+  de cada vez); `verify()`, `recover()` e `hql::execute_query` deixaram de fazer
+  `read_to_end` do ficheiro inteiro. O `payload_len` do disco é limitado pelos
+  bytes restantes antes de alocar.
 
 **Marco B — Cripto real (§2.2)**
 - [ ] Chave ed25519 de verdade (assinar a âncora/raiz, não um hash fixo);

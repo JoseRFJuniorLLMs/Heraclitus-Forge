@@ -323,3 +323,141 @@ impl RaftNode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::HeraclitusDB;
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CTR: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_db() -> HeraclitusDB {
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir()
+            .join(format!("forge_raft_{}_{}.hdb", std::process::id(), n));
+        let s = p.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&s);
+        let _ = std::fs::remove_file(format!("{s}.anchor"));
+        HeraclitusDB::new(&s).unwrap()
+    }
+
+    fn fact(action: &str) -> Value {
+        json!({
+            "fact_id": "019f035c-1823-7fe9-8c54-02b2d1acc30c",
+            "fact.identity": {"actor.id":"a","actor.name":"a","target.id":"t","source.ip":null},
+            "fact.time": {"system_timestamp": 1_782_467_794_979_937i64, "log_sequence_number": 0u64},
+            "fact.behavior": {"class":"c","action":action,"risk_level":"Medium"},
+            "fact.evidence": {"raw_observation_hash":"b3:abcd","carimbo_tempo_legal":"icp"},
+            "fact.lineage": {"transformation_steps":["parse"],"input_source":"pg","matched_rule":"r"},
+            "fact.confidence": 0.9,
+            "fact.knowledge_version":"k","fact.reasoning_version":"r","fact.ontology_version":"v9"
+        })
+    }
+
+    /// Entrega toda a fila de mensagens até quiescência (guard anti-loop).
+    fn drain(nodes: &mut [RaftNode], mut q: VecDeque<(usize, usize, Msg)>) {
+        let mut guard = 0;
+        while let Some((from, to, msg)) = q.pop_front() {
+            for (t, m) in nodes[to].handle(from, msg) {
+                q.push_back((to, t, m));
+            }
+            guard += 1;
+            assert!(guard < 100_000, "loop de mensagens Raft não convergiu");
+        }
+    }
+
+    /// Um "tick" global: relógio lógico avança em todos os nós; entrega tudo.
+    fn tick_round(nodes: &mut [RaftNode]) {
+        let mut q = VecDeque::new();
+        for i in 0..nodes.len() {
+            for (t, m) in nodes[i].tick() {
+                q.push_back((i, t, m));
+            }
+        }
+        drain(nodes, q);
+    }
+
+    fn cluster(n: usize) -> Vec<RaftNode> {
+        (0..n)
+            .map(|i| {
+                let peers: Vec<usize> = (0..n).filter(|&j| j != i).collect();
+                RaftNode::new(i, peers, tmp_db())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn three_nodes_converge_and_each_verifies() {
+        let mut nodes = cluster(3);
+
+        // Elege um líder.
+        let mut leader = None;
+        for _ in 0..120 {
+            tick_round(&mut nodes);
+            if let Some(l) = (0..3).find(|&i| nodes[i].is_leader()) {
+                leader = Some(l);
+                break;
+            }
+        }
+        let l = leader.expect("nenhum líder eleito");
+
+        // Líder ingere 5 Fatos e replica.
+        for i in 0..5 {
+            let mut f = fact(&format!("a{i}"));
+            let (lsn, root, block) = nodes[l].db.commit_local(&mut f).unwrap();
+            nodes[l].client_commit(lsn, root, block);
+            for _ in 0..12 {
+                tick_round(&mut nodes);
+            }
+        }
+
+        // Todos convergem: mesmo LSN, mesma raiz Merkle, e verify() íntegro em cada.
+        let lsn0 = nodes[l].last_lsn();
+        let root0 = nodes[l].last_root();
+        assert_eq!(lsn0, BASE_LSN + 5, "líder não gravou os 5 Fatos");
+        for i in 0..3 {
+            assert_eq!(nodes[i].last_lsn(), lsn0, "nó {i} não convergiu no LSN");
+            assert_eq!(nodes[i].last_root(), root0, "nó {i} não convergiu na raiz");
+            assert_eq!(nodes[i].db.verify().status, "INTEG_OK", "nó {i} não íntegro");
+        }
+    }
+
+    #[test]
+    fn no_double_vote_in_same_term() {
+        // Regressão do split-brain: depois de votar em 1 no termo T e receber
+        // AppendEntries do líder 1 (mesmo T), um RequestVote de 2 no MESMO T
+        // TEM de ser recusado. Antes do fix, o become_follower do AppendEntries
+        // apagava voted_for e o voto duplo passava.
+        let mut n = RaftNode::new(0, vec![1, 2], tmp_db());
+
+        n.handle(1, Msg::RequestVote { term: 5, candidate: 1, last_lsn: BASE_LSN, last_term: 0 });
+        n.handle(1, Msg::AppendEntries {
+            term: 5, leader: 1, prev_lsn: BASE_LSN, prev_root: String::new(),
+            entries: vec![], leader_commit: BASE_LSN,
+        });
+        let resp = n.handle(2, Msg::RequestVote { term: 5, candidate: 2, last_lsn: BASE_LSN, last_term: 0 });
+
+        match resp.first().map(|(_, m)| m) {
+            Some(Msg::RequestVoteResp { granted, .. }) => {
+                assert!(!granted, "voto duplo no mesmo termo — split-brain");
+            }
+            other => panic!("resposta inesperada: {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn higher_term_request_vote_is_granted_after_stepping_down() {
+        // Complemento: um termo MAIOR reabre o voto (não é split-brain — é a
+        // progressão normal do Raft).
+        let mut n = RaftNode::new(0, vec![1, 2], tmp_db());
+        n.handle(1, Msg::RequestVote { term: 5, candidate: 1, last_lsn: BASE_LSN, last_term: 0 });
+        let resp = n.handle(2, Msg::RequestVote { term: 6, candidate: 2, last_lsn: BASE_LSN, last_term: 0 });
+        match resp.first().map(|(_, m)| m) {
+            Some(Msg::RequestVoteResp { granted, .. }) => assert!(granted, "termo maior devia reabrir o voto"),
+            other => panic!("resposta inesperada: {:?}", other.map(|_| ())),
+        }
+    }
+}

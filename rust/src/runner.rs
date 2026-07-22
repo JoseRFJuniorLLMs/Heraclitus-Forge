@@ -475,3 +475,33 @@ fn compile_execution_plan(nodes: &BTreeMap<String, DagNode>) -> Result<Vec<Strin
     }
     Ok(order)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Artefato REAL do registry (resolvido a partir do crate, independente do cwd).
+    const ARTIFACT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../registry/postgresql/v1.1.0.hcx");
+
+    fn runner() -> ReconstitutiveRunner {
+        ReconstitutiveRunner::load(ARTIFACT)
+            .expect("artefato postgresql v1.1.0 ausente — rode: python forge_compiler.py")
+    }
+
+    #[test]
+    fn matches_known_postgres_line_into_a_fact() {
+        let mut r = runner();
+        let line = "2026-06-26 01:20:05.123 UTC [14802] FATAL:  password authentication failed for user \"admin\"";
+        let of = r.process_observation(line).expect("linha conhecida deveria casar (não é drift)");
+        assert_eq!(of["fact.behavior"]["action"], "authentication.failure");
+        // O Fato carrega proveniência do artefato que o produziu.
+        assert!(of["fact.knowledge_version"].as_str().unwrap().contains("postgresql"));
+    }
+
+    #[test]
+    fn unknown_line_is_schema_drift() {
+        let mut r = runner();
+        let of = r.process_observation("=== ruído totalmente fora do schema 42 xyz ===");
+        assert!(of.is_none(), "linha desconhecida deveria cair em Schema Drift (None)");
+    }
+}
