@@ -37,17 +37,20 @@ Estas são **escolhas assumidas no código** (rotuladas como simulação/mock). 
 foram "corrigidas" porque mudá-las é trabalho de produto, não de patch. Listadas
 por impacto para promover a produção.
 
-### 2.1 — [ALTO] Consenso Raft é uma SIMULAÇÃO
-- `raft.rs:9` — "simulacao determinística, sem rede real". Dirigido por ticks.
-- **Não persiste** `term` / `voted_for` / log Raft (só o `.hdb` de fatos é
-  durável). Restart ⇒ perde o estado de consenso.
-- `advance_commit` conta réplicas **ignorando o termo** — falta a regra
-  Figura-8 do Raft (só comprometer entradas do termo corrente diretamente). A
-  cadeia Merkle hash-linked mitiga histórias divergentes, mas a regra formal
-  não está lá.
-- O "Wire Protocol TCP (spec §8)" que a produção exigiria **não existe**.
-- **Comparar com o HeraclitusDB:** lá o consenso é openraft real (eleição +
-  quórum + failover + log durável). O Forge diverge disso.
+### 2.1 — [ALTO] Consenso Raft — segurança ✅ FEITA (Marco C.1); transporte TCP pendente (C.2)
+- **Estado durável (✅):** `term` / `voted_for` persistem em `<db>.raftmeta` e o
+  log Raft (com termos) em `<db>.raftlog`, reconstruídos no arranque. Um nó já
+  não vota duas vezes no mesmo termo através de um restart (fecha o split-brain
+  por reinício). Testes `vote_survives_restart`, `raft_log_survives_restart`.
+- **Regra de Figura-8 (✅):** `advance_commit` só compromete DIRETAMENTE um
+  índice cuja entrada é do termo corrente (§5.4.2 do Raft) — entradas de termos
+  anteriores comprometem-se indiretamente. Teste
+  `figure8_does_not_commit_previous_term_by_count_alone`.
+- **Transporte (⏳ C.2):** ainda dirigido por **ticks** (`raft.rs` "simulacao
+  determinística"). O mesmo state machine `Msg` roda sobre a simulação; falta o
+  **Wire Protocol TCP (spec §8)** para correr sobre uma rede real. É plumbing de
+  I/O — não afeta as propriedades de segurança acima (que agora estão corretas e
+  testadas). Alternativa: reusar o transporte do HeraclitusDB (openraft).
 
 ### 2.2 — [ALTO] Assinatura era MOCK — ✅ RESOLVIDO (Marco B)
 - **Antes:** `db.rs sign()` era BLAKE3 de um prefixo fixo (sem chave privada) e o
@@ -116,10 +119,12 @@ por impacto para promover a produção.
   assina a sua própria âncora local. Tag por-Fato honesta (`b3tag:`).
 - [ ] (residual) Assinar também o artefato `.hcx` no `forge_compiler.py`.
 
-**Marco C — Consenso de produção (§2.1)**
-- [ ] Persistir `term`/`voted_for`/log Raft (à la `meta.bin` do HeraclitusDB).
-- [ ] Regra de commit por termo (Figura-8).
-- [ ] Transporte TCP real (spec §8) OU reusar o transporte do HeraclitusDB.
+**Marco C — Consenso de produção (§2.1) — segurança ✅ FEITA; transporte pendente**
+- [x] Persistir `term`/`voted_for` (`<db>.raftmeta`) + log Raft (`<db>.raftlog`),
+  reconstruídos no arranque (à la `meta.bin`/WAL do HeraclitusDB).
+- [x] Regra de commit por termo (Figura-8) em `advance_commit`.
+- [ ] **(C.2)** Transporte TCP real (spec §8) OU reusar o transporte do
+  HeraclitusDB. Não afeta a correção do algoritmo (já testada); é I/O plumbing.
 
 **Marco D — Ingestão & conectores (§2.3)**
 - [ ] Tail real de PostgreSQL no gateway/fabric.

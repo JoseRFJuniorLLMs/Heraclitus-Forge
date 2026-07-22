@@ -16,9 +16,10 @@ assinatura sem a chave — o `verify()` deteta.
 > depende de **proteger a chave privada** (`<db>.key`) — mantê-la 0600 e, em
 > produção, fora da máquina que serve os dados. O campo por-Fato
 > `fact.integrity.signature` é apenas uma **tag BLAKE3** (`b3tag:`), não uma
-> assinatura — a assinatura autoritativa é a da âncora. A **replicação Raft
-> continua uma simulação** determinística (sem rede/persistência de consenso) —
-> Marco C do roadmap.
+> assinatura — a assinatura autoritativa é a da âncora. O **consenso Raft** já
+> tem estado **durável** (term/voto/log em `<db>.raftmeta`/`.raftlog`) e a regra
+> de **Figura-8**; continua dirigido por **ticks** — falta só o transporte TCP
+> real (Marco C.2 do roadmap) para correr sobre rede.
 
 A divisão de linguagem segue a spec: o **runtime (caminho quente)** é todo **Rust**;
 o que é **Design-Time / Knowledge-Cloud** (não line-rate) fica em **Python**.

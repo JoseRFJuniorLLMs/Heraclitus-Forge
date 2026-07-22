@@ -18,6 +18,10 @@ quarantine.log
 *.pub
 *.anchor.sig
 
+# Estado de consenso durável (Marco C) — regeneravel/local ao no.
+*.raftmeta
+*.raftlog
+
 # Rust
 target/
 rust/target/
