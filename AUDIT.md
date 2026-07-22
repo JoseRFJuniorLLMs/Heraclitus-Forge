@@ -1,0 +1,125 @@
+# AUDIT.md — Auditoria & Roadmap de Conclusão do Heraclitus-Forge
+
+**Data:** 2026-07-22 · **Escopo:** runtime Rust (`rust/src/**`) + Design-Time Python
+(`forge_compiler.py`, `forge_ai.py`, `cke.py`, `web_forge.py`, `dashboard.py`).
+**Contexto:** o Forge é o runtime line-rate que é **parte do HeraclitusDB** — esta
+auditoria aplica o mesmo padrão de rigor usado no HeraclitusDB de produção
+(ver `docs/md/falta_fazer.md §6.4` naquele repo).
+
+**Veredicto:** o Forge é um **protótipo ponta-a-ponta coerente e funcional** da
+Heraclitus Suite v6.0, com um **núcleo sólido** (store append-only + codec +
+runner dirigido por artefato). **Não está completo** para produção: vários
+pilares distribuídos/cripto/ingestão são **simulação assumida no código**, e a
+cobertura de testes é fina. Este documento lista o que foi corrigido, o que é
+lacuna de design (decisão de dono) e o roadmap para "completo".
+
+---
+
+## 1. Bugs CORRIGIDOS (commit `7cde0cb`)
+
+Todos confirmados contra o código real; cada um do mesmo tipo dos achados no
+HeraclitusDB de produção. Verificado verde (`cargo test`, 8 testes + 1 regressão).
+
+| Sev | Ficheiro | Bug | Correção |
+|---|---|---|---|
+| **HIGH** | `db.rs` | **Reabrir não recuperava estado.** `HeraclitusDB::new` de um `.hdb` existente repunha `current_lsn = BASE_LSN` e `trusted_root = ""`. O próximo `write_fact` atribuía um LSN já usado e dobrava a cadeia Merkle a partir do vazio ⇒ o `merkle_root_anchor` embutido divergia do que `verify()` recalcula sobre todo o ficheiro ⇒ **um append legítimo pós-restart marcava o banco como VIOLATED**. | Novo `recover()` reconstrói `current_lsn` + `trusted_root` do disco (filosofia replay-from-log do HeraclitusDB). Teste `reopen_preserves_chain_and_verifies`. |
+| **HIGH** | `db.rs` | **Sem `fsync`.** `write_fact` / `write_stream` / `commit_local` / `append_replicated_block` faziam `write_all` sem sincronizar — durabilidade dada como garantida sem o ser (incl. o líder Raft que acka aos followers). | `sync_all()` antes de cada ack e antes de ancorar. |
+| **MED** | `fbfact.rs` | **Alocação ilimitada.** `Vec::with_capacity(nsteps)` a partir de um `u32` não confiável do buffer. O CRC-32C do CPM não é *keyed* ⇒ quem tenha acesso de escrita ao ficheiro forja `nsteps = 0xFFFFFFFF` ⇒ OOM. | Limitado pelos bytes restantes do buffer. |
+| **MED** | `gateway.rs` | **Panic em UTF-8.** `POST /ingest` fatiava o corpo HTTP por **byte** (`&line[..80]`); um corpo multibyte que caísse a meio de um caractere panicava o handler. | Truncagem por caractere (`chars().take(n)`). |
+| **MED** | `raft.rs` | **Split-brain.** `become_follower` incondicional em `AppendEntries` apagava `voted_for` a cada heartbeat do MESMO termo ⇒ um nó que já votou em A no termo T podia votar em B no mesmo T. | Só reinicia o voto quando o termo **avança**. |
+| **LOW** | `hql.rs` | **Overflow/underflow.** `WITHIN LAST N` transbordava `a*unit*1e6` e o `now-window` fazia underflow (panic em debug) com N gigante. | Aritmética saturante. |
+
+---
+
+## 2. Lacunas de DESIGN (não são bugs pontuais — decisão de dono)
+
+Estas são **escolhas assumidas no código** (rotuladas como simulação/mock). Não
+foram "corrigidas" porque mudá-las é trabalho de produto, não de patch. Listadas
+por impacto para promover a produção.
+
+### 2.1 — [ALTO] Consenso Raft é uma SIMULAÇÃO
+- `raft.rs:9` — "simulacao determinística, sem rede real". Dirigido por ticks.
+- **Não persiste** `term` / `voted_for` / log Raft (só o `.hdb` de fatos é
+  durável). Restart ⇒ perde o estado de consenso.
+- `advance_commit` conta réplicas **ignorando o termo** — falta a regra
+  Figura-8 do Raft (só comprometer entradas do termo corrente diretamente). A
+  cadeia Merkle hash-linked mitiga histórias divergentes, mas a regra formal
+  não está lá.
+- O "Wire Protocol TCP (spec §8)" que a produção exigiria **não existe**.
+- **Comparar com o HeraclitusDB:** lá o consenso é openraft real (eleição +
+  quórum + failover + log durável). O Forge diverge disso.
+
+### 2.2 — [ALTO] Assinatura é MOCK
+- `forge_compiler.py:341` "Ed25519 mock"; `db.rs sign()` é BLAKE3 de um prefixo
+  fixo — **sem chave privada**. O `verify()` nem sequer confere a assinatura.
+- Consequência: o banco é **tamper-EVIDENTE** (cadeia Merkle + âncora), mas
+  **não é tamper-PROOF** contra um atacante com acesso de escrita ao ficheiro
+  (que recomputa cadeia + âncora + sig consistentes, tudo em texto plano).
+- O README promete "criptograficamente verificáveis" — **overstatement** face
+  ao que o código entrega.
+
+### 2.3 — [MÉDIO] Ingestão e conectores são de demonstração
+- Gateway: `gateway.rs:238` alimenta o `.hdb` com um array `SAMPLES` fixo num
+  timer de 1.2s — **não** é um tail real de PostgreSQL.
+- Registry tem **um único conector** (`registry/postgresql/` v1.0.0 + v1.1.0).
+  A proposta ("observações heterogêneas") pede vários; o CKE/forge_ai existem
+  para os gerar, mas ainda não foram.
+
+### 2.4 — [MÉDIO] Cobertura de testes fina
+- 8 testes Rust, todos em `cpm.rs` / `db.rs` / `fbfact.rs`.
+- **Sem teste nenhum** para `raft.rs`, `runner.rs`, `hql.rs`, `fabric`,
+  `gateway`. O caminho de consenso e o de raciocínio não têm rede de segurança.
+
+### 2.5 — [MÉDIO] Leitura carrega o ficheiro inteiro para a RAM
+- `db.rs verify()` e `hql.rs execute_query` fazem `read_to_end` do `.hdb`
+  completo. Ok à escala de demo; não passa disso num `.hdb` grande. O
+  HeraclitusDB de produção usa scan janelado (`scan_capped`).
+
+### 2.6 — [BAIXO] FlatBuffers hand-rolled
+- `fbfact.rs` é um stand-in manual do schema (`flatc` não instalado). Funciona e
+  é determinístico, mas não é o código gerado do `.fbs`. Trocar quando o `flatc`
+  entrar não muda o `db.rs` (documentado).
+
+### 2.7 — [BAIXO] Dashboard com dados mock
+- `dashboard.py:320 eventos_mock` — a visão do dashboard mistura dados
+  fabricados. Distinguir claramente do que vem do `/facts` real.
+
+---
+
+## 3. Roadmap de conclusão (ordem sugerida)
+
+**Marco A — Honestidade & robustez (barato, alto valor)**
+- [ ] Alinhar o README: "tamper-evidente via Merkle+âncora", não
+  "criptograficamente assinado", enquanto §2.2 não for resolvido.
+- [ ] Testes para `raft.rs` (convergência 3 nós, split-brain, fast-sync),
+  `hql.rs` (parser + janelas de tempo), `runner.rs` (regra casa/não-casa).
+- [ ] Leitura paginada em `verify()`/HQL (portar a ideia do `scan_capped`).
+
+**Marco B — Cripto real (§2.2)**
+- [ ] Chave ed25519 de verdade (assinar a âncora/raiz, não um hash fixo);
+  guardar a chave fora do `.hdb`; `verify()` passa a conferir a assinatura.
+
+**Marco C — Consenso de produção (§2.1)**
+- [ ] Persistir `term`/`voted_for`/log Raft (à la `meta.bin` do HeraclitusDB).
+- [ ] Regra de commit por termo (Figura-8).
+- [ ] Transporte TCP real (spec §8) OU reusar o transporte do HeraclitusDB.
+
+**Marco D — Ingestão & conectores (§2.3)**
+- [ ] Tail real de PostgreSQL no gateway/fabric.
+- [ ] ≥2 conectores novos via CKE/forge_ai (validar o Coverage pelo bin Rust).
+
+---
+
+## 4. O que já está SÓLIDO (não re-litigar)
+
+- **`cpm.rs`** — decode com bounds em todos os campos (`record_size` range,
+  `var_len+payload_len == record_size`, CRC, `parse_tlvs` com `checked_add`),
+  CRC-32C correto (vetor de teste bate), bons testes de tamper físico/cripto.
+- **`db.rs`** (pós-correções) — store append-only com dupla camada (CRC físico +
+  Merkle cripto), recovery no reabrir, fsync antes do ack.
+- **`fbfact.rs`** — codec determinístico zero-copy com bounds em `get_str`/
+  `skip_str`; alocação agora limitada.
+- **`runner.rs`** — motor **genérico dirigido por artefato** (`.hcx`), não
+  hardcoded a um conector.
+- **`forge_compiler.py`** — gera a anatomia `.hcx` completa e valida o Coverage
+  pelo **runner Rust real** (bin `coverage`), não por um fake em Python.
