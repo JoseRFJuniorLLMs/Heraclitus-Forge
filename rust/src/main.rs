@@ -10,8 +10,10 @@ use tracing::{info, warn, error};
 use heraclitus::db::HeraclitusDB;
 use heraclitus::runner::ReconstitutiveRunner;
 
-const ARTIFACT: &str = "../registry/postgresql.hcx";
-const SAMPLE: &str = "../samples/postgresql.log";
+const ARTIFACT_DIR: &str = "../registry/postgresql";
+/// Ficheiro de log a ingerir. Sobrepõe-se com a variável de ambiente
+/// HERACLITUS_SAMPLE (para testar com outros ficheiros sem recompilar).
+const SAMPLE_DEFAULT: &str = "../samples/postgresql.log";
 const DB_PATH: &str = "storage_rs.hdb";
 
 fn main() -> Result<()> {
@@ -24,21 +26,26 @@ fn main() -> Result<()> {
     info!("#  HERACLITUS (Rust) - CONECTOR POSTGRESQL");
     info!("{}", "#".repeat(64));
 
-    if !std::path::Path::new(ARTIFACT).exists() {
-        error!("\n[ERRO] Artefato {ARTIFACT} ausente.");
+    // O registry é VERSIONADO (`<base>/vX.Y.Z.hcx`); o caminho fixo antigo
+    // (`registry/postgresql.hcx`) já não existe e este binário falhava sempre.
+    let Some(artifact) = heraclitus::runner::resolve_latest_artifact(ARTIFACT_DIR) else {
+        error!("\n[ERRO] Nenhuma versao do conector em {ARTIFACT_DIR}.");
         error!("       Rode o Forge (Python) primeiro:  python forge_compiler.py");
         std::process::exit(1);
-    }
+    };
+    info!("[Runner] Artefato: {artifact}");
 
-    let mut runner = ReconstitutiveRunner::load(ARTIFACT)
+    let mut runner = ReconstitutiveRunner::load(&artifact)
         .context("Falha ao carregar artefato")?;
 
     info!("[Runner] Artefato carregado. Plano (Kahn): {}", runner.plan_str());
 
     let mut db = HeraclitusDB::new(DB_PATH).context("Falha ao abrir db")?;
 
-    info!("[Ingestao] Processando {SAMPLE}...");
-    let content = fs::read_to_string(SAMPLE).context("Falha ao ler sample")?;
+    let sample = std::env::var("HERACLITUS_SAMPLE").unwrap_or_else(|_| SAMPLE_DEFAULT.to_string());
+    info!("[Ingestao] Processando {sample}...");
+    let content = fs::read_to_string(&sample)
+        .with_context(|| format!("Falha ao ler o log {sample}"))?;
     for raw in content.lines().filter(|l| !l.trim().is_empty()) {
         match runner.process_observation(raw) {
             None => warn!("[DRIFT] linha rejeitada: {}", &raw[..raw.len().min(50)]),

@@ -1,0 +1,106 @@
+2026-08-06 09:00:01.137 UTC [20001] LOG:  database system is ready to accept connections
+2026-08-06 09:00:02.274 UTC [20010] FATAL:  password authentication failed for user "admin"
+2026-08-06 09:00:03.411 UTC [20011] FATAL:  password authentication failed for user "admin"
+2026-08-06 09:00:04.548 UTC [20012] FATAL:  password authentication failed for user "admin"
+2026-08-06 09:00:05.685 UTC [20013] FATAL:  password authentication failed for user "admin"
+2026-08-06 09:00:06.822 UTC [20014] FATAL:  password authentication failed for user "admin"
+2026-08-06 09:00:07.959 UTC [20015] FATAL:  password authentication failed for user "admin"
+2026-08-06 09:00:08.096 UTC [20016] FATAL:  password authentication failed for user "admin"
+2026-08-06 09:00:09.233 UTC [20017] FATAL:  password authentication failed for user "admin"
+2026-08-06 09:00:10.370 UTC [20018] FATAL:  password authentication failed for user "admin"
+2026-08-06 09:00:11.507 UTC [20019] FATAL:  password authentication failed for user "admin"
+2026-08-06 09:00:12.644 UTC [20020] FATAL:  password authentication failed for user "admin"
+2026-08-06 09:00:13.781 UTC [20021] FATAL:  password authentication failed for user "admin"
+2026-08-06 09:00:14.918 UTC [20100] admin@prod LOG:  connection authorized: user=admin database=prod
+2026-08-06 09:00:15.055 UTC [20100] admin@prod LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:00:16.192 UTC [20100] admin@prod LOG:  statement: SELECT * FROM users;
+2026-08-06 09:00:17.329 UTC [20100] admin@prod LOG:  statement: SELECT * FROM users;
+2026-08-06 09:00:18.466 UTC [20100] admin@prod ERROR:  permission denied for table salaries
+2026-08-06 09:00:19.603 UTC [20101] analyst@prod LOG:  connection authorized: user=analyst database=prod
+2026-08-06 09:00:20.740 UTC [20101] analyst@prod LOG:  statement: SELECT * FROM audit_log;
+2026-08-06 09:00:21.877 UTC [20101] analyst@prod LOG:  statement: SELECT * FROM salaries;
+2026-08-06 09:00:22.014 UTC [20101] analyst@prod LOG:  statement: SELECT * FROM salaries;
+2026-08-06 09:00:23.151 UTC [20101] analyst@prod ERROR:  permission denied for table users
+2026-08-06 09:00:24.288 UTC [20102] analyst@analytics LOG:  connection authorized: user=analyst database=analytics
+2026-08-06 09:00:25.425 UTC [20102] analyst@analytics LOG:  statement: SELECT * FROM cards;
+2026-08-06 09:00:26.562 UTC [20102] analyst@analytics ERROR:  permission denied for table cards
+2026-08-06 09:00:27.699 UTC [20103] svc_bkp@prod LOG:  connection authorized: user=svc_bkp database=prod
+2026-08-06 09:00:28.836 UTC [20103] svc_bkp@prod LOG:  statement: SELECT * FROM cards;
+2026-08-06 09:00:29.973 UTC [20103] svc_bkp@prod LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:00:30.110 UTC [20104] admin@prod LOG:  connection authorized: user=admin database=prod
+2026-08-06 09:00:31.247 UTC [20104] admin@prod LOG:  statement: SELECT * FROM audit_log;
+2026-08-06 09:00:32.384 UTC [20104] admin@prod LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:00:33.521 UTC [20104] admin@prod LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:00:34.658 UTC [20104] admin@prod ERROR:  permission denied for table orders
+2026-08-06 09:00:35.795 UTC [20105] admin@prod LOG:  connection authorized: user=admin database=prod
+2026-08-06 09:00:36.932 UTC [20105] admin@prod LOG:  statement: SELECT * FROM salaries;
+2026-08-06 09:00:37.069 UTC [20105] admin@prod LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:00:38.206 UTC [20106] analyst@staging LOG:  connection authorized: user=analyst database=staging
+2026-08-06 09:00:39.343 UTC [20106] analyst@staging LOG:  statement: SELECT * FROM audit_log;
+2026-08-06 09:00:40.480 UTC [20107] svc_bkp@prod LOG:  connection authorized: user=svc_bkp database=prod
+2026-08-06 09:00:41.617 UTC [20107] svc_bkp@prod LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:00:42.754 UTC [20107] svc_bkp@prod LOG:  statement: SELECT * FROM cards;
+2026-08-06 09:00:43.891 UTC [20107] svc_bkp@prod LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:00:44.028 UTC [20108] admin@prod LOG:  connection authorized: user=admin database=prod
+2026-08-06 09:00:45.165 UTC [20108] admin@prod LOG:  statement: SELECT * FROM users;
+2026-08-06 09:00:46.302 UTC [20108] admin@prod LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:00:47.439 UTC [20108] admin@prod LOG:  statement: SELECT * FROM salaries;
+2026-08-06 09:00:48.576 UTC [20109] admin@staging LOG:  connection authorized: user=admin database=staging
+2026-08-06 09:00:49.713 UTC [20109] admin@staging LOG:  statement: SELECT * FROM audit_log;
+2026-08-06 09:00:50.850 UTC [20109] admin@staging LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:00:51.987 UTC [20109] admin@staging ERROR:  permission denied for table orders
+2026-08-06 09:00:52.124 UTC [20110] guest@analytics LOG:  connection authorized: user=guest database=analytics
+2026-08-06 09:00:53.261 UTC [20110] guest@analytics LOG:  statement: SELECT * FROM salaries;
+2026-08-06 09:00:54.398 UTC [20110] guest@analytics LOG:  statement: SELECT * FROM cards;
+2026-08-06 09:00:55.535 UTC [20111] analyst@analytics LOG:  connection authorized: user=analyst database=analytics
+2026-08-06 09:00:56.672 UTC [20111] analyst@analytics LOG:  statement: SELECT * FROM users;
+2026-08-06 09:00:57.809 UTC [20112] app_ro@analytics LOG:  connection authorized: user=app_ro database=analytics
+2026-08-06 09:00:58.946 UTC [20112] app_ro@analytics LOG:  statement: SELECT * FROM cards;
+2026-08-06 09:00:59.083 UTC [20112] app_ro@analytics LOG:  statement: SELECT * FROM users;
+2026-08-06 09:01:00.220 UTC [20112] app_ro@analytics LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:01:01.357 UTC [20113] admin@prod LOG:  connection authorized: user=admin database=prod
+2026-08-06 09:01:02.494 UTC [20113] admin@prod LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:01:03.631 UTC [20114] admin@prod LOG:  connection authorized: user=admin database=prod
+2026-08-06 09:01:04.768 UTC [20114] admin@prod LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:01:05.905 UTC [20114] admin@prod LOG:  statement: SELECT * FROM users;
+2026-08-06 09:01:06.042 UTC [20114] admin@prod LOG:  statement: SELECT * FROM audit_log;
+2026-08-06 09:01:07.179 UTC [20114] admin@prod ERROR:  permission denied for table audit_log
+2026-08-06 09:01:08.316 UTC [20115] guest@staging LOG:  connection authorized: user=guest database=staging
+2026-08-06 09:01:09.453 UTC [20115] guest@staging LOG:  statement: SELECT * FROM users;
+2026-08-06 09:01:10.590 UTC [20116] analyst@staging LOG:  connection authorized: user=analyst database=staging
+2026-08-06 09:01:11.727 UTC [20116] analyst@staging LOG:  statement: SELECT * FROM cards;
+2026-08-06 09:01:12.864 UTC [20116] analyst@staging LOG:  statement: SELECT * FROM audit_log;
+2026-08-06 09:01:13.001 UTC [20116] analyst@staging LOG:  statement: SELECT * FROM cards;
+2026-08-06 09:01:14.138 UTC [20116] analyst@staging ERROR:  permission denied for table users
+2026-08-06 09:01:15.275 UTC [20117] guest@analytics LOG:  connection authorized: user=guest database=analytics
+2026-08-06 09:01:16.412 UTC [20117] guest@analytics LOG:  statement: SELECT * FROM salaries;
+2026-08-06 09:01:17.549 UTC [20117] guest@analytics LOG:  statement: SELECT * FROM salaries;
+2026-08-06 09:01:18.686 UTC [20118] guest@analytics LOG:  connection authorized: user=guest database=analytics
+2026-08-06 09:01:19.823 UTC [20118] guest@analytics LOG:  statement: SELECT * FROM audit_log;
+2026-08-06 09:01:20.960 UTC [20119] svc_bkp@staging LOG:  connection authorized: user=svc_bkp database=staging
+2026-08-06 09:01:21.097 UTC [20119] svc_bkp@staging LOG:  statement: SELECT * FROM audit_log;
+2026-08-06 09:01:22.234 UTC [20119] svc_bkp@staging LOG:  statement: SELECT * FROM cards;
+2026-08-06 09:01:23.371 UTC [20119] svc_bkp@staging LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:01:24.508 UTC [20120] admin@analytics LOG:  connection authorized: user=admin database=analytics
+2026-08-06 09:01:25.645 UTC [20120] admin@analytics LOG:  statement: SELECT * FROM salaries;
+2026-08-06 09:01:26.782 UTC [20120] admin@analytics LOG:  statement: SELECT * FROM cards;
+2026-08-06 09:01:27.919 UTC [20120] admin@analytics LOG:  statement: SELECT * FROM orders;
+2026-08-06 09:01:28.056 UTC [20121] app_ro@prod LOG:  connection authorized: user=app_ro database=prod
+2026-08-06 09:01:29.193 UTC [20121] app_ro@prod LOG:  statement: SELECT * FROM audit_log;
+2026-08-06 09:01:30.330 UTC [20121] app_ro@prod LOG:  statement: SELECT * FROM users;
+2026-08-06 09:01:31.467 UTC [20122] app_ro@analytics LOG:  connection authorized: user=app_ro database=analytics
+2026-08-06 09:01:32.604 UTC [20122] app_ro@analytics LOG:  statement: SELECT * FROM cards;
+2026-08-06 09:01:33.741 UTC [20123] app_ro@analytics LOG:  connection authorized: user=app_ro database=analytics
+2026-08-06 09:01:34.878 UTC [20123] app_ro@analytics LOG:  statement: SELECT * FROM cards;
+2026-08-06 09:01:35.015 UTC [20123] app_ro@analytics LOG:  statement: SELECT * FROM users;
+2026-08-06 09:01:36.152 UTC [20123] app_ro@analytics LOG:  statement: SELECT * FROM users;
+2026-08-06 09:01:37.289 UTC [20123] app_ro@analytics ERROR:  permission denied for table users
+2026-08-06 09:01:38.426 UTC [20124] analyst@analytics LOG:  connection authorized: user=analyst database=analytics
+2026-08-06 09:01:39.563 UTC [20124] analyst@analytics LOG:  statement: SELECT * FROM cards;
+2026-08-06 09:01:40.700 UTC [20124] analyst@analytics ERROR:  permission denied for table salaries
+2026-08-06 09:01:41.837 UTC [20500] FATAL:  the database system is shutting down
+2026-08-06 09:01:42.974 UTC [20501] FATAL:  the database system is shutting down
+2026-08-06 09:01:43.111 UTC [20502] FATAL:  the database system is shutting down
+=== isto nao e um log do postgres ===
+{"json":"tambem nao","n":42}
+Aug  6 10:15:01 host sshd[123]: Accepted password for root from 10.0.0.5

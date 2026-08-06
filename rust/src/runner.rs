@@ -505,3 +505,33 @@ mod tests {
         assert!(of.is_none(), "linha desconhecida deveria cair em Schema Drift (None)");
     }
 }
+
+/// Resolve a versão MAIS RECENTE de um conector no registry versionado
+/// (`<base>/vX.Y.Z.hcx`). O registry passou a ser versionado mas alguns
+/// binários ainda apontavam para um caminho fixo `<nome>.hcx` que já não
+/// existe — daí este resolver partilhado.
+pub fn resolve_latest_artifact(base: &str) -> Option<String> {
+    let dir = Path::new(base);
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut highest = (0u32, 0u32, 0u32);
+    let mut highest_path = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('v') && name.ends_with(".hcx") {
+            let parts: Vec<u32> = name[1..name.len() - 4]
+                .split('.')
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if parts.len() == 3 {
+                let t = (parts[0], parts[1], parts[2]);
+                if t >= highest {
+                    highest = t;
+                    highest_path = Some(e.path().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    highest_path
+}
