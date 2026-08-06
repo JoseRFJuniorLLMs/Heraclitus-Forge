@@ -136,17 +136,62 @@ CONNECTOR_PROFILES = {
         "confidence": 0.984,
         "parse": {
             "engine": "regex",
-            "pattern": r"^<(?P<pri>\d+)> (?P<user>\S+) failed password for (?P<target>\S+) from (?P<ip>\S+)",
+            # Formato REAL do syslog do OpenSSH (/var/log/auth.log):
+            #   "Aug  6 10:00:01 srv01 sshd[2000]: Failed password for u from 1.2.3.4 port 40000 ssh2"
+            # O padrao anterior esperava um prefixo de prioridade "<13> ..." que
+            # o sshd NUNCA escreve em ficheiro — rejeitava 100% dos logs reais.
+            "pattern": (
+                r"^(?P<ts>[A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2}) "
+                r"(?P<host>\S+) "
+                r"(?P<proc>\w+)\[(?P<pid>\d+)\]:\s+(?P<message>.*)$"
+            ),
         },
         "reasoning": [
             {
                 "id": "ssh_auth_failure",
-                "when": [],
+                "when": [{"field": "message",
+                          "matches": r"Failed password for (?:invalid user )?(?P<target_user>\S+) from (?P<src_ip>\S+)"}],
                 "set": {
                     "action": "authentication.failure",
                     "behavior_class": "credential_attack",
                     "risk": "High",
-                    "identity": {"actor_name": "${user}", "target_id": "${target}", "source_ip": "${ip}"},
+                    "identity": {"actor_name": "${target_user}", "target_id": "${host}",
+                                 "source_ip": "${src_ip}"},
+                },
+            },
+            {
+                "id": "ssh_invalid_user",
+                "when": [{"field": "message",
+                          "matches": r"Invalid user (?P<target_user>\S+) from (?P<src_ip>\S+)"}],
+                "set": {
+                    "action": "authentication.invalid_user",
+                    "behavior_class": "reconnaissance",
+                    "risk": "Medium",
+                    "identity": {"actor_name": "${target_user}", "target_id": "${host}",
+                                 "source_ip": "${src_ip}"},
+                },
+            },
+            {
+                "id": "ssh_auth_success",
+                "when": [{"field": "message",
+                          "matches": r"Accepted (?:password|publickey) for (?P<target_user>\S+) from (?P<src_ip>\S+)"}],
+                "set": {
+                    "action": "authentication.success",
+                    "behavior_class": "session",
+                    "risk": "Low",
+                    "identity": {"actor_name": "${target_user}", "target_id": "${host}",
+                                 "source_ip": "${src_ip}"},
+                },
+            },
+            {
+                "id": "ssh_session_opened",
+                "when": [{"field": "message",
+                          "matches": r"session opened for user (?P<target_user>\S+)"}],
+                "set": {
+                    "action": "session.open",
+                    "behavior_class": "session",
+                    "risk": "Low",
+                    "identity": {"actor_name": "${target_user}", "target_id": "${host}"},
                 },
             },
         ],
@@ -160,8 +205,12 @@ CONNECTOR_PROFILES = {
             },
         ],
         "test_matrix": [
-            {"input": "<13> admin failed password for root from 187.4.5.1",
+            {"input": "Aug  6 10:00:01 srv01 sshd[2000]: Failed password for deploy from 203.0.113.45 port 40000 ssh2",
              "expect_action": "authentication.failure"},
+            {"input": "Aug  6 10:00:10 srv01 sshd[2100]: Accepted password for admin from 10.0.0.5 port 41000 ssh2",
+             "expect_action": "authentication.success"},
+            {"input": "Aug  6 10:00:22 srv01 sshd[2200]: Invalid user oracle from 198.51.100.7 port 42000",
+             "expect_action": "authentication.invalid_user"},
         ],
         "benchmark": {"estimated_eps": 82000, "avg_latency_ms": 1.2},
     },
@@ -395,9 +444,31 @@ class HeraclitusForgeCompiler:
 
 
 if __name__ == "__main__":
-    compiler = HeraclitusForgeCompiler()
-    compiler.compile_knowledge(
-        artifact_id="postgresql",
-        vendor="PostgreSQL Global Development Group",
-        sample_log='2026-06-26 01:20:05.123 UTC [14802] FATAL:  password authentication failed for user "admin"',
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Forge — compila conhecimento num artefato .hcx versionado.",
+        epilog=("Formatos com perfil deterministico: " + ", ".join(CONNECTOR_PROFILES) + ". "
+                "Um artifact_id fora dessa lista usa o Forge AI (precisa de ANTHROPIC_API_KEY) "
+                "e, sem chave, cai no perfil keyvalue_generic."),
+    )
+    ap.add_argument("artifact_id", nargs="?", default="postgresql",
+                    help="identificador do conector (ex.: postgresql, linux_sshd, nginx)")
+    ap.add_argument("--vendor", default="PostgreSQL Global Development Group")
+    ap.add_argument("--sample", default=None,
+                    help="UMA linha de exemplo do log; ou use --sample-file")
+    ap.add_argument("--sample-file", default=None,
+                    help="ficheiro de log: usa a primeira linha nao vazia como amostra")
+    args = ap.parse_args()
+
+    sample = args.sample
+    if args.sample_file:
+        with open(args.sample_file, encoding="utf-8") as fh:
+            sample = next((l.strip() for l in fh if l.strip()), None)
+    if not sample:
+        sample = ('2026-06-26 01:20:05.123 UTC [14802] FATAL:  '
+                  'password authentication failed for user "admin"')
+
+    HeraclitusForgeCompiler().compile_knowledge(
+        artifact_id=args.artifact_id, vendor=args.vendor, sample_log=sample,
     )

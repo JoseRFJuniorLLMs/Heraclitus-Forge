@@ -1,0 +1,25 @@
+Aug  6 10:00:01 srv01 sshd[2000]: Failed password for deploy from 203.0.113.45 port 40000 ssh2
+Aug  6 10:00:02 srv01 sshd[2001]: Failed password for admin from 203.0.113.45 port 40001 ssh2
+Aug  6 10:00:03 srv01 sshd[2002]: Failed password for ubuntu from 203.0.113.45 port 40002 ssh2
+Aug  6 10:00:04 srv01 sshd[2003]: Failed password for root from 203.0.113.45 port 40003 ssh2
+Aug  6 10:00:05 srv01 sshd[2004]: Failed password for root from 203.0.113.45 port 40004 ssh2
+Aug  6 10:00:06 srv01 sshd[2005]: Failed password for root from 203.0.113.45 port 40005 ssh2
+Aug  6 10:00:07 srv01 sshd[2006]: Failed password for deploy from 203.0.113.45 port 40006 ssh2
+Aug  6 10:00:08 srv01 sshd[2007]: Failed password for root from 203.0.113.45 port 40007 ssh2
+Aug  6 10:00:09 srv01 sshd[2008]: Failed password for admin from 203.0.113.45 port 40008 ssh2
+Aug  6 10:00:10 srv01 sshd[2100]: Accepted password for root from 203.0.113.45 port 41000 ssh2
+Aug  6 10:00:11 srv01 sshd[2100]: pam_unix(sshd:session): session opened for user root
+Aug  6 10:00:12 srv01 sshd[2101]: Accepted password for ubuntu from 198.51.100.7 port 41001 ssh2
+Aug  6 10:00:13 srv01 sshd[2101]: pam_unix(sshd:session): session opened for user ubuntu
+Aug  6 10:00:14 srv01 sshd[2102]: Accepted password for root from 203.0.113.45 port 41002 ssh2
+Aug  6 10:00:15 srv01 sshd[2102]: pam_unix(sshd:session): session opened for user root
+Aug  6 10:00:16 srv01 sshd[2103]: Accepted password for root from 10.0.0.5 port 41003 ssh2
+Aug  6 10:00:17 srv01 sshd[2103]: pam_unix(sshd:session): session opened for user root
+Aug  6 10:00:18 srv01 sshd[2104]: Accepted password for ubuntu from 203.0.113.45 port 41004 ssh2
+Aug  6 10:00:19 srv01 sshd[2104]: pam_unix(sshd:session): session opened for user ubuntu
+Aug  6 10:00:20 srv01 sshd[2105]: Accepted password for root from 203.0.113.45 port 41005 ssh2
+Aug  6 10:00:21 srv01 sshd[2105]: pam_unix(sshd:session): session opened for user root
+Aug  6 10:00:22 srv01 sshd[2200]: Invalid user oracle from 198.51.100.7 port 42000
+Aug  6 10:00:23 srv01 sshd[2201]: Invalid user oracle from 198.51.100.7 port 42001
+Aug  6 10:00:24 srv01 sshd[2202]: Invalid user oracle from 198.51.100.7 port 42002
+2026-08-06 09:00:01.000 UTC [999] LOG:  isto e postgres, nao sshd

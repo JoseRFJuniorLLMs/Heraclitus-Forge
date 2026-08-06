@@ -10,7 +10,10 @@ use tracing::{info, warn, error};
 use heraclitus::db::HeraclitusDB;
 use heraclitus::runner::ReconstitutiveRunner;
 
-const ARTIFACT_DIR: &str = "../registry/postgresql";
+/// Conector a usar. Sobrepõe-se com `HERACLITUS_ARTIFACT=<dir do conector>`
+/// (ex.: `../registry/linux_sshd`) — sem isto só se conseguia ingerir
+/// PostgreSQL, por muito que o Forge compilasse outros conectores.
+const ARTIFACT_DIR_DEFAULT: &str = "../registry/postgresql";
 /// Ficheiro de log a ingerir. Sobrepõe-se com a variável de ambiente
 /// HERACLITUS_SAMPLE (para testar com outros ficheiros sem recompilar).
 const SAMPLE_DEFAULT: &str = "../samples/postgresql.log";
@@ -28,8 +31,10 @@ fn main() -> Result<()> {
 
     // O registry é VERSIONADO (`<base>/vX.Y.Z.hcx`); o caminho fixo antigo
     // (`registry/postgresql.hcx`) já não existe e este binário falhava sempre.
-    let Some(artifact) = heraclitus::runner::resolve_latest_artifact(ARTIFACT_DIR) else {
-        error!("\n[ERRO] Nenhuma versao do conector em {ARTIFACT_DIR}.");
+    let artifact_dir = std::env::var("HERACLITUS_ARTIFACT")
+        .unwrap_or_else(|_| ARTIFACT_DIR_DEFAULT.to_string());
+    let Some(artifact) = heraclitus::runner::resolve_latest_artifact(&artifact_dir) else {
+        error!("\n[ERRO] Nenhuma versao do conector em {artifact_dir}.");
         error!("       Rode o Forge (Python) primeiro:  python forge_compiler.py");
         std::process::exit(1);
     };
