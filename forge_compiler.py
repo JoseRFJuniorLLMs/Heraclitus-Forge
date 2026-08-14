@@ -16,6 +16,7 @@ import _console  # noqa: F401  (consola UTF-8 no Windows)
 import os
 import json
 import hashlib
+import pathlib
 import subprocess
 
 import yaml
@@ -388,15 +389,25 @@ class HeraclitusForgeCompiler:
             print(f"[+] Coverage (runner Rust): "
                   f"{coverage['covered']}/{coverage['total']} = {coverage['rate']:.1f}%")
 
-        # --- 8. signature.sig (Ed25519 mock sobre o hash combinado) ----------
+        # --- 8. signature.sig (Ed25519 REAL — Marco B, ver forge_sign.py) ----
+        # Era um SHA-256 truncado com um prefixo "ed25519:" a mentir: nao havia
+        # chave nenhuma e quem alterasse o artefato recalculava o selo em duas
+        # linhas. Agora e uma assinatura ed25519 sobre o digest canonico de TODO
+        # o artefato, verificavel contra registry/publisher.pub.
         print("[+] Finalizando com blindagem criptografica...")
-        hasher = hashlib.sha256()
-        for target_file in self.SIGNED_FILES:
-            with open(os.path.join(package_path, target_file), "rb") as f:
-                hasher.update(f.read())
-        signature = f"ed25519:sig:{hasher.hexdigest()[:48]}"
-        with open(os.path.join(package_path, "signature.sig"), "w", encoding="utf-8") as f:
-            f.write(signature)
+        try:
+            import forge_sign
+            sig = forge_sign.sign_artifact(pathlib.Path(package_path))
+            print(f"[+] Assinatura ed25519: {sig[:16]}...")
+        except SystemExit as e:
+            # Sem chave de publicacao o artefato SAI SEM ASSINATURA, e diz que
+            # saiu. O que nao pode acontecer e sair com um selo que finge ser
+            # uma assinatura -- foi esse o defeito que este bloco corrigiu.
+            sig_path = os.path.join(package_path, "signature.sig")
+            if os.path.exists(sig_path):
+                os.remove(sig_path)
+            print(f"[!] SEM ASSINATURA: {e}")
+            print("[!] O artefato e valido mas NAO tem prova de origem.")
 
         print(f"[OK] COMPILACAO CONCLUIDA. Artefato pronto em: {package_path}\n")
         return package_path

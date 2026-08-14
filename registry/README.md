@@ -33,22 +33,56 @@ entre versões do mesmo conector, permite rever o que o Forge (ou o Claude, via
 a fonte da verdade — em vez da pasta local de quem correu o compilador por
 último.
 
-## Ressalva: a assinatura ainda é mock
+## Assinatura Ed25519 (Marco B — fechado em 2026-08-14)
 
-O `signature.sig` diz `ed25519:sig:…` mas **não é uma assinatura ed25519 real**
-— é um selo determinístico gerado pelo `forge_compiler.py`. A âncora do `.hdb`
-essa sim é assinada com ed25519 a sério (Marco B); o artefato `.hcx` está à
-espera do mesmo tratamento. Ver `AUDIT.md` §2.2 (residual do Marco B).
+Cada artefato traz uma assinatura **ed25519 real** sobre um digest canónico de
+todo o seu conteúdo, verificável contra `publisher.pub` (versionada aqui — é a
+âncora de confiança).
 
-Até lá: **não trates a presença do `signature.sig` como prova de origem.** A
-prova de origem de um `.hcx` neste momento é o histórico do git.
+```bash
+python forge_sign.py verify-all                        # varre o registry
+python forge_sign.py verify registry/postgresql/v1.2.0.hcx
+```
+
+O `signature.sig` é autodescritivo e diz **quem** assinou:
+
+```
+format=hcx-v2
+alg=ed25519
+key=5254bdb1…      <- tem de bater com publisher.pub
+digest=a1182519…   <- SHA-256 canónico do artefato
+sig=fc1e7a94…      <- 64 bytes
+```
+
+**O que mudou.** Até 13 de agosto o `signature.sig` dizia `ed25519:sig:<hash>`
+mas era um SHA-256 truncado — não havia chave nenhuma, e quem alterasse um
+artefato recalculava o selo em duas linhas. O digest antigo cobria uma *lista
+fixa* de ficheiros, por isso acrescentar um ficheiro novo ao pacote nem sequer o
+mexia. O novo cobre **todos** os ficheiros, com nome e comprimento a enquadrar
+cada um.
+
+**Modelo de confiança.** A chave de publicação é distinta da chave da âncora do
+`.hdb`: aquela prova que *os dados* não foram adulterados na máquina que os
+serve, esta prova que *o conhecimento* foi publicado por quem diz tê-lo
+publicado. A privada vive em `~/.heraclitus/publisher.key`, **fora** do
+repositório — um `git add -A` distraído nunca a apanha.
+
+**Limite honesto.** Isto prova *quem publicou*, não que o conhecimento esteja
+correto. Um conector mal derivado, assinado, continua mal derivado. A revisão do
+conteúdo é o code review; a assinatura só garante que o que revíste é o que
+corre.
 
 ## Compilar um conector novo
 
 ```bash
 export ANTHROPIC_API_KEY=...          # sem isto, o perfil sai semanticamente vazio
+python forge_sign.py keygen           # uma vez por publicador
 python cke_forge_pipeline.py /caminho/do/cliente.log
 ```
+
+Artefatos novos nascem assinados. Sem chave de publicação o compilador emite o
+artefato **sem** `signature.sig` e diz que o fez — o que nunca volta a acontecer
+é sair um selo a fingir que é uma assinatura.
 
 O `compiled_at` do `manifest.yaml` é fixo de propósito — mantém o artefato
 byte-a-byte reproduzível para a mesma entrada, para que um diff no git mostre
