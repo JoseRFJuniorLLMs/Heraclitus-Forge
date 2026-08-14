@@ -40,6 +40,11 @@ path = "src/bin/fabric.rs"
 name = "coverage"
 path = "src/bin/coverage.rs"
 
+# Ponte Forge -> HeraclitusDB: exporta os Fatos do .hdb em JSON Lines
+[[bin]]
+name = "export_facts"
+path = "src/bin/export_facts.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

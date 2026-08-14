@@ -4,6 +4,11 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
+
+# Estado de retoma da ponte (bridge.py) — local à máquina, nunca partilhado:
+# guarda o último LSN exportado deste .hdb para este HeraclitusDB.
+.bridge_state.json
 
 # Artefatos gerados em runtime (regeneraveis pelo Forge / DB)
 registry/

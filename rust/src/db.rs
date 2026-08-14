@@ -194,6 +194,65 @@ where
     }
 }
 
+/// Resultado de uma exportação (ver [`export_facts`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ExportStats {
+    /// Blocos varridos no ficheiro.
+    pub scanned: u64,
+    /// Fatos entregues ao callback (passaram CRC + decode + `from_lsn`).
+    pub exported: u64,
+    /// Blocos saltados por CRC-32C inválido (`CpmDecoded::Torn`).
+    pub torn: u64,
+    /// Blocos cujo payload decodificou mal (fbfact corrompido).
+    pub undecodable: u64,
+    /// Último LSN entregue — ponto de retoma para a próxima exportação.
+    pub last_lsn: u64,
+}
+
+/// Exporta os Fatos do `.hdb` em **streaming**, para fora do runtime do Forge.
+///
+/// Esta é a superfície pública que a ponte Forge → HeraclitusDB consome: o
+/// `scan_blocks` é `pub(crate)` (enquadramento físico, não é contrato), aqui o
+/// que sai é o **Fato Operacional** já validado e desserializado.
+///
+/// Por bloco: valida o CRC-32C (camada física CPM-200), decodifica o corpo
+/// `fbfact` e chama `f(lsn, fact)`. Blocos com CRC partido são **saltados e
+/// contados** — nunca silenciados; quem julga a integridade da cadeia é o
+/// [`HeraclitusDB::verify`], não o exportador.
+///
+/// `from_lsn` retoma uma exportação anterior (entrega apenas `lsn > from_lsn`);
+/// devolver `false` no callback interrompe (limite de lote).
+pub fn export_facts<F>(db_path: &str, from_lsn: u64, mut f: F) -> std::io::Result<ExportStats>
+where
+    F: FnMut(u64, serde_json::Value) -> bool,
+{
+    let mut st = ExportStats::default();
+    scan_blocks(db_path, |lsn, raw_payload| {
+        st.scanned += 1;
+        if lsn <= from_lsn {
+            return true;
+        }
+        let rec = match crate::cpm::decode_record(raw_payload) {
+            crate::cpm::CpmDecoded::Record(rec, _) => rec,
+            crate::cpm::CpmDecoded::Torn => {
+                st.torn += 1;
+                return true;
+            }
+        };
+        let fact = match crate::cpm::record_to_fact(&rec) {
+            Ok(v) => v,
+            Err(_) => {
+                st.undecodable += 1;
+                return true;
+            }
+        };
+        st.exported += 1;
+        st.last_lsn = lsn;
+        f(lsn, fact)
+    })?;
+    Ok(st)
+}
+
 pub struct HeraclitusDB {
     pub db_path: String,
     anchor_path: String,
@@ -615,6 +674,112 @@ mod tests {
             "fact.confidence": 0.9,
             "fact.knowledge_version":"k-v1","fact.reasoning_version":"r-v6","fact.ontology_version":"v9"
         })
+    }
+
+    // -- export_facts: a superfície que a ponte Forge -> HeraclitusDB consome --
+
+    /// O exportador tem de devolver os Fatos ÍNTEGROS e por ordem de LSN, e o
+    /// `last_lsn` tem de ser o ponto de retoma correto.
+    #[test]
+    fn export_facts_yields_every_written_fact() {
+        let p = tmp_path("export_all");
+        let mut db = HeraclitusDB::new(&p).unwrap();
+        for i in 0..5 {
+            let mut f = fact(&format!("action{i}"));
+            db.write_fact(&mut f).unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let st = export_facts(&p, 0, |lsn, f| {
+            seen.push((lsn, f["fact.behavior"]["action"].as_str().unwrap().to_string()));
+            true
+        })
+        .unwrap();
+
+        assert_eq!(st.exported, 5, "todos os fatos escritos têm de sair");
+        assert_eq!(st.torn, 0);
+        assert_eq!(st.undecodable, 0);
+        assert_eq!(seen.len(), 5);
+        // Ordem de LSN estritamente crescente — a ponte depende disto para retomar.
+        assert!(seen.windows(2).all(|w| w[0].0 < w[1].0), "LSN tem de crescer");
+        assert_eq!(seen[0].1, "action0");
+        assert_eq!(seen[4].1, "action4");
+        assert_eq!(st.last_lsn, seen[4].0);
+    }
+
+    /// `from_lsn` é o contrato de retoma: exportar duas vezes seguidas não pode
+    /// entregar o mesmo Fato duas vezes — senão a ponte duplica no HeraclitusDB.
+    #[test]
+    fn export_facts_from_lsn_resumes_without_duplicates() {
+        let p = tmp_path("export_resume");
+        let mut db = HeraclitusDB::new(&p).unwrap();
+        for i in 0..6 {
+            let mut f = fact(&format!("a{i}"));
+            db.write_fact(&mut f).unwrap();
+        }
+
+        // Primeiro lote: 4 Fatos (limite via early-exit do callback).
+        let mut first = Vec::new();
+        let st1 = export_facts(&p, 0, |lsn, _| {
+            first.push(lsn);
+            first.len() < 4
+        })
+        .unwrap();
+        assert_eq!(first.len(), 4);
+
+        // Segundo lote: retoma do último entregue.
+        let mut second = Vec::new();
+        let st2 = export_facts(&p, st1.last_lsn, |lsn, _| {
+            second.push(lsn);
+            true
+        })
+        .unwrap();
+
+        assert_eq!(second.len(), 2, "sobram exatamente os 2 que faltavam");
+        assert!(
+            first.iter().all(|l| !second.contains(l)),
+            "nenhum LSN pode aparecer nos dois lotes"
+        );
+        assert_eq!(st2.exported, 2);
+    }
+
+    /// Um bloco com CRC-32C partido é SALTADO e CONTADO — nunca silenciado nem
+    /// entregue como Fato válido. É isto que impede a ponte de propagar dados
+    /// corrompidos para o HeraclitusDB.
+    #[test]
+    fn export_facts_counts_tampered_blocks_instead_of_yielding_them() {
+        let p = tmp_path("export_tamper");
+        let mut db = HeraclitusDB::new(&p).unwrap();
+        let mut lsns = Vec::new();
+        for i in 0..3 {
+            let mut f = fact(&format!("a{i}"));
+            lsns.push(db.write_fact(&mut f).unwrap());
+        }
+
+        let clean = export_facts(&p, 0, |_, _| true).unwrap();
+        assert_eq!(clean.exported, 3);
+        assert_eq!(clean.torn, 0);
+
+        // Corrompe fisicamente o bloco do meio.
+        assert!(db.inject_malicious_tamper(lsns[1]).unwrap());
+
+        let after = export_facts(&p, 0, |_, _| true).unwrap();
+        assert_eq!(after.scanned, 3, "os 3 blocos continuam a ser varridos");
+        assert_eq!(
+            after.exported + after.torn + after.undecodable,
+            3,
+            "cada bloco é exportado OU contado como partido — nada desaparece"
+        );
+        assert!(after.torn + after.undecodable >= 1, "o bloco adulterado tem de ser apanhado");
+        assert!(after.exported < 3, "um bloco adulterado não pode sair como Fato válido");
+    }
+
+    /// Um `.hdb` que não existe não é um panic nem um sucesso vazio ambíguo.
+    #[test]
+    fn export_facts_on_missing_file_is_empty_not_panic() {
+        let st = export_facts("nao_existe_de_todo.hdb", 0, |_, _| true).unwrap();
+        assert_eq!(st.exported, 0);
+        assert_eq!(st.scanned, 0);
     }
 
     /// Regressão do bug-chave: reabrir um `.hdb` existente TEM de recuperar
