@@ -119,7 +119,17 @@ por impacto para promover a produção.
   chave privada em `<db>.key` (0600, `.gitignore`), pública em `<db>.pub`,
   assinatura em `<db>.anchor.sig`; `verify()` confere (camada 3). Cada nó Raft
   assina a sua própria âncora local. Tag por-Fato honesta (`b3tag:`).
-- [ ] (residual) Assinar também o artefato `.hcx` no `forge_compiler.py`.
+- [x] **(residual) — ✅ FEITO (2026-08-14)** Assinar também o artefato `.hcx`.
+  Novo `forge_sign.py`: chave de **publicação** ed25519 distinta da chave da
+  âncora (domínios de confiança diferentes), privada em
+  `~/.heraclitus/publisher.key` **fora do repositório**, pública fixada em
+  `registry/publisher.pub` (versionada). O digest canónico cobre **todos** os
+  ficheiros do artefato com nome+comprimento a enquadrar — o selo antigo cobria
+  uma lista fixa, por isso acrescentar um ficheiro ao pacote não o invalidava.
+  Sem chave, o compilador emite o artefato **sem** assinatura e diz que o fez.
+  14 testes, incluindo alterar/acrescentar/apagar/renomear ficheiro, chave
+  estranha, assinatura corrompida, e o selo antigo a ser reportado como
+  `LEGACY_MOCK` e nunca como válido.
 
 **Marco C — Consenso de produção (§2.1) — ✅ FEITO**
 - [x] Persistir `term`/`voted_for` (`<db>.raftmeta`) + log Raft (`<db>.raftlog`),

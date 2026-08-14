@@ -23,10 +23,17 @@ storage.hdb*
 quarantine.log
 
 # Material de chave (Marco B) — a CHAVE PRIVADA NUNCA pode ser commitada.
-# .pub/.anchor.sig nao sao secretos mas sao regeneraveis; ficam de fora tambem.
+# .pub/.anchor.sig do .hdb sao regeneraveis com o proprio .hdb; ficam de fora.
 *.key
 *.pub
 *.anchor.sig
+
+# EXCECAO: a chave PUBLICA de publicacao TEM de ser versionada. E a ancora de
+# confianca dos artefatos .hcx — sem ela ninguem que clone o repo consegue
+# verificar uma assinatura, e a prova de origem morre no clone. Nao e segredo:
+# e o oposto de um segredo. A privada correspondente vive em
+# ~/.heraclitus/publisher.key, FORA do repositorio.
+!registry/publisher.pub
 
 # Estado de consenso durável (Marco C) — regeneravel/local ao no.
 *.raftmeta
