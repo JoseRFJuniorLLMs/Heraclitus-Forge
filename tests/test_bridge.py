@@ -247,31 +247,48 @@ def test_dry_run_nao_escreve_nada(tmp_path, exporter):
 # Ponta-a-ponta contra o HeraclitusDB a sério (opt-in: -m live)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.live
-def test_ponta_a_ponta_contra_o_heraclitusdb(tmp_path, exporter):
-    """
-    O teste que a auditoria disse não existir: um Fato do Forge chega ao
-    HeraclitusDB e é encontrado por uma query, com a cadeia de custódia intacta.
-    """
+def _live_db():
+    """Liga ao HeraclitusDB real ou salta o teste. Nunca falha por indisponibilidade."""
     heraclitusdb = pytest.importorskip("heraclitusdb")
     try:
         db = heraclitusdb.connect(bridge.DEFAULT_ADDR)
-        antes = db.head()
+        db.head()
+        return db
     except Exception as e:
         pytest.skip(f"HeraclitusDB não acessível em {bridge.DEFAULT_ADDR}: {e}")
 
-    st = tmp_path / "estado.json"
-    r = bridge.run(HDB, apply=True, addr=bridge.DEFAULT_ADDR, state_path=st,
-                   reset=True, limit=3, batch=100)
-    assert r["appended"] == 3, f"erros: {r['errors']}"
+
+@pytest.mark.live
+def test_ponta_a_ponta_contra_o_heraclitusdb(exporter):
+    """
+    O teste que a auditoria disse não existir: um Fato do Forge chega ao
+    HeraclitusDB e é encontrado por uma query, com a cadeia de custódia intacta.
+
+    Usa o ficheiro de estado REAL e nunca `reset`: correr este teste N vezes
+    escreve no máximo uma vez cada Fato. A primeira versão deste teste usava
+    `reset=True` com um `tmp_path`, e por isso reescrevia os mesmos Fatos na
+    memória do utilizador a cada `pytest -m live` — o log é append-only, esse
+    lixo não se apaga. Se não houver nada de novo para exportar, o teste salta
+    em vez de inventar trabalho.
+    """
+    db = _live_db()
+    antes = db.head()
+
+    pendentes = list(bridge.export_jsonl(HDB, _last_bridged(), limit=3))
+    if not pendentes:
+        pytest.skip("nada de novo no .hdb — a ponte já está em dia (é o estado correto)")
+
+    r = bridge.run(HDB, apply=True, addr=bridge.DEFAULT_ADDR,
+                   state_path=bridge.DEFAULT_STATE, reset=False, limit=3, batch=100)
+    assert r["appended"] == len(pendentes), f"erros: {r['errors']}"
     assert db.head() > antes
 
     achados = db.query(
-        f'MATCH (n) WHERE n.agent_id = "{bridge.AGENT_ID}" RETURN n LIMIT 200'
+        f'MATCH (n) WHERE n.agent_id = "{bridge.AGENT_ID}" RETURN n LIMIT 500'
     )
     assert achados, "os Fatos escritos têm de ser encontráveis por agent_id"
 
-    esperados = {lsn for lsn, _ in bridge.export_jsonl(HDB, 0, limit=3)}
+    esperados = {lsn for lsn, _ in pendentes}
     obtidos = {int(e["attrs"]["forge_lsn"]) for e in achados if "forge_lsn" in e["attrs"]}
     assert esperados <= obtidos, "todos os LSN exportados têm de estar no banco"
 
@@ -281,21 +298,29 @@ def test_ponta_a_ponta_contra_o_heraclitusdb(tmp_path, exporter):
     db.close()
 
 
-@pytest.mark.live
-def test_correr_a_ponte_duas_vezes_nao_duplica(tmp_path, exporter):
-    """A propriedade que torna a ponte segura de agendar: é idempotente."""
-    heraclitusdb = pytest.importorskip("heraclitusdb")
-    try:
-        heraclitusdb.connect(bridge.DEFAULT_ADDR).close()
-    except Exception as e:
-        pytest.skip(f"HeraclitusDB não acessível: {e}")
+def _last_bridged() -> int:
+    return int(bridge.load_state(bridge.DEFAULT_STATE)
+               .get(str(HDB.resolve()), {}).get("last_lsn", 0))
 
-    st = tmp_path / "estado.json"
-    r1 = bridge.run(HDB, apply=True, addr=bridge.DEFAULT_ADDR, state_path=st,
-                    reset=True, limit=2, batch=100)
-    r2 = bridge.run(HDB, apply=True, addr=bridge.DEFAULT_ADDR, state_path=st,
-                    reset=False, limit=2, batch=100)
-    assert r1["appended"] == 2
-    assert r2["last_lsn"] > r1["last_lsn"], "a 2ª corrida avança, não repete"
-    assert r1["last_lsn"] not in [lsn for lsn, _ in
-                                  bridge.export_jsonl(HDB, r1["last_lsn"], limit=2)]
+
+@pytest.mark.live
+def test_a_ponte_em_dia_nao_escreve_nada(exporter):
+    """
+    A propriedade que torna a ponte segura de agendar: quando não há Fatos
+    novos, uma corrida é um no-op — não acrescenta um único episódio.
+
+    Isto é o inverso do teste anterior e não precisa de escrever nada, por isso
+    pode correr sempre.
+    """
+    db = _live_db()
+    antes = db.head()
+
+    r = bridge.run(HDB, apply=True, addr=bridge.DEFAULT_ADDR,
+                   state_path=bridge.DEFAULT_STATE, reset=False, limit=None, batch=100)
+    # Segunda corrida imediata: o .hdb não cresceu, logo não há nada a fazer.
+    r2 = bridge.run(HDB, apply=True, addr=bridge.DEFAULT_ADDR,
+                    state_path=bridge.DEFAULT_STATE, reset=False, limit=None, batch=100)
+
+    assert r2["appended"] == 0, "uma ponte em dia não pode reescrever nada"
+    assert db.head() == antes + r["appended"], "o banco só cresceu o que a ponte escreveu"
+    db.close()

@@ -31,6 +31,14 @@ Retoma
 ------
 O último LSN exportado por `.hdb` fica em `.bridge_state.json`. Correr duas
 vezes seguidas não duplica nada — a segunda corrida não tem trabalho.
+
+LIMITE CONHECIDO: a idempotência vem do ficheiro de estado, **não** do banco.
+Se o `.bridge_state.json` se perder, ou se correr com `--reset`, os mesmos Fatos
+são acrescentados outra vez — e o log do HeraclitusDB é append-only, esses
+episódios não se apagam. Distinguem-se pelo `attrs.fact_id`, que é estável para
+o mesmo Fato (o mesmo `fact_id` a aparecer duas vezes = reexportação, não dois
+acontecimentos). Uma versão futura pode deduplicar consultando os `fact_id` já
+presentes antes de escrever; hoje não o faz para não pagar uma query por Fato.
 """
 from __future__ import annotations
 
