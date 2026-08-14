@@ -1,0 +1,8 @@
+{
+  "cases": [
+    {
+      "input": "<13> admin failed password for root from 187.4.5.1",
+      "expect_action": "authentication.failure"
+    }
+  ]
+}

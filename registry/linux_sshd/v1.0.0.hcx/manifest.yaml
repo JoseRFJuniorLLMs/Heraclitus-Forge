@@ -1,0 +1,6 @@
+id: br.gov.heraclitus.pipelines.linux_sshd-v1.0.0
+vendor: OpenSSH
+version: 1.0.0
+schema_version: v9
+domain: identity_access
+compiled_at: '2026-06-26T02:10:00Z'

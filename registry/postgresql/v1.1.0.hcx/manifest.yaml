@@ -1,0 +1,6 @@
+id: br.gov.heraclitus.pipelines.postgresql-v1.1.0
+vendor: PostgreSQL Global Development Group
+version: 1.1.0
+schema_version: v9
+domain: database_security
+compiled_at: '2026-06-26T02:10:00Z'

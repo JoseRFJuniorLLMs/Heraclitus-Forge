@@ -1,0 +1,8 @@
+signatures:
+- id: pg_brute_force
+  trigger_action: authentication.failure
+  window_secs: 60
+  threshold: 5
+  escalate_to:
+    behavior_class: brute_force_attack
+    risk: Critical
