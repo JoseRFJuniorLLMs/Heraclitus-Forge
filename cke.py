@@ -15,6 +15,7 @@ conector `.hcx` completo) é o passo opcional de IA em `forge_ai.py`
 (requer `ANTHROPIC_API_KEY`).
 """
 
+import _console  # noqa: F401  (consola UTF-8 no Windows)
 import math
 import os
 import re

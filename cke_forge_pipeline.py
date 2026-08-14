@@ -21,6 +21,8 @@ Uso:
 """
 from __future__ import annotations
 
+import _console  # noqa: F401  (consola UTF-8 no Windows)
+
 import argparse
 import json
 import re

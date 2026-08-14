@@ -17,6 +17,8 @@ Requer: pip install anthropic pydantic
 
 from __future__ import annotations
 
+import _console  # noqa: F401  (consola UTF-8 no Windows)
+
 import os
 from typing import List, Optional
 
