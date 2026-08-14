@@ -39,6 +39,7 @@ Python (Design-Time / Cloud)            Rust (Runtime / Line-Rate)
 | `forge_compiler.py` | **Forge** — compila o conhecimento num artefato `.hcx` v6 declarativo. O Coverage é validado pelo **runner Rust real** (bin `coverage`), não por um runner Python. |
 | `forge_ai.py` | **Forge AI** (opcional) — deriva conector de formatos desconhecidos via **Claude** (`messages.parse` + Pydantic, `claude-opus-4-8`). |
 | `cke.py` | **CKE** (Knowledge Cloud) — clusteriza a quarentena (`quarantine.log` do Fabric) e gera sementes de novos conectores. |
+| `bridge.py` | **Ponte Forge → HeraclitusDB** — traduz os Fatos do `.hdb` para o [HeraclitusDB](https://github.com/JoseRFJuniorLLMs/HeraclitusDB) event-sourced (gRPC :7474). Ver [§ A ponte](#a-ponte-para-o-heraclitusdb). |
 
 > Latência de IA/compilação não afeta produção; orquestrar agentes e validar schema
 > é muito mais ágil em Python — por isso o Forge **permanece** em Python (spec).
@@ -80,6 +81,56 @@ cargo run --release --bin bench -- 1000000       # benchmark de EPS
 # 3. Cloud (Python): o CKE evolui o conhecimento a partir da quarentena
 python cke.py rust/quarantine.log   # clusteriza -> sementes de conector p/ o Forge
 ```
+
+## A ponte para o HeraclitusDB
+
+> **Dois sistemas, um nome.** O `HeraclitusDB` deste repositório (`rust/src/db.rs`)
+> é o store append-only **embebido** do runtime — blocos `HERA`/`FACT`, âncora
+> ed25519 externa, feito para line-rate na borda. O
+> [HeraclitusDB](https://github.com/JoseRFJuniorLLMs/HeraclitusDB) é um projeto
+> **separado**: um banco event-sourced em rede (gRPC :7474, segmentos `HRKL`/`HFTR`,
+> grafo + vetor + texto). Os formatos são **incompatíveis** e nenhum lê o ficheiro
+> do outro — por isso existe uma ponte, e não uma migração.
+
+O `.hdb` continua a ser o buffer tamper-evidente de borda; o HeraclitusDB passa a
+ser o sistema de registo durável e consultável.
+
+```
+.hdb ──► export_facts (Rust) ──JSONL──► bridge.py (Python) ──gRPC──► HeraclitusDB
+         decodifica o formato            fala o SDK
+```
+
+```bash
+cd rust && cargo build --release --bin export_facts && cd ..
+
+python bridge.py                 # dry-run: mostra o mapeamento, não escreve
+python bridge.py --apply         # escreve mesmo (retoma de onde ficou)
+python bridge.py --apply --reset # reexporta desde o LSN 0
+```
+
+A ponte é **idempotente**: o último LSN exportado fica em `.bridge_state.json`, por
+isso correr duas vezes não duplica. A **cadeia de custódia** atravessa a tradução —
+`merkle_root_anchor`, `leaf_hash`, `integrity_signature` e `evidence_hash` viajam
+nos `attrs`, para que um Fato no HeraclitusDB continue a poder ser ligado de volta
+à cadeia BLAKE3 assinada do Forge. O mapa canónico é a função `bridge.map_fact()` —
+é a **única** definição do contrato, e os testes importam-na em vez de a copiar.
+
+Consultar do lado do HeraclitusDB:
+
+```
+MATCH (n:OperationalFact) WHERE n.agent_id = "heraclitus-forge" RETURN n
+```
+
+## Testes
+
+```bash
+cd rust && cargo test          # 28 testes do runtime
+cd .. && pytest                # 19 testes da ponte (não escrevem em lado nenhum)
+pytest -m live                 # + 2 ponta-a-ponta contra o HeraclitusDB real
+```
+
+Os testes `live` estão **de fora** por omissão: o HeraclitusDB local costuma ser um
+banco a sério, não um sandbox — um `pytest` distraído não lhe deve acrescentar lixo.
 
 ## Conectores
 
