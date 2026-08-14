@@ -1,0 +1,16 @@
+{
+  "cases": [
+    {
+      "input": "Aug  6 10:00:01 srv01 sshd[2000]: Failed password for deploy from 203.0.113.45 port 40000 ssh2",
+      "expect_action": "authentication.failure"
+    },
+    {
+      "input": "Aug  6 10:00:10 srv01 sshd[2100]: Accepted password for admin from 10.0.0.5 port 41000 ssh2",
+      "expect_action": "authentication.success"
+    },
+    {
+      "input": "Aug  6 10:00:22 srv01 sshd[2200]: Invalid user oracle from 198.51.100.7 port 42000",
+      "expect_action": "authentication.invalid_user"
+    }
+  ]
+}

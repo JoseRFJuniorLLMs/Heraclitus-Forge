@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "input": "2026-06-26 01:20:05.123 UTC [14802] FATAL:  password authentication failed for user \"admin\"",
+      "expect_action": "authentication.failure"
+    },
+    {
+      "input": "2026-06-26 01:20:11.500 UTC [14808] admin@prod LOG:  connection authorized: user=admin database=prod",
+      "expect_action": "authentication.success"
+    },
+    {
+      "input": "2026-06-26 01:20:12.000 UTC [14808] admin@prod LOG:  statement: SELECT * FROM salaries;",
+      "expect_action": "query.execute"
+    },
+    {
+      "input": "2026-06-26 01:20:13.000 UTC [14809] guest@prod ERROR:  permission denied for table salaries",
+      "expect_action": "authorization.failure"
+    },
+    {
+      "input": "2026-06-26 01:20:00.001 UTC [14801] LOG:  database system is ready to accept connections",
+      "expect_action": "log.info"
+    }
+  ]
+}

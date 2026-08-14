@@ -1,0 +1,11 @@
+rules:
+- id: ssh_auth_failure
+  when: []
+  set:
+    action: authentication.failure
+    behavior_class: credential_attack
+    risk: High
+    identity:
+      actor_name: ${user}
+      target_id: ${target}
+      source_ip: ${ip}

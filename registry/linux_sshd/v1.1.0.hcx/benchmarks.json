@@ -1,0 +1,8 @@
+{
+  "coverage_rate": 100.0,
+  "covered": 3,
+  "total": 3,
+  "estimated_eps": 82000,
+  "avg_latency_ms": 1.2,
+  "global_confidence_score": 0.984
+}

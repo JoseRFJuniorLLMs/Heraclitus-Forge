@@ -1,0 +1,25 @@
+version: '6.0'
+dag:
+  parse:
+    engine: regex
+    depends_on: []
+    config:
+      pattern: ^<(?P<pri>\d+)> (?P<user>\S+) failed password for (?P<target>\S+) from
+        (?P<ip>\S+)
+  normalize:
+    engine: reasoner
+    depends_on:
+    - parse
+    config:
+      ruleset: reasoning.yaml
+  behavior:
+    engine: sliding_window
+    depends_on:
+    - normalize
+    config:
+      model: behavior.model
+  emit:
+    engine: fact_emitter
+    depends_on:
+    - behavior
+    config: {}

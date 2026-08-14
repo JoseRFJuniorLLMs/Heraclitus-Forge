@@ -1,0 +1,66 @@
+rules:
+- id: pg_auth_failure
+  when:
+  - field: message
+    matches: password authentication failed for user "(?P<target_user>[^"]+)"
+  set:
+    action: authentication.failure
+    behavior_class: credential_attack
+    risk: High
+    identity:
+      actor_name: ${target_user}
+      target_id: postgresql
+- id: pg_connection_authorized
+  when:
+  - field: message
+    matches: 'connection authorized: user=(?P<target_user>\w+)(?: database=(?P<target_db>\w+))?'
+  set:
+    action: authentication.success
+    behavior_class: session
+    risk: Low
+    identity:
+      actor_name: ${target_user}
+      target_id: ${target_db}
+- id: pg_permission_denied
+  when:
+  - field: message
+    contains: permission denied
+  set:
+    action: authorization.failure
+    behavior_class: privilege_violation
+    risk: Medium
+    identity:
+      actor_name: ${user}
+      target_id: ${db}
+- id: pg_statement
+  when:
+  - field: message
+    matches: '^statement: (?P<stmt>.+)$'
+  set:
+    action: query.execute
+    behavior_class: data_access
+    risk: Low
+    identity:
+      actor_name: ${user}
+      target_id: ${db}
+- id: pg_fatal
+  when:
+  - severity_in:
+    - FATAL
+    - PANIC
+  set:
+    action: system.fault
+    behavior_class: availability
+    risk: High
+    identity:
+      actor_name: ${user}
+      target_id: ${db}
+- id: pg_info
+  when: []
+  set:
+    action: log.info
+    behavior_class: observation
+    risk: Low
+    identity:
+      actor_name: ${user}
+      target_id: ${db}

@@ -11,7 +11,12 @@ venv/
 .bridge_state.json
 
 # Artefatos gerados em runtime (regeneraveis pelo Forge / DB)
-registry/
+#
+# NOTA: o `registry/` JA NAO e ignorado. Um conector compilado nao e um
+# artefato descartavel — e o patrimonio do projeto (o "Knowledge Registry" da
+# spec). Versiona-lo da diff entre versoes do mesmo conector, permite revisao
+# do que o Forge/Claude derivou, e faz do repo a fonte da verdade em vez da
+# pasta local de quem correu o compilador por ultimo.
 *.hdb
 *.hdb.anchor
 storage.hdb*
