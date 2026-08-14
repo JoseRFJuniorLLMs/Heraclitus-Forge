@@ -68,9 +68,26 @@ DEFAULT_ADDR = "127.0.0.1:7474"
 #: `MATCH (n:OperationalFact)` encontre exatamente o que o Forge produziu.
 KIND = "OperationalFact"
 
-#: `agent_id` de proveniência — permite isolar (ou filtrar) tudo o que veio do
-#: Forge com `WHERE n.agent_id = "heraclitus-forge"`, sem tocar no resto do log.
-AGENT_ID = "heraclitus-forge"
+#: Quem PRODUZIU os Fatos. Vai em `attrs.producer` (não em `agent_id` — ver abaixo).
+PRODUCER = "heraclitus-forge"
+
+#: Prefixo do `agent_id`. O `agent_id` do HeraclitusDB **não** é um rótulo de
+#: proveniência: é a unidade de APAGAMENTO. A cifra em repouso guarda uma chave
+#: ChaCha20-Poly1305 por `agent_id` e o `shred(agent_id)` destrói essa chave,
+#: tornando o conteúdo permanentemente ilegível sem nunca mutar o log — é assim
+#: que um log append-only cumpre o direito à eliminação (LGPD art. 18, GDPR 17).
+#:
+#: Logo o `agent_id` tem de ser o TITULAR DOS DADOS, não o sistema produtor. Com
+#: `agent_id="heraclitus-forge"` para tudo, apagar os dados de um servidor
+#: obrigaria a destruir a chave de TODOS os Fatos do Forge — o pedido de
+#: eliminação de uma pessoa apagaria o histórico de toda a gente, e recusá-lo
+#: seria incumprimento. Com um `agent_id` por titular, `shred("titular:carlos")`
+#: apaga exatamente o que tem de apagar.
+SUBJECT_PREFIX = "titular:"
+
+#: Usado quando o Fato não identifica um actor (log de sistema, ruído).
+#: Fica num balde próprio para nunca se misturar com dados de uma pessoa.
+NO_SUBJECT = "titular:_sem_titular"
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +120,22 @@ def render_content(fact: dict) -> str:
     src = _flat(fact, "fact.identity", "source.ip")
     tail = f" from {src}" if src else ""
     return f"{actor} executed {action} on {target}{tail}"
+
+
+def subject_of(fact: dict) -> str:
+    """
+    O titular dos dados deste Fato — vira o `agent_id`, que é a unidade de
+    apagamento do HeraclitusDB (ver SUBJECT_PREFIX).
+
+    Usa `actor.id` e não `actor.name`: o id é a chave estável da pessoa; o nome
+    muda (casamento, correção de registo) e um apagamento que dependa do nome
+    falha silenciosamente contra os Fatos gravados com o nome antigo.
+    """
+    actor = _flat(fact, "fact.identity", "actor.id") \
+        or _flat(fact, "fact.identity", "actor.name")
+    if not actor or actor == "unknown":
+        return NO_SUBJECT
+    return f"{SUBJECT_PREFIX}{actor}"
 
 
 def map_fact(lsn: int, fact: dict) -> dict:
@@ -150,6 +183,9 @@ def map_fact(lsn: int, fact: dict) -> dict:
         "input_source":        _flat(fact, "fact.lineage", "input_source"),
 
         # --- proveniência da própria ponte ---
+        # `producer` substitui o antigo uso do `agent_id` como marca de origem.
+        # Filtrar tudo o que veio do Forge:  WHERE n.producer = "heraclitus-forge"
+        "producer":            PRODUCER,
         "forge_lsn":           lsn,
         "generated_by":        "heraclitus_forge_bridge",
     }
@@ -160,7 +196,7 @@ def map_fact(lsn: int, fact: dict) -> dict:
     return {
         "kind": KIND,
         "content": render_content(fact),
-        "agent_id": AGENT_ID,
+        "agent_id": subject_of(fact),
         # Agrupa os Fatos pelo artefato .hcx que os produziu — todas as leituras
         # de um mesmo conector versionado partilham a "sessão".
         "session_id": str(fact.get("fact.knowledge_version") or ""),
@@ -300,7 +336,9 @@ def run(hdb: Path, *, apply: bool, addr: str, state_path: Path,
         print(f"{len(errors)} erro(s):")
         for e in errors:
             print(f"  • {e}")
-    print(f"Consultar:  MATCH (n:{KIND}) WHERE n.agent_id = \"{AGENT_ID}\" RETURN n")
+    print(f"Consultar:   MATCH (n:{KIND}) WHERE n.producer = \"{PRODUCER}\" RETURN n")
+    print(f"Apagar (LGPD): admin(\"shred:{SUBJECT_PREFIX}<id do titular>\")"
+          f"  — exige encryption_at_rest ligado")
     return {"read": len(facts), "appended": appended, "last_lsn": last_lsn, "errors": errors}
 
 
