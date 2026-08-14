@@ -87,9 +87,52 @@ def test_kind_e_o_nome_canonico_da_spec():
     assert bridge.KIND == "OperationalFact"
 
 
-def test_agent_id_isola_o_que_veio_do_forge():
+def test_producer_isola_o_que_veio_do_forge():
     ep = bridge.map_fact(1, _sample_fact())
-    assert ep["agent_id"] == "heraclitus-forge"
+    assert ep["attrs"]["producer"] == "heraclitus-forge"
+
+
+def test_agent_id_e_o_titular_dos_dados_nao_o_produtor():
+    """
+    O `agent_id` do HeraclitusDB é a unidade de APAGAMENTO: existe uma chave
+    ChaCha20-Poly1305 por `agent_id` e o `shred(agent_id)` destrói-a.
+
+    A primeira versão da ponte punha `agent_id="heraclitus-forge"` em TODOS os
+    Fatos. Com dados pessoais isso é incumprimento da LGPD: para apagar os dados
+    de uma pessoa seria preciso destruir a chave de todos os Fatos do Forge —
+    o pedido de eliminação de um titular apagaria o histórico de toda a gente.
+    """
+    ep = bridge.map_fact(1, _sample_fact())
+    assert ep["agent_id"] == "titular:deploy"
+    assert ep["agent_id"] != bridge.PRODUCER
+
+
+def test_titulares_diferentes_ficam_em_agent_ids_diferentes():
+    """Sem isto, um `shred` não consegue ser cirúrgico."""
+    a = _sample_fact()
+    b = _sample_fact()
+    b["fact.identity"]["actor.id"] = "ana"
+    assert bridge.map_fact(1, a)["agent_id"] != bridge.map_fact(2, b)["agent_id"]
+
+
+def test_o_titular_vem_do_id_estavel_e_nao_do_nome():
+    """
+    O nome muda (casamento, correção de registo). Um apagamento indexado pelo
+    nome falharia silenciosamente contra os Fatos gravados com o nome antigo.
+    """
+    f = _sample_fact()
+    f["fact.identity"]["actor.id"] = "mat-4471"
+    f["fact.identity"]["actor.name"] = "Carlos Silva"
+    assert bridge.map_fact(1, f)["agent_id"] == "titular:mat-4471"
+
+
+def test_fato_sem_actor_vai_para_um_balde_proprio():
+    """Um log de sistema não pode aterrar no `agent_id` de uma pessoa."""
+    f = _sample_fact()
+    f["fact.identity"]["actor.id"] = None
+    f["fact.identity"]["actor.name"] = None
+    assert bridge.map_fact(1, f)["agent_id"] == bridge.NO_SUBJECT
+    assert bridge.map_fact(1, {})["agent_id"] == bridge.NO_SUBJECT
 
 
 def test_a_cadeia_de_custodia_sobrevive_a_traducao():
@@ -284,7 +327,7 @@ def test_ponta_a_ponta_contra_o_heraclitusdb(exporter):
     assert db.head() > antes
 
     achados = db.query(
-        f'MATCH (n) WHERE n.agent_id = "{bridge.AGENT_ID}" RETURN n LIMIT 500'
+        f'MATCH (n) WHERE n.producer = "{bridge.PRODUCER}" RETURN n LIMIT 500'
     )
     assert achados, "os Fatos escritos têm de ser encontráveis por agent_id"
 
