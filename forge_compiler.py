@@ -12,6 +12,7 @@ esteira multiagente (Claude). Aqui ele esta versionado em codigo para tornar o
 pipeline reprodutivel e testavel. Cada profile descreve UM conector.
 """
 
+import _console  # noqa: F401  (consola UTF-8 no Windows)
 import os
 import json
 import hashlib
