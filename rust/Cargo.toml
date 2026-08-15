@@ -1,8 +1,10 @@
 [package]
 name = "heraclitus-forge"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Heraclitus Runner + HeraclitusDB — runtime nativo line-rate (port Rust)"
+publish = false
+license-file = "../LICENSE"
 
 [lib]
 name = "heraclitus"
@@ -45,6 +47,10 @@ path = "src/bin/coverage.rs"
 name = "export_facts"
 path = "src/bin/export_facts.rs"
 
+[[bin]]
+name = "quarantine"
+path = "src/bin/quarantine.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -53,7 +59,7 @@ regex = "1"
 blake3 = "1"
 ed25519-dalek = "2"   # Marco B: assinatura real da âncora (não mais mock)
 getrandom = "0.2"     # geração da seed da chave (CSPRNG do SO)
-bincode = "1"         # Marco C.2: serialização das mensagens Raft no wire TCP
+chacha20poly1305 = "0.10" # quarentena cifrada XChaCha20-Poly1305
 uuid = { version = "1", features = ["v7"] }
 anyhow = "1"
 thiserror = "2"
@@ -62,6 +68,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Gateway de ingestao (backend do dashboard) — stack Rust recomendada
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 axum = "0.7"
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

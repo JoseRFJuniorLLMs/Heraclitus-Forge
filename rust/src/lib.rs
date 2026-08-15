@@ -5,12 +5,13 @@
 //! de producao — o Runner (line-rate) e o HeraclitusDB (append-only) — para Rust,
 //! lendo os artefatos `.hcx` ja homologados.
 
+pub mod cpm;
+pub mod db;
 pub mod error;
 pub mod fact;
 pub mod fbfact;
-pub mod cpm;
-pub mod db;
-pub mod runner;
-pub mod raft;
-pub mod wire;
 pub mod hql;
+pub mod quarantine;
+pub mod raft;
+pub mod runner;
+pub mod wire;

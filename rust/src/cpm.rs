@@ -63,7 +63,10 @@ pub struct Tlv {
 
 impl Tlv {
     pub fn new(tag: u16, value: impl Into<Vec<u8>>) -> Self {
-        Self { tag, value: value.into() }
+        Self {
+            tag,
+            value: value.into(),
+        }
     }
 }
 
@@ -91,7 +94,10 @@ impl CpmRecord {
 
     /// Value of the first TLV with `tag`, if present.
     pub fn tlv(&self, tag: u16) -> Option<&[u8]> {
-        self.tlvs.iter().find(|t| t.tag == tag).map(|t| t.value.as_slice())
+        self.tlvs
+            .iter()
+            .find(|t| t.tag == tag)
+            .map(|t| t.value.as_slice())
     }
 
     fn encode_tlvs(&self) -> Vec<u8> {
@@ -197,7 +203,10 @@ fn parse_tlvs(mut buf: &[u8]) -> Option<Vec<Tlv>> {
         if buf.len() < end {
             return None;
         }
-        out.push(Tlv { tag, value: buf[6..end].to_vec() });
+        out.push(Tlv {
+            tag,
+            value: buf[6..end].to_vec(),
+        });
         buf = &buf[end..];
     }
     Some(out)
@@ -212,7 +221,11 @@ const CRC32C_TABLE: [u32; 256] = {
         let mut crc = i as u32;
         let mut j = 0;
         while j < 8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
             j += 1;
         }
         table[i] = crc;
@@ -285,13 +298,19 @@ pub fn fact_to_record(fact: &Value) -> CpmRecord {
         .and_then(|t| t.get("system_timestamp"))
         .and_then(|v| v.as_i64())
         .unwrap_or(0) as u64;
-    let confidence = fact.get("fact.confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let confidence = fact
+        .get("fact.confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
     let confidence_raw = (confidence.clamp(0.0, 1.0) * u16::MAX as f64).round() as u16;
 
     let mut tlvs = Vec::new();
     // 0x0003 Legal Digital Receipt <- ICP-Brasil/SERPRO timestamp receipt.
     if let Some(carimbo) = sget(fact, &["fact.evidence", "carimbo_tempo_legal"]) {
-        tlvs.push(Tlv::new(TLV_LEGAL_DIGITAL_RECEIPT, carimbo.as_bytes().to_vec()));
+        tlvs.push(Tlv::new(
+            TLV_LEGAL_DIGITAL_RECEIPT,
+            carimbo.as_bytes().to_vec(),
+        ));
     }
     // 0x0004 Origin Tenant Id <- the pipeline/source that produced the fact.
     if let Some(src) = sget(fact, &["fact.lineage", "input_source"]) {
@@ -351,11 +370,22 @@ mod tests {
         assert_eq!(rec.ontology_ver, 9); // "v9" -> 9
         assert!((rec.confidence() - 0.972).abs() < 1e-3);
         // fact_id is a real UUID -> its 16 canonical bytes
-        assert_eq!(rec.event_id, *uuid::Uuid::parse_str("019f035c-1823-7fe9-8c54-02b2d1acc30c").unwrap().as_bytes());
+        assert_eq!(
+            rec.event_id,
+            *uuid::Uuid::parse_str("019f035c-1823-7fe9-8c54-02b2d1acc30c")
+                .unwrap()
+                .as_bytes()
+        );
         // the legal timestamp receipt rides in TLV 0x0003
-        assert_eq!(rec.tlv(TLV_LEGAL_DIGITAL_RECEIPT), Some(&b"icp_brasil_serpro_tst_recibo"[..]));
+        assert_eq!(
+            rec.tlv(TLV_LEGAL_DIGITAL_RECEIPT),
+            Some(&b"icp_brasil_serpro_tst_recibo"[..])
+        );
         // the origin pipeline rides in TLV 0x0004
-        assert_eq!(rec.tlv(TLV_ORIGIN_TENANT_ID).unwrap(), b"br.gov.heraclitus.pipelines.postgresql-v1.0.0");
+        assert_eq!(
+            rec.tlv(TLV_ORIGIN_TENANT_ID).unwrap(),
+            b"br.gov.heraclitus.pipelines.postgresql-v1.0.0"
+        );
     }
 
     #[test]
@@ -367,10 +397,19 @@ mod tests {
                 assert_eq!(consumed, bytes.len());
                 let back = record_to_fact(&rec).unwrap();
                 // pristine payload preserves the whole fact body losslessly
-                assert_eq!(back["fact.behavior"]["action"], fact["fact.behavior"]["action"]);
+                assert_eq!(
+                    back["fact.behavior"]["action"],
+                    fact["fact.behavior"]["action"]
+                );
                 assert_eq!(back["fact.confidence"], fact["fact.confidence"]);
-                assert_eq!(back["fact.evidence"]["carimbo_tempo_legal"], fact["fact.evidence"]["carimbo_tempo_legal"]);
-                assert_eq!(back["fact.lineage"]["transformation_steps"], fact["fact.lineage"]["transformation_steps"]);
+                assert_eq!(
+                    back["fact.evidence"]["carimbo_tempo_legal"],
+                    fact["fact.evidence"]["carimbo_tempo_legal"]
+                );
+                assert_eq!(
+                    back["fact.lineage"]["transformation_steps"],
+                    fact["fact.lineage"]["transformation_steps"]
+                );
             }
             CpmDecoded::Torn => panic!("valid record decoded as Torn"),
         }
@@ -383,7 +422,10 @@ mod tests {
         for i in 4..bytes.len() {
             let mut t = bytes.clone();
             t[i] ^= 0x01;
-            assert!(matches!(decode_record(&t), CpmDecoded::Torn), "bit-rot at {i} slipped the CRC32C lane");
+            assert!(
+                matches!(decode_record(&t), CpmDecoded::Torn),
+                "bit-rot at {i} slipped the CRC32C lane"
+            );
         }
     }
 
@@ -397,8 +439,15 @@ mod tests {
         let size = u32::from_le_bytes(t[4..8].try_into().unwrap()) as usize;
         let new_crc = crc32c(&t[4..size]).to_le_bytes();
         t[..4].copy_from_slice(&new_crc);
-        assert!(matches!(decode_record(&t), CpmDecoded::Record(..)), "crc was repaired");
-        assert_ne!(leaf0, record_leaf(&t), "Merkle leaf must move under field tamper");
+        assert!(
+            matches!(decode_record(&t), CpmDecoded::Record(..)),
+            "crc was repaired"
+        );
+        assert_ne!(
+            leaf0,
+            record_leaf(&t),
+            "Merkle leaf must move under field tamper"
+        );
     }
 
     #[test]
@@ -409,7 +458,10 @@ mod tests {
         match decode_record(&bytes) {
             CpmDecoded::Record(got, _) => {
                 assert_eq!(got.tlv(0xBEEF), Some(&b"future"[..]));
-                assert!(record_to_fact(&got).is_ok(), "pristine payload readable past unknown TLV");
+                assert!(
+                    record_to_fact(&got).is_ok(),
+                    "pristine payload readable past unknown TLV"
+                );
             }
             CpmDecoded::Torn => panic!("unknown TLV must be skipped, not rejected"),
         }

@@ -5,19 +5,19 @@
 //!   2. Lider ingere Fatos (via Runner) e replica para os followers.
 //!   3. Particao de rede isola um follower enquanto novos Fatos sao commitados.
 //!   4. Cura da particao => o follower faz fast-sync e o cluster converge.
+//!
 //! Ao final, todos os nos tem o mesmo LSN, a mesma raiz Merkle e `verify() == INTEG_OK`.
 
 use std::collections::VecDeque;
-use std::fs;
 
 use anyhow::{Context, Result};
-use tracing::{info, warn, error};
+use tracing::{error, info};
 
 use heraclitus::db::HeraclitusDB;
 use heraclitus::raft::{Msg, RaftNode};
 use heraclitus::runner::ReconstitutiveRunner;
 
-const ARTIFACT: &str = "../registry/postgresql.hcx";
+const ARTIFACT_DIR: &str = "../registry/postgresql";
 const SAMPLES: &[&str] = &[
     "2026-06-26 01:20:05.123 UTC [14802] FATAL:  password authentication failed for user \"admin\"",
     "2026-06-26 01:20:06.230 UTC [14803] FATAL:  password authentication failed for user \"bob\"",
@@ -33,16 +33,23 @@ struct Cluster {
 }
 
 impl Cluster {
-    fn new(n: usize) -> Result<Self> {
+    fn new(n: usize, dir: &std::path::Path) -> Result<Self> {
         let mut nodes = Vec::new();
         for id in 0..n {
-            let path = format!("node{id}.hdb");
-            let _ = fs::remove_file(&path);
-            let _ = fs::remove_file(format!("{path}.anchor"));
+            let path = dir.join(format!("node{id}.hdb"));
+            let path = path.to_string_lossy().into_owned();
             let peers = (0..n).filter(|&p| p != id).collect();
-            nodes.push(RaftNode::new(id, peers, HeraclitusDB::new(&path).context("Erro ao criar DB")?));
+            nodes.push(RaftNode::new(
+                id,
+                peers,
+                HeraclitusDB::new(&path).context("Erro ao criar DB")?,
+            ));
         }
-        Ok(Self { nodes, queue: VecDeque::new(), partitioned: vec![false; n] })
+        Ok(Self {
+            nodes,
+            queue: VecDeque::new(),
+            partitioned: vec![false; n],
+        })
     }
 
     fn round(&mut self) {
@@ -80,7 +87,10 @@ impl Cluster {
 
     fn submit(&mut self, fact: &mut serde_json::Value) -> Result<()> {
         let lid = self.leader_id().context("sem lider")?;
-        let (lsn, root, block) = self.nodes[lid].db.commit_local(fact).context("falha no commit local")?;
+        let (lsn, root, block) = self.nodes[lid]
+            .db
+            .commit_local(fact)
+            .context("falha no commit local")?;
         self.nodes[lid].client_commit(lsn, root, block);
         Ok(())
     }
@@ -91,10 +101,20 @@ impl Cluster {
             let v = n.db.verify();
             let root = n.db.trusted_root.clone();
             let root_short = if root.len() >= 12 { &root[..12] } else { &root };
-            let part = if self.partitioned[n.id] { " [PARTICIONADO]" } else { "" };
+            let part = if self.partitioned[n.id] {
+                " [PARTICIONADO]"
+            } else {
+                ""
+            };
             info!(
                 "  node{} {:<9} term={} LSN={} root={}… verify={}{}",
-                n.id, n.role_name(), n.term, n.db.current_lsn, root_short, v.status, part
+                n.id,
+                n.role_name(),
+                n.term,
+                n.db.current_lsn,
+                root_short,
+                v.status,
+                part
             );
         }
     }
@@ -102,13 +122,19 @@ impl Cluster {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
+    if std::env::args().skip(1).collect::<Vec<_>>() != ["--demo"] {
+        anyhow::bail!("cluster_demo usa apenas dados sintéticos; execute com --demo");
+    }
+    let temp = tempfile::tempdir().context("criar diretório temporário da demo")?;
 
     info!("{}", "#".repeat(68));
     info!("#  HERACLITUS (Rust) — REPLICACAO RAFT (LSN + Previous_Merkle_Root)");
     info!("{}", "#".repeat(68));
 
-    let mut runner = ReconstitutiveRunner::load(ARTIFACT).context("carregar artefato .hcx")?;
-    let mut cluster = Cluster::new(3)?;
+    let artifact = heraclitus::runner::resolve_latest_artifact(ARTIFACT_DIR)
+        .context("nenhum artefato PostgreSQL assinado no registry")?;
+    let mut runner = ReconstitutiveRunner::load(&artifact).context("carregar artefato .hcx")?;
+    let mut cluster = Cluster::new(3, temp.path())?;
 
     // 1. Eleicao
     let mut elected = false;
@@ -121,8 +147,10 @@ fn main() -> Result<()> {
     }
     assert!(elected, "nenhum lider eleito");
     let leader_idx = cluster.leader_id().unwrap();
-    info!("[1] Eleicao: node{} eleito LIDER (term {})",
-             leader_idx, cluster.nodes[leader_idx].term);
+    info!(
+        "[1] Eleicao: node{} eleito LIDER (term {})",
+        leader_idx, cluster.nodes[leader_idx].term
+    );
 
     // 2. Ingestao + replicacao normal
     for line in SAMPLES {
@@ -151,26 +179,31 @@ fn main() -> Result<()> {
     cluster.report("[4] Apos fast-sync (convergencia)");
 
     // Verificacao final de convergencia
-    let roots: Vec<String> = cluster.nodes.iter().map(|n| n.db.trusted_root.clone()).collect();
+    let roots: Vec<String> = cluster
+        .nodes
+        .iter()
+        .map(|n| n.db.trusted_root.clone())
+        .collect();
     let lsns: Vec<u64> = cluster.nodes.iter().map(|n| n.db.current_lsn).collect();
     let converged = roots.iter().all(|r| r == &roots[0]) && lsns.iter().all(|l| l == &lsns[0]);
-    let all_ok = cluster.nodes.iter().all(|n| n.db.verify().status == "INTEG_OK");
+    let all_ok = cluster
+        .nodes
+        .iter()
+        .all(|n| n.db.verify().status == "INTEG_OK");
 
     info!("{}", "#".repeat(68));
     if converged && all_ok {
-        info!("#  CONVERGENCIA OK — todos os nos no LSN {} com raiz {}…",
-                 lsns[0], &roots[0][..16]);
+        info!(
+            "#  CONVERGENCIA OK — todos os nos no LSN {} com raiz {}…",
+            lsns[0],
+            &roots[0][..16]
+        );
         info!("#  Alta disponibilidade garantida: replicas identicas e integras.");
     } else {
         error!("#  FALHA: convergencia={converged} integridade={all_ok}");
     }
     info!("{}", "#".repeat(68));
 
-    for id in 0..cluster.nodes.len() {
-        let _ = fs::remove_file(format!("node{id}.hdb"));
-        let _ = fs::remove_file(format!("node{id}.hdb.anchor"));
-    }
-    
     if !(converged && all_ok) {
         std::process::exit(1);
     }

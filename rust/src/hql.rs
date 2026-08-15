@@ -37,8 +37,8 @@ use crate::cpm;
 // ---------------------------------------------------------------------------
 
 pub struct Query {
-    pub action: String,   // "*" = wildcard
-    pub target: String,   // "*" = wildcard
+    pub action: String, // "*" = wildcard
+    pub target: String, // "*" = wildcard
     pub amount: Option<i64>,
     pub unit: Option<String>,
     pub fields: Vec<String>, // vazio = SELECT *
@@ -98,101 +98,9 @@ pub fn parse_query(q: &str) -> Result<Query, String> {
 fn unit_secs(u: &str) -> i64 {
     match u {
         "MINUTES" => 60,
-        "HOURS"   => 3600,
-        "DAYS"    => 86400,
-        _         => 0,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::HeraclitusDB;
-    use serde_json::json;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static CTR: AtomicU64 = AtomicU64::new(0);
-
-    fn tmp_with_facts(pairs: &[(&str, &str)]) -> String {
-        let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("forge_hql_{}_{}.hdb", std::process::id(), n));
-        let s = p.to_str().unwrap().to_string();
-        let _ = std::fs::remove_file(&s);
-        let _ = std::fs::remove_file(format!("{s}.anchor"));
-        let mut db = HeraclitusDB::new(&s).unwrap();
-        for (action, target) in pairs {
-            let mut f = json!({
-                "fact_id": "019f035c-1823-7fe9-8c54-02b2d1acc30c",
-                "fact.identity": {"actor.id":"a","actor.name":"a","target.id":target,"source.ip":null},
-                "fact.time": {"system_timestamp": 1_782_467_794_979_937i64, "log_sequence_number": 0u64},
-                "fact.behavior": {"class":"c","action":action,"risk_level":"Medium"},
-                "fact.evidence": {"raw_observation_hash":"b3:abcd","carimbo_tempo_legal":"icp"},
-                "fact.lineage": {"transformation_steps":["parse"],"input_source":"pg","matched_rule":"r"},
-                "fact.confidence": 0.9,
-                "fact.knowledge_version":"k","fact.reasoning_version":"r","fact.ontology_version":"v9"
-            });
-            db.write_fact(&mut f).unwrap();
-        }
-        s
-    }
-
-    #[test]
-    fn parse_wildcards_select_and_limit() {
-        let q = parse_query(
-            r#"FROM FACTS MATCH (actor.id) EXECUTES "*" AGAINST "salaries" WITHIN LAST 10 DAYS SELECT actor.id,action LIMIT 5"#,
-        )
-        .unwrap();
-        assert_eq!(q.action, "*");
-        assert_eq!(q.target, "salaries");
-        assert_eq!(q.amount, Some(10));
-        assert_eq!(q.unit.as_deref(), Some("DAYS"));
-        assert_eq!(q.fields, vec!["actor.id".to_string(), "action".to_string()]);
-        assert_eq!(q.limit, Some(5));
-    }
-
-    #[test]
-    fn parse_select_star_is_empty_fields() {
-        let q = parse_query(r#"FROM FACTS MATCH (actor.id) EXECUTES "login" AGAINST "*" SELECT *"#).unwrap();
-        assert!(q.fields.is_empty());
-        assert_eq!(q.limit, None);
-    }
-
-    #[test]
-    fn malformed_query_is_rejected() {
-        assert!(parse_query("SELECT * FROM users").is_err());
-    }
-
-    #[test]
-    fn huge_time_window_does_not_panic() {
-        // Regressão: `WITHIN LAST 999999999999999 DAYS` transbordava/underflow.
-        let db = tmp_with_facts(&[("login", "prod")]);
-        let rows = execute_query(
-            &db,
-            r#"FROM FACTS MATCH (actor.id) EXECUTES "*" AGAINST "*" WITHIN LAST 999999999999999 DAYS SELECT *"#,
-        )
-        .unwrap();
-        assert_eq!(rows.len(), 1, "janela gigante deve saturar em 'desde o início'");
-    }
-
-    #[test]
-    fn execute_filters_by_action_target_and_limit() {
-        let db = tmp_with_facts(&[
-            ("authentication.failure", "prod"),
-            ("authentication.failure", "prod"),
-            ("authorization.failure", "salaries"),
-        ]);
-
-        // Filtro por ação.
-        let r = execute_query(&db, r#"FROM FACTS MATCH (actor.id) EXECUTES "authentication.failure" AGAINST "*" SELECT *"#).unwrap();
-        assert_eq!(r.len(), 2);
-
-        // Filtro por target.
-        let r = execute_query(&db, r#"FROM FACTS MATCH (actor.id) EXECUTES "*" AGAINST "salaries" SELECT *"#).unwrap();
-        assert_eq!(r.len(), 1);
-
-        // Wildcard total + LIMIT.
-        let r = execute_query(&db, r#"FROM FACTS MATCH (actor.id) EXECUTES "*" AGAINST "*" SELECT * LIMIT 2"#).unwrap();
-        assert_eq!(r.len(), 2, "LIMIT deve cortar o scan cedo");
+        "HOURS" => 3600,
+        "DAYS" => 86400,
+        _ => 0,
     }
 }
 
@@ -204,38 +112,38 @@ mod tests {
 fn resolve_field(fact: &Value, field: &str) -> Value {
     let path: Vec<&str> = match field {
         // identidade
-        "fact.id"           => vec!["fact_id"],
-        "actor.id"          => vec!["fact.identity", "actor.id"],
-        "actor.name"        => vec!["fact.identity", "actor.name"],
-        "target.id"         => vec!["fact.identity", "target.id"],
-        "source.ip"         => vec!["fact.identity", "source.ip"],
+        "fact.id" => vec!["fact_id"],
+        "actor.id" => vec!["fact.identity", "actor.id"],
+        "actor.name" => vec!["fact.identity", "actor.name"],
+        "target.id" => vec!["fact.identity", "target.id"],
+        "source.ip" => vec!["fact.identity", "source.ip"],
         // comportamento
-        "fact.behavior.class"      => vec!["fact.behavior", "class"],
-        "class"                    => vec!["fact.behavior", "class"],
-        "fact.behavior.action"     => vec!["fact.behavior", "action"],
-        "action"                   => vec!["fact.behavior", "action"],
+        "fact.behavior.class" => vec!["fact.behavior", "class"],
+        "class" => vec!["fact.behavior", "class"],
+        "fact.behavior.action" => vec!["fact.behavior", "action"],
+        "action" => vec!["fact.behavior", "action"],
         "fact.behavior.risk_level" => vec!["fact.behavior", "risk_level"],
-        "risk"                     => vec!["fact.behavior", "risk_level"],
-        "risk_level"               => vec!["fact.behavior", "risk_level"],
+        "risk" => vec!["fact.behavior", "risk_level"],
+        "risk_level" => vec!["fact.behavior", "risk_level"],
         // evidência
         "fact.evidence.raw_observation_hash" => vec!["fact.evidence", "raw_observation_hash"],
-        "evidence_hash"                      => vec!["fact.evidence", "raw_observation_hash"],
-        "carimbo_tempo_legal"                => vec!["fact.evidence", "carimbo_tempo_legal"],
+        "evidence_hash" => vec!["fact.evidence", "raw_observation_hash"],
+        "carimbo_tempo_legal" => vec!["fact.evidence", "carimbo_tempo_legal"],
         // temporal
-        "fact.confidence"   => vec!["fact.confidence"],
-        "confidence"        => vec!["fact.confidence"],
-        "lsn"               => vec!["fact.time", "log_sequence_number"],
-        "timestamp"         => vec!["fact.time", "system_timestamp"],
+        "fact.confidence" => vec!["fact.confidence"],
+        "confidence" => vec!["fact.confidence"],
+        "lsn" => vec!["fact.time", "log_sequence_number"],
+        "timestamp" => vec!["fact.time", "system_timestamp"],
         // integridade
         "integrity.merkle_root_anchor" => vec!["fact.integrity", "merkle_root_anchor"],
-        "integrity.signature"          => vec!["fact.integrity", "signature"],
-        "integrity.leaf_hash"          => vec!["fact.integrity", "leaf_hash"],
+        "integrity.signature" => vec!["fact.integrity", "signature"],
+        "integrity.leaf_hash" => vec!["fact.integrity", "leaf_hash"],
         // versões
         "fact.knowledge_version" => vec!["fact.knowledge_version"],
-        "fact.ontology_version"  => vec!["fact.ontology_version"],
+        "fact.ontology_version" => vec!["fact.ontology_version"],
         // linhagem
-        "input_source"  => vec!["fact.lineage", "input_source"],
-        "matched_rule"  => vec!["fact.lineage", "matched_rule"],
+        "input_source" => vec!["fact.lineage", "input_source"],
+        "matched_rule" => vec!["fact.lineage", "matched_rule"],
         // fallback: chave literal no root do Fato
         other => return fact.get(other).cloned().unwrap_or(Value::Null),
     };
@@ -243,7 +151,7 @@ fn resolve_field(fact: &Value, field: &str) -> Value {
     for k in path {
         match node.get(k) {
             Some(v) => node = v,
-            None    => return Value::Null,
+            None => return Value::Null,
         }
     }
     node.clone()
@@ -253,13 +161,25 @@ fn resolve_field(fact: &Value, field: &str) -> Value {
 fn project_all(fact: &Value) -> Map<String, Value> {
     let mut row = Map::new();
     let all_fields = [
-        "fact.id", "actor.id", "actor.name", "target.id", "source.ip",
-        "fact.behavior.class", "fact.behavior.action", "fact.behavior.risk_level",
-        "fact.evidence.raw_observation_hash", "carimbo_tempo_legal",
-        "fact.confidence", "lsn", "timestamp",
-        "integrity.merkle_root_anchor", "integrity.signature",
-        "fact.knowledge_version", "fact.ontology_version",
-        "input_source", "matched_rule",
+        "fact.id",
+        "actor.id",
+        "actor.name",
+        "target.id",
+        "source.ip",
+        "fact.behavior.class",
+        "fact.behavior.action",
+        "fact.behavior.risk_level",
+        "fact.evidence.raw_observation_hash",
+        "carimbo_tempo_legal",
+        "fact.confidence",
+        "lsn",
+        "timestamp",
+        "integrity.merkle_root_anchor",
+        "integrity.signature",
+        "fact.knowledge_version",
+        "fact.ontology_version",
+        "input_source",
+        "matched_rule",
     ];
     for &f in &all_fields {
         let v = resolve_field(fact, f);
@@ -293,9 +213,7 @@ pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, 
             // Aritmética saturante: `WITHIN LAST 999999999999 DAYS` transbordava
             // o `a * unit_secs * 1e6` e o `now - …` fazia underflow (panic em
             // debug, wrap em release). Satura em 0 = "desde o início".
-            let window = (a as i64)
-                .saturating_mul(unit_secs(u))
-                .saturating_mul(1_000_000);
+            let window = a.saturating_mul(unit_secs(u)).saturating_mul(1_000_000);
             Some(now.saturating_sub(window))
         }
         _ => None,
@@ -354,10 +272,7 @@ pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, 
         out.push(row);
 
         // --- LIMIT: interrompe early se já temos o suficiente ---
-        match plan.limit {
-            Some(lim) if out.len() >= lim => false,
-            _ => true,
-        }
+        !matches!(plan.limit, Some(lim) if out.len() >= lim)
     });
 
     match outcome.map_err(|e| e.to_string())? {
@@ -366,5 +281,114 @@ pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, 
         // Done / magic corrompido / cauda truncada: devolve o que foi lido
         // (mesma semântica do `break` do scan antigo).
         _ => Ok(out),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::HeraclitusDB;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CTR: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_with_facts(pairs: &[(&str, &str)]) -> String {
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("forge_hql_{}_{}.hdb", std::process::id(), n));
+        let s = p.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&s);
+        let _ = std::fs::remove_file(format!("{s}.anchor"));
+        let mut db = HeraclitusDB::new(&s).unwrap();
+        for (action, target) in pairs {
+            let mut f = json!({
+                "fact_id": "019f035c-1823-7fe9-8c54-02b2d1acc30c",
+                "fact.identity": {"actor.id":"a","actor.name":"a","target.id":target,"source.ip":null},
+                "fact.time": {"system_timestamp": 1_782_467_794_979_937i64, "log_sequence_number": 0u64},
+                "fact.behavior": {"class":"c","action":action,"risk_level":"Medium"},
+                "fact.evidence": {"raw_observation_hash":"b3:abcd","carimbo_tempo_legal":"icp"},
+                "fact.lineage": {"transformation_steps":["parse"],"input_source":"pg","matched_rule":"r"},
+                "fact.confidence": 0.9,
+                "fact.knowledge_version":"k","fact.reasoning_version":"r","fact.ontology_version":"v9"
+            });
+            db.write_fact(&mut f).unwrap();
+        }
+        s
+    }
+
+    #[test]
+    fn parse_wildcards_select_and_limit() {
+        let q = parse_query(
+            r#"FROM FACTS MATCH (actor.id) EXECUTES "*" AGAINST "salaries" WITHIN LAST 10 DAYS SELECT actor.id,action LIMIT 5"#,
+        )
+        .unwrap();
+        assert_eq!(q.action, "*");
+        assert_eq!(q.target, "salaries");
+        assert_eq!(q.amount, Some(10));
+        assert_eq!(q.unit.as_deref(), Some("DAYS"));
+        assert_eq!(q.fields, vec!["actor.id".to_string(), "action".to_string()]);
+        assert_eq!(q.limit, Some(5));
+    }
+
+    #[test]
+    fn parse_select_star_is_empty_fields() {
+        let q = parse_query(r#"FROM FACTS MATCH (actor.id) EXECUTES "login" AGAINST "*" SELECT *"#)
+            .unwrap();
+        assert!(q.fields.is_empty());
+        assert_eq!(q.limit, None);
+    }
+
+    #[test]
+    fn malformed_query_is_rejected() {
+        assert!(parse_query("SELECT * FROM users").is_err());
+    }
+
+    #[test]
+    fn huge_time_window_does_not_panic() {
+        // Regressão: `WITHIN LAST 999999999999999 DAYS` transbordava/underflow.
+        let db = tmp_with_facts(&[("login", "prod")]);
+        let rows = execute_query(
+            &db,
+            r#"FROM FACTS MATCH (actor.id) EXECUTES "*" AGAINST "*" WITHIN LAST 999999999999999 DAYS SELECT *"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "janela gigante deve saturar em 'desde o início'"
+        );
+    }
+
+    #[test]
+    fn execute_filters_by_action_target_and_limit() {
+        let db = tmp_with_facts(&[
+            ("authentication.failure", "prod"),
+            ("authentication.failure", "prod"),
+            ("authorization.failure", "salaries"),
+        ]);
+
+        // Filtro por ação.
+        let r = execute_query(
+            &db,
+            r#"FROM FACTS MATCH (actor.id) EXECUTES "authentication.failure" AGAINST "*" SELECT *"#,
+        )
+        .unwrap();
+        assert_eq!(r.len(), 2);
+
+        // Filtro por target.
+        let r = execute_query(
+            &db,
+            r#"FROM FACTS MATCH (actor.id) EXECUTES "*" AGAINST "salaries" SELECT *"#,
+        )
+        .unwrap();
+        assert_eq!(r.len(), 1);
+
+        // Wildcard total + LIMIT.
+        let r = execute_query(
+            &db,
+            r#"FROM FACTS MATCH (actor.id) EXECUTES "*" AGAINST "*" SELECT * LIMIT 2"#,
+        )
+        .unwrap();
+        assert_eq!(r.len(), 2, "LIMIT deve cortar o scan cedo");
     }
 }

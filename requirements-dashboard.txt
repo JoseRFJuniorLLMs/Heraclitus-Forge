@@ -1,0 +1,9 @@
+-r requirements.txt
+
+# Interfaces Streamlit locais. dashboard.py permanece fail-closed enquanto
+# FORGE_ENABLE_DEMO_DASHBOARD=1 não for definido.
+GPUtil>=1.4
+numpy>=2.0
+pandas>=2.2
+psutil>=6.0
+streamlit>=1.40

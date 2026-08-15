@@ -12,8 +12,8 @@
 //! Formato: magic "HFB1" + campos na ordem do schema. String = u32 len (0xFFFFFFFF=null)
 //! + bytes UTF-8. Escalares i64/u64/f64 em 8 bytes big-endian. lineage = u32 count + N strings.
 
-use serde_json::{json, Value};
 use crate::error::HeraclitusError;
+use serde_json::{json, Value};
 
 const MAGIC: &[u8; 4] = b"HFB1";
 
@@ -30,7 +30,9 @@ fn put_str(b: &mut Vec<u8>, s: Option<&str>) {
 }
 fn get_str(d: &[u8], p: &mut usize) -> Result<Option<String>, HeraclitusError> {
     if *p + 4 > d.len() {
-        return Err(HeraclitusError::FactEncodingError("Unexpected EOF reading string length".into()));
+        return Err(HeraclitusError::FactEncodingError(
+            "Unexpected EOF reading string length".into(),
+        ));
     }
     let len = u32::from_be_bytes(d[*p..*p + 4].try_into()?);
     *p += 4;
@@ -39,7 +41,9 @@ fn get_str(d: &[u8], p: &mut usize) -> Result<Option<String>, HeraclitusError> {
     }
     let len = len as usize;
     if *p + len > d.len() {
-        return Err(HeraclitusError::FactEncodingError("Unexpected EOF reading string data".into()));
+        return Err(HeraclitusError::FactEncodingError(
+            "Unexpected EOF reading string data".into(),
+        ));
     }
     let s = String::from_utf8_lossy(&d[*p..*p + len]).into_owned();
     *p += len;
@@ -48,7 +52,9 @@ fn get_str(d: &[u8], p: &mut usize) -> Result<Option<String>, HeraclitusError> {
 /// Pula um campo string e devolve a fatia (&str) sem alocar — base do zero-copy.
 fn skip_str<'a>(d: &'a [u8], p: &mut usize) -> Result<Option<&'a str>, HeraclitusError> {
     if *p + 4 > d.len() {
-        return Err(HeraclitusError::FactEncodingError("Unexpected EOF reading string length".into()));
+        return Err(HeraclitusError::FactEncodingError(
+            "Unexpected EOF reading string length".into(),
+        ));
     }
     let len = u32::from_be_bytes(d[*p..*p + 4].try_into()?);
     *p += 4;
@@ -57,7 +63,9 @@ fn skip_str<'a>(d: &'a [u8], p: &mut usize) -> Result<Option<&'a str>, Heraclitu
     }
     let len = len as usize;
     if *p + len > d.len() {
-        return Err(HeraclitusError::FactEncodingError("Unexpected EOF reading string data".into()));
+        return Err(HeraclitusError::FactEncodingError(
+            "Unexpected EOF reading string data".into(),
+        ));
     }
     let s = std::str::from_utf8(&d[*p..*p + len]).unwrap_or("");
     *p += len;
@@ -98,8 +106,12 @@ fn encode_inner(f: &Value, with_integrity: bool) -> Vec<u8> {
     put_str(&mut b, sget(f, &["fact.identity", "actor.name"]));
     put_str(&mut b, sget(f, &["fact.identity", "target.id"]));
     put_str(&mut b, sget(f, &["fact.identity", "source.ip"]));
-    let ts = nget(f, &["fact.time", "system_timestamp"]).and_then(|v| v.as_i64()).unwrap_or(0);
-    let lsn = nget(f, &["fact.time", "log_sequence_number"]).and_then(|v| v.as_u64()).unwrap_or(0);
+    let ts = nget(f, &["fact.time", "system_timestamp"])
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let lsn = nget(f, &["fact.time", "log_sequence_number"])
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     b.extend_from_slice(&ts.to_be_bytes());
     b.extend_from_slice(&lsn.to_be_bytes());
     put_str(&mut b, sget(f, &["fact.behavior", "class"]));
@@ -117,7 +129,9 @@ fn encode_inner(f: &Value, with_integrity: bool) -> Vec<u8> {
     }
     put_str(&mut b, sget(f, &["fact.lineage", "input_source"]));
     put_str(&mut b, sget(f, &["fact.lineage", "matched_rule"]));
-    let conf = nget(f, &["fact.confidence"]).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let conf = nget(f, &["fact.confidence"])
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
     b.extend_from_slice(&conf.to_be_bytes());
     put_str(&mut b, sget(f, &["fact.knowledge_version"]));
     put_str(&mut b, sget(f, &["fact.reasoning_version"]));
@@ -142,7 +156,9 @@ fn s(v: Option<String>) -> Value {
 /// Reconstrói a `Value` (mesmas chaves que o Runner produz).
 pub fn decode(d: &[u8]) -> Result<Value, HeraclitusError> {
     if d.len() < 4 || &d[..4] != MAGIC {
-        return Err(HeraclitusError::FactEncodingError("payload fbfact invalido".into()));
+        return Err(HeraclitusError::FactEncodingError(
+            "payload fbfact invalido".into(),
+        ));
     }
     let mut p = 4usize;
     let fact_id = get_str(d, &mut p)?;
@@ -150,19 +166,26 @@ pub fn decode(d: &[u8]) -> Result<Value, HeraclitusError> {
     let actor_name = get_str(d, &mut p)?;
     let target_id = get_str(d, &mut p)?;
     let source_ip = get_str(d, &mut p)?;
-    
-    if p + 16 > d.len() { return Err(HeraclitusError::FactEncodingError("Unexpected EOF".into())); }
-    let ts = i64::from_be_bytes(d[p..p + 8].try_into()?); p += 8;
-    let lsn = u64::from_be_bytes(d[p..p + 8].try_into()?); p += 8;
-    
+
+    if p + 16 > d.len() {
+        return Err(HeraclitusError::FactEncodingError("Unexpected EOF".into()));
+    }
+    let ts = i64::from_be_bytes(d[p..p + 8].try_into()?);
+    p += 8;
+    let lsn = u64::from_be_bytes(d[p..p + 8].try_into()?);
+    p += 8;
+
     let bclass = get_str(d, &mut p)?;
     let baction = get_str(d, &mut p)?;
     let brisk = get_str(d, &mut p)?;
     let ev_hash = get_str(d, &mut p)?;
     let carimbo = get_str(d, &mut p)?;
-    
-    if p + 4 > d.len() { return Err(HeraclitusError::FactEncodingError("Unexpected EOF".into())); }
-    let nsteps = u32::from_be_bytes(d[p..p + 4].try_into()?) as usize; p += 4;
+
+    if p + 4 > d.len() {
+        return Err(HeraclitusError::FactEncodingError("Unexpected EOF".into()));
+    }
+    let nsteps = u32::from_be_bytes(d[p..p + 4].try_into()?) as usize;
+    p += 4;
     // Pré-alocação LIMITADA pelos bytes restantes (cada step ocupa ≥ 4 bytes de
     // prefixo): um `nsteps` corrompido (o CRC-32C do CPM não é keyed, logo quem
     // tiver acesso de escrita ao ficheiro forja-o) não pode pedir GiBs. O loop
@@ -173,10 +196,13 @@ pub fn decode(d: &[u8]) -> Result<Value, HeraclitusError> {
     }
     let input_source = get_str(d, &mut p)?;
     let matched_rule = get_str(d, &mut p)?;
-    
-    if p + 8 > d.len() { return Err(HeraclitusError::FactEncodingError("Unexpected EOF".into())); }
-    let conf = f64::from_be_bytes(d[p..p + 8].try_into()?); p += 8;
-    
+
+    if p + 8 > d.len() {
+        return Err(HeraclitusError::FactEncodingError("Unexpected EOF".into()));
+    }
+    let conf = f64::from_be_bytes(d[p..p + 8].try_into()?);
+    p += 8;
+
     let kver = get_str(d, &mut p)?;
     let rver = get_str(d, &mut p)?;
     let over = get_str(d, &mut p)?;
@@ -216,9 +242,13 @@ pub fn action(d: &[u8]) -> Option<&str> {
         return None;
     }
     let mut p = 4usize;
-    for _ in 0..5 { skip_str(d, &mut p).ok()?; } // fact_id + 4 de identity
+    for _ in 0..5 {
+        skip_str(d, &mut p).ok()?;
+    } // fact_id + 4 de identity
     p += 16; // ts + lsn
-    if p > d.len() { return None; }
+    if p > d.len() {
+        return None;
+    }
     skip_str(d, &mut p).ok()??; // behavior.class
     skip_str(d, &mut p).ok()? // behavior.action
 }
@@ -230,11 +260,19 @@ pub fn evidence_hash_offset(d: &[u8]) -> Option<usize> {
         return None;
     }
     let mut p = 4usize;
-    for _ in 0..5 { skip_str(d, &mut p).ok()?; } // fact_id + 4 de identity
+    for _ in 0..5 {
+        skip_str(d, &mut p).ok()?;
+    } // fact_id + 4 de identity
     p += 16; // ts + lsn
-    if p > d.len() { return None; }
-    for _ in 0..3 { skip_str(d, &mut p).ok()?; } // class, action, risk
-    if p + 4 > d.len() { return None; }
+    if p > d.len() {
+        return None;
+    }
+    for _ in 0..3 {
+        skip_str(d, &mut p).ok()?;
+    } // class, action, risk
+    if p + 4 > d.len() {
+        return None;
+    }
     let len = u32::from_be_bytes(d[p..p + 4].try_into().ok()?);
     p += 4;
     if len == u32::MAX || len == 0 {
@@ -276,9 +314,15 @@ mod tests {
         assert_eq!(target_id(&bytes), Some("postgresql"));
         // round-trip completo
         let back = decode(&bytes).unwrap();
-        assert_eq!(back["fact.behavior"]["action"], of["fact.behavior"]["action"]);
+        assert_eq!(
+            back["fact.behavior"]["action"],
+            of["fact.behavior"]["action"]
+        );
         assert_eq!(back["fact.confidence"], of["fact.confidence"]);
-        assert_eq!(back["fact.lineage"]["transformation_steps"], of["fact.lineage"]["transformation_steps"]);
+        assert_eq!(
+            back["fact.lineage"]["transformation_steps"],
+            of["fact.lineage"]["transformation_steps"]
+        );
         // determinismo
         assert_eq!(encode(&of), encode(&decode(&encode(&of)).unwrap()));
     }

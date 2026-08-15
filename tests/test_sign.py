@@ -7,6 +7,7 @@ Uma assinatura que aceita tudo é pior do que assinatura nenhuma, porque dá
 confiança sem a merecer — foi exatamente esse o defeito do selo que isto
 substituiu.
 """
+
 from __future__ import annotations
 
 import shutil
@@ -17,7 +18,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import forge_sign  # noqa: E402
+import forge_sign
 
 REAL_REGISTRY = Path(__file__).resolve().parent.parent / "registry"
 
@@ -51,6 +52,7 @@ def pinned(tmp_path, key, monkeypatch) -> Path:
 # O caminho feliz
 # ---------------------------------------------------------------------------
 
+
 def test_artefato_assinado_verifica(pkg, key, pinned):
     forge_sign.sign_artifact(pkg, key)
     estado, detalhe = forge_sign.verify_artifact(pkg)
@@ -59,12 +61,16 @@ def test_artefato_assinado_verifica(pkg, key, pinned):
 
 def test_a_assinatura_tem_64_bytes(pkg, key, pinned):
     sig = forge_sign.sign_artifact(pkg, key)
-    assert len(bytes.fromhex(sig)) == 64, "ed25519 produz 64 bytes; menos que isso é um hash disfarçado"
+    assert len(bytes.fromhex(sig)) == 64, (
+        "ed25519 produz 64 bytes; menos que isso é um hash disfarçado"
+    )
 
 
 def test_signature_sig_e_autodescritivo(pkg, key, pinned):
     forge_sign.sign_artifact(pkg, key)
-    campos = dict(l.split("=", 1) for l in (pkg / "signature.sig").read_text().strip().splitlines())
+    campos = dict(
+        line.split("=", 1) for line in (pkg / "signature.sig").read_text().strip().splitlines()
+    )
     assert campos["format"] == "hcx-v2"
     assert campos["alg"] == "ed25519"
     # A chave viaja no ficheiro: dá para saber QUEM assinou sem adivinhar.
@@ -74,6 +80,7 @@ def test_signature_sig_e_autodescritivo(pkg, key, pinned):
 # ---------------------------------------------------------------------------
 # O que tem de FALHAR
 # ---------------------------------------------------------------------------
+
 
 def test_alterar_um_byte_invalida(pkg, key, pinned):
     forge_sign.sign_artifact(pkg, key)
@@ -119,7 +126,7 @@ def test_assinatura_corrompida_e_rejeitada(pkg, key, pinned):
     forge_sign.sign_artifact(pkg, key)
     sig_file = pkg / "signature.sig"
     txt = sig_file.read_text()
-    linha = [l for l in txt.splitlines() if l.startswith("sig=")][0]
+    linha = next(line for line in txt.splitlines() if line.startswith("sig="))
     trocado = linha[:5] + ("0" if linha[5] != "0" else "1") + linha[6:]
     sig_file.write_text(txt.replace(linha, trocado), encoding="utf-8")
     estado, _ = forge_sign.verify_artifact(pkg)
@@ -148,6 +155,7 @@ def test_sem_assinatura_nao_e_o_mesmo_que_assinatura_invalida(pkg, pinned):
 # Digest canónico
 # ---------------------------------------------------------------------------
 
+
 def test_digest_e_deterministico(pkg):
     assert forge_sign.artifact_digest(pkg) == forge_sign.artifact_digest(pkg)
 
@@ -155,8 +163,9 @@ def test_digest_e_deterministico(pkg):
 def test_digest_ignora_o_proprio_signature_sig(pkg, key, pinned):
     antes = forge_sign.artifact_digest(pkg)
     forge_sign.sign_artifact(pkg, key)
-    assert forge_sign.artifact_digest(pkg) == antes, \
+    assert forge_sign.artifact_digest(pkg) == antes, (
         "escrever a assinatura não pode mudar o que ela assina"
+    )
 
 
 def test_copia_do_artefato_tem_o_mesmo_digest(pkg, tmp_path):
@@ -168,6 +177,7 @@ def test_copia_do_artefato_tem_o_mesmo_digest(pkg, tmp_path):
 # ---------------------------------------------------------------------------
 # O registry a sério
 # ---------------------------------------------------------------------------
+
 
 def test_todos_os_artefatos_publicados_estao_assinados():
     """

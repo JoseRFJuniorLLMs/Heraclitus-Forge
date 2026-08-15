@@ -32,8 +32,16 @@ pub struct LogEntry {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum Msg {
-    RequestVote { term: u64, candidate: usize, last_lsn: u64, last_term: u64 },
-    RequestVoteResp { term: u64, granted: bool },
+    RequestVote {
+        term: u64,
+        candidate: usize,
+        last_lsn: u64,
+        last_term: u64,
+    },
+    RequestVoteResp {
+        term: u64,
+        granted: bool,
+    },
     AppendEntries {
         term: u64,
         leader: usize,
@@ -42,7 +50,12 @@ pub enum Msg {
         entries: Vec<LogEntry>,
         leader_commit: u64,
     },
-    AppendEntriesResp { term: u64, success: bool, match_lsn: u64, need_from: u64 },
+    AppendEntriesResp {
+        term: u64,
+        success: bool,
+        match_lsn: u64,
+        need_from: u64,
+    },
 }
 
 pub struct RaftNode {
@@ -112,7 +125,12 @@ fn replay_log(path: &str) -> Vec<LogEntry> {
         }
         let block = data[p..p + blen].to_vec();
         p += blen;
-        out.push(LogEntry { term, lsn, merkle_root: root, block });
+        out.push(LogEntry {
+            term,
+            lsn,
+            merkle_root: root,
+            block,
+        });
     }
     out
 }
@@ -156,7 +174,11 @@ impl RaftNode {
     /// Acrescenta uma entrada ao log Raft durável (append-only).
     fn append_log_record(&self, e: &LogEntry) {
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.log_path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+        {
             let mut buf = Vec::with_capacity(24 + e.merkle_root.len() + e.block.len());
             buf.extend_from_slice(&e.term.to_le_bytes());
             buf.extend_from_slice(&e.lsn.to_le_bytes());
@@ -175,7 +197,10 @@ impl RaftNode {
         self.log.last().map(|e| e.lsn).unwrap_or(BASE_LSN)
     }
     pub fn last_root(&self) -> String {
-        self.log.last().map(|e| e.merkle_root.clone()).unwrap_or_default()
+        self.log
+            .last()
+            .map(|e| e.merkle_root.clone())
+            .unwrap_or_default()
     }
     fn last_term(&self) -> u64 {
         self.log.last().map(|e| e.term).unwrap_or(0)
@@ -194,7 +219,7 @@ impl RaftNode {
         self.role == Role::Leader
     }
     fn majority(&self) -> usize {
-        (self.peers.len() + 1) / 2 + 1
+        self.peers.len().div_ceil(2) + 1
     }
 
     // -- cliente: lider ingere um Fato ja serializado em bloco -------------
@@ -202,7 +227,12 @@ impl RaftNode {
     pub fn client_commit(&mut self, lsn: u64, root: String, block: Vec<u8>) {
         // O lider ja persistiu via db.commit_local; aqui registra no log Raft
         // (RAM + sidecar durável).
-        let entry = LogEntry { term: self.term, lsn, merkle_root: root, block };
+        let entry = LogEntry {
+            term: self.term,
+            lsn,
+            merkle_root: root,
+            block,
+        };
         self.append_log_record(&entry);
         self.log.push(entry);
     }
@@ -268,14 +298,21 @@ impl RaftNode {
     }
 
     fn broadcast_append(&self) -> Vec<(usize, Msg)> {
-        self.peers.iter().map(|&p| (p, self.append_for(p))).collect()
+        self.peers
+            .iter()
+            .map(|&p| (p, self.append_for(p)))
+            .collect()
     }
 
     fn append_for(&self, peer: usize) -> Msg {
         let ni = *self.next_index.get(&peer).unwrap_or(&(self.last_lsn() + 1));
         let prev_lsn = ni - 1;
         let start = (ni - BASE_LSN - 1) as usize;
-        let entries = if start < self.log.len() { self.log[start..].to_vec() } else { Vec::new() };
+        let entries = if start < self.log.len() {
+            self.log[start..].to_vec()
+        } else {
+            Vec::new()
+        };
         Msg::AppendEntries {
             term: self.term,
             leader: self.id,
@@ -290,7 +327,12 @@ impl RaftNode {
 
     pub fn handle(&mut self, from: usize, msg: Msg) -> Vec<(usize, Msg)> {
         match msg {
-            Msg::RequestVote { term, candidate, last_lsn, last_term } => {
+            Msg::RequestVote {
+                term,
+                candidate,
+                last_lsn,
+                last_term,
+            } => {
                 if term > self.term {
                     self.become_follower(term);
                 }
@@ -303,7 +345,13 @@ impl RaftNode {
                     self.election_elapsed = 0;
                     self.persist_meta(); // voto DURÁVEL antes de o conceder (§5.4 Raft)
                 }
-                vec![(from, Msg::RequestVoteResp { term: self.term, granted })]
+                vec![(
+                    from,
+                    Msg::RequestVoteResp {
+                        term: self.term,
+                        granted,
+                    },
+                )]
             }
 
             Msg::RequestVoteResp { term, granted } => {
@@ -320,12 +368,24 @@ impl RaftNode {
                 Vec::new()
             }
 
-            Msg::AppendEntries { term, leader, prev_lsn, prev_root, entries, leader_commit } => {
+            Msg::AppendEntries {
+                term,
+                leader,
+                prev_lsn,
+                prev_root,
+                entries,
+                leader_commit,
+            } => {
                 if term < self.term {
-                    return vec![(from, Msg::AppendEntriesResp {
-                        term: self.term, success: false,
-                        match_lsn: self.last_lsn(), need_from: self.last_lsn() + 1,
-                    })];
+                    return vec![(
+                        from,
+                        Msg::AppendEntriesResp {
+                            term: self.term,
+                            success: false,
+                            match_lsn: self.last_lsn(),
+                            need_from: self.last_lsn() + 1,
+                        },
+                    )];
                 }
                 // Passa a follower reconhecendo o líder. CRÍTICO: só apagar
                 // `voted_for` quando o TERMO avança. O `become_follower`
@@ -351,28 +411,48 @@ impl RaftNode {
                             }
                             Err(_) => {
                                 // Integridade quebrada: rejeita para forcar re-sync
-                                return vec![(from, Msg::AppendEntriesResp {
-                                    term: self.term, success: false,
-                                    match_lsn: self.last_lsn(), need_from: self.last_lsn() + 1,
-                                })];
+                                return vec![(
+                                    from,
+                                    Msg::AppendEntriesResp {
+                                        term: self.term,
+                                        success: false,
+                                        match_lsn: self.last_lsn(),
+                                        need_from: self.last_lsn() + 1,
+                                    },
+                                )];
                             }
                         }
                     }
                     self.commit_lsn = leader_commit.min(self.last_lsn());
-                    vec![(from, Msg::AppendEntriesResp {
-                        term: self.term, success: true,
-                        match_lsn: self.last_lsn(), need_from: 0,
-                    })]
+                    vec![(
+                        from,
+                        Msg::AppendEntriesResp {
+                            term: self.term,
+                            success: true,
+                            match_lsn: self.last_lsn(),
+                            need_from: 0,
+                        },
+                    )]
                 } else {
                     // Inconsistencia => pede fast-sync a partir do ultimo ponto comum
-                    vec![(from, Msg::AppendEntriesResp {
-                        term: self.term, success: false,
-                        match_lsn: self.last_lsn(), need_from: self.last_lsn() + 1,
-                    })]
+                    vec![(
+                        from,
+                        Msg::AppendEntriesResp {
+                            term: self.term,
+                            success: false,
+                            match_lsn: self.last_lsn(),
+                            need_from: self.last_lsn() + 1,
+                        },
+                    )]
                 }
             }
 
-            Msg::AppendEntriesResp { term, success, match_lsn, need_from } => {
+            Msg::AppendEntriesResp {
+                term,
+                success,
+                match_lsn,
+                need_from,
+            } => {
                 if term > self.term {
                     self.become_follower(term);
                     return Vec::new();
@@ -408,7 +488,9 @@ impl RaftNode {
         let cand_term = if candidate <= BASE_LSN {
             Some(0)
         } else {
-            self.log.get((candidate - BASE_LSN - 1) as usize).map(|e| e.term)
+            self.log
+                .get((candidate - BASE_LSN - 1) as usize)
+                .map(|e| e.term)
         };
         if candidate > self.commit_lsn && cand_term == Some(self.term) {
             self.commit_lsn = candidate;
@@ -438,7 +520,15 @@ mod tests {
         let n = CTR.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!("forge_raft_{}_{}.hdb", std::process::id(), n));
         let s = p.to_str().unwrap().to_string();
-        for ext in ["", ".anchor", ".anchor.sig", ".key", ".pub", ".raftmeta", ".raftlog"] {
+        for ext in [
+            "",
+            ".anchor",
+            ".anchor.sig",
+            ".key",
+            ".pub",
+            ".raftmeta",
+            ".raftlog",
+        ] {
             let _ = std::fs::remove_file(format!("{s}{ext}"));
         }
         s
@@ -476,8 +566,8 @@ mod tests {
     /// Um "tick" global: relógio lógico avança em todos os nós; entrega tudo.
     fn tick_round(nodes: &mut [RaftNode]) {
         let mut q = VecDeque::new();
-        for i in 0..nodes.len() {
-            for (t, m) in nodes[i].tick() {
+        for (i, node) in nodes.iter_mut().enumerate() {
+            for (t, m) in node.tick() {
                 q.push_back((i, t, m));
             }
         }
@@ -522,10 +612,10 @@ mod tests {
         let lsn0 = nodes[l].last_lsn();
         let root0 = nodes[l].last_root();
         assert_eq!(lsn0, BASE_LSN + 5, "líder não gravou os 5 Fatos");
-        for i in 0..3 {
-            assert_eq!(nodes[i].last_lsn(), lsn0, "nó {i} não convergiu no LSN");
-            assert_eq!(nodes[i].last_root(), root0, "nó {i} não convergiu na raiz");
-            assert_eq!(nodes[i].db.verify().status, "INTEG_OK", "nó {i} não íntegro");
+        for (i, node) in nodes.iter().enumerate().take(3) {
+            assert_eq!(node.last_lsn(), lsn0, "nó {i} não convergiu no LSN");
+            assert_eq!(node.last_root(), root0, "nó {i} não convergiu na raiz");
+            assert_eq!(node.db.verify().status, "INTEG_OK", "nó {i} não íntegro");
         }
     }
 
@@ -537,12 +627,35 @@ mod tests {
         // apagava voted_for e o voto duplo passava.
         let mut n = RaftNode::new(0, vec![1, 2], tmp_db());
 
-        n.handle(1, Msg::RequestVote { term: 5, candidate: 1, last_lsn: BASE_LSN, last_term: 0 });
-        n.handle(1, Msg::AppendEntries {
-            term: 5, leader: 1, prev_lsn: BASE_LSN, prev_root: String::new(),
-            entries: vec![], leader_commit: BASE_LSN,
-        });
-        let resp = n.handle(2, Msg::RequestVote { term: 5, candidate: 2, last_lsn: BASE_LSN, last_term: 0 });
+        n.handle(
+            1,
+            Msg::RequestVote {
+                term: 5,
+                candidate: 1,
+                last_lsn: BASE_LSN,
+                last_term: 0,
+            },
+        );
+        n.handle(
+            1,
+            Msg::AppendEntries {
+                term: 5,
+                leader: 1,
+                prev_lsn: BASE_LSN,
+                prev_root: String::new(),
+                entries: vec![],
+                leader_commit: BASE_LSN,
+            },
+        );
+        let resp = n.handle(
+            2,
+            Msg::RequestVote {
+                term: 5,
+                candidate: 2,
+                last_lsn: BASE_LSN,
+                last_term: 0,
+            },
+        );
 
         match resp.first().map(|(_, m)| m) {
             Some(Msg::RequestVoteResp { granted, .. }) => {
@@ -557,10 +670,28 @@ mod tests {
         // Complemento: um termo MAIOR reabre o voto (não é split-brain — é a
         // progressão normal do Raft).
         let mut n = RaftNode::new(0, vec![1, 2], tmp_db());
-        n.handle(1, Msg::RequestVote { term: 5, candidate: 1, last_lsn: BASE_LSN, last_term: 0 });
-        let resp = n.handle(2, Msg::RequestVote { term: 6, candidate: 2, last_lsn: BASE_LSN, last_term: 0 });
+        n.handle(
+            1,
+            Msg::RequestVote {
+                term: 5,
+                candidate: 1,
+                last_lsn: BASE_LSN,
+                last_term: 0,
+            },
+        );
+        let resp = n.handle(
+            2,
+            Msg::RequestVote {
+                term: 6,
+                candidate: 2,
+                last_lsn: BASE_LSN,
+                last_term: 0,
+            },
+        );
         match resp.first().map(|(_, m)| m) {
-            Some(Msg::RequestVoteResp { granted, .. }) => assert!(granted, "termo maior devia reabrir o voto"),
+            Some(Msg::RequestVoteResp { granted, .. }) => {
+                assert!(granted, "termo maior devia reabrir o voto")
+            }
             other => panic!("resposta inesperada: {:?}", other.map(|_| ())),
         }
     }
@@ -574,16 +705,35 @@ mod tests {
         {
             let db = HeraclitusDB::new(&path).unwrap();
             let mut n = RaftNode::new(0, vec![1, 2], db);
-            n.handle(1, Msg::RequestVote { term: 5, candidate: 1, last_lsn: BASE_LSN, last_term: 0 });
+            n.handle(
+                1,
+                Msg::RequestVote {
+                    term: 5,
+                    candidate: 1,
+                    last_lsn: BASE_LSN,
+                    last_term: 0,
+                },
+            );
         }
         // Restart: reabre o mesmo banco/estado.
         let db = HeraclitusDB::new(&path).unwrap();
         let mut n = RaftNode::new(0, vec![1, 2], db);
         assert_eq!(n.term, 5, "currentTerm não sobreviveu ao restart");
-        let resp = n.handle(2, Msg::RequestVote { term: 5, candidate: 2, last_lsn: BASE_LSN, last_term: 0 });
+        let resp = n.handle(
+            2,
+            Msg::RequestVote {
+                term: 5,
+                candidate: 2,
+                last_lsn: BASE_LSN,
+                last_term: 0,
+            },
+        );
         match resp.first().map(|(_, m)| m) {
             Some(Msg::RequestVoteResp { granted, .. }) => {
-                assert!(!granted, "voto duplo no mesmo termo após restart — split-brain");
+                assert!(
+                    !granted,
+                    "voto duplo no mesmo termo após restart — split-brain"
+                );
             }
             other => panic!("resposta inesperada: {:?}", other.map(|_| ())),
         }
@@ -607,7 +757,11 @@ mod tests {
         }
         let db = HeraclitusDB::new(&path).unwrap();
         let n = RaftNode::new(0, vec![1, 2], db);
-        assert_eq!(n.last_lsn(), BASE_LSN + 3, "log Raft não sobreviveu ao restart");
+        assert_eq!(
+            n.last_lsn(),
+            BASE_LSN + 3,
+            "log Raft não sobreviveu ao restart"
+        );
         assert_eq!(n.last_term(), 3, "termo das entradas não sobreviveu");
     }
 
@@ -619,17 +773,34 @@ mod tests {
         let mut n = RaftNode::new(0, vec![1, 2], tmp_db());
         n.role = Role::Leader;
         n.term = 2;
-        n.log.push(LogEntry { term: 1, lsn: BASE_LSN + 1, merkle_root: "r1".into(), block: vec![] });
+        n.log.push(LogEntry {
+            term: 1,
+            lsn: BASE_LSN + 1,
+            merkle_root: "r1".into(),
+            block: vec![],
+        });
         n.match_index.insert(1, BASE_LSN + 1);
         n.match_index.insert(2, BASE_LSN + 1);
         n.advance_commit();
-        assert_eq!(n.commit_lsn, BASE_LSN, "termo anterior não pode commitar só por contagem");
+        assert_eq!(
+            n.commit_lsn, BASE_LSN,
+            "termo anterior não pode commitar só por contagem"
+        );
 
         // Uma entrada do termo CORRENTE replicada em maioria compromete tudo abaixo.
-        n.log.push(LogEntry { term: 2, lsn: BASE_LSN + 2, merkle_root: "r2".into(), block: vec![] });
+        n.log.push(LogEntry {
+            term: 2,
+            lsn: BASE_LSN + 2,
+            merkle_root: "r2".into(),
+            block: vec![],
+        });
         n.match_index.insert(1, BASE_LSN + 2);
         n.match_index.insert(2, BASE_LSN + 2);
         n.advance_commit();
-        assert_eq!(n.commit_lsn, BASE_LSN + 2, "entrada do termo corrente compromete tudo abaixo");
+        assert_eq!(
+            n.commit_lsn,
+            BASE_LSN + 2,
+            "entrada do termo corrente compromete tudo abaixo"
+        );
     }
 }

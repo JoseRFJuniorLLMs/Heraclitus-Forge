@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Query, State},
-    http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+    extract::{DefaultBodyLimit, Query, State},
+    http::{header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderMap, HeaderValue},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -27,10 +27,11 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
-use tracing::{info, error, warn};
+use tracing::{error, info, warn};
 
-use heraclitus::db::HeraclitusDB;
+use heraclitus::db::{export_facts, HeraclitusDB};
 use heraclitus::hql;
+use heraclitus::quarantine::{key_from_env, QuarantineWriter};
 use heraclitus::runner::ReconstitutiveRunner;
 
 fn resolve_latest_artifact(base: &str) -> Option<String> {
@@ -41,18 +42,16 @@ fn resolve_latest_artifact(base: &str) -> Option<String> {
     let mut highest = (0, 0, 0);
     let mut highest_path = None;
 
-    for entry in std::fs::read_dir(dir).ok()? {
-        if let Ok(e) = entry {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('v') && name.ends_with(".hcx") {
-                let ver_str = &name[1..name.len() - 4];
-                let parts: Vec<u32> = ver_str.split('.').filter_map(|s| s.parse().ok()).collect();
-                if parts.len() == 3 {
-                    let tuple = (parts[0], parts[1], parts[2]);
-                    if tuple >= highest {
-                        highest = tuple;
-                        highest_path = Some(e.path().to_string_lossy().to_string());
-                    }
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('v') && name.ends_with(".hcx") {
+            let ver_str = &name[1..name.len() - 4];
+            let parts: Vec<u32> = ver_str.split('.').filter_map(|s| s.parse().ok()).collect();
+            if parts.len() == 3 {
+                let tuple = (parts[0], parts[1], parts[2]);
+                if tuple >= highest {
+                    highest = tuple;
+                    highest_path = Some(e.path().to_string_lossy().to_string());
                 }
             }
         }
@@ -60,9 +59,9 @@ fn resolve_latest_artifact(base: &str) -> Option<String> {
     highest_path
 }
 
-const DB_PATH: &str = "gateway.hdb";
+const DB_PATH_DEFAULT: &str = "gateway.hdb";
 /// Porta distinta do HeraclitusDB de produção (7475 = "panta rhei").
-const ADDR: &str = "127.0.0.1:7480";
+const ADDR_DEFAULT: &str = "127.0.0.1:7480";
 const CAP: usize = 200;
 
 const SAMPLES: &[&str] = &[
@@ -85,10 +84,21 @@ struct AppState {
     total: AtomicU64,
     db: Mutex<HeraclitusDB>,
     runner: Mutex<ReconstitutiveRunner>,
+    quarantine: Mutex<QuarantineWriter>,
+    db_path: String,
 }
 
-fn cors() -> [(axum::http::HeaderName, &'static str); 1] {
-    [(ACCESS_CONTROL_ALLOW_ORIGIN, "*")]
+fn cors() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Ok(origin) = std::env::var("FORGE_CORS_ORIGIN") {
+        if origin == "*" {
+            return headers;
+        }
+        if let Ok(value) = HeaderValue::from_str(&origin) {
+            headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, value);
+        }
+    }
+    headers
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +112,10 @@ async fn healthz() -> impl IntoResponse {
 async fn stats(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let total = st.total.load(Ordering::Relaxed);
     let lsn = st.db.lock().await.current_lsn;
-    (cors(), Json(json!({ "head": total, "events": total, "lsn": lsn })))
+    (
+        cors(),
+        Json(json!({ "head": total, "events": total, "lsn": lsn })),
+    )
 }
 
 #[derive(Deserialize)]
@@ -130,7 +143,7 @@ struct HqlQ {
 /// e devolve os Fatos projetados como JSON, com suporte a zero-copy, wildcards
 /// e LIMIT N conforme o parser EBNF do `hql.rs`.
 async fn query_hql(
-    State(_st): State<Arc<AppState>>,
+    State(st): State<Arc<AppState>>,
     Query(params): Query<HqlQ>,
 ) -> impl IntoResponse {
     let body = match params.q.filter(|s| !s.is_empty()) {
@@ -139,7 +152,23 @@ async fn query_hql(
             "exemplo": "GET /query?q=FROM FACTS MATCH (actor.id) EXECUTES \"*\" AGAINST \"*\" SELECT * LIMIT 10"
         }),
         Some(qs) => {
-            let result = tokio::task::spawn_blocking(move || hql::execute_query(DB_PATH, &qs))
+            if qs.len() > 16_384 {
+                return (cors(), Json(json!({ "error": "consulta excede 16 KiB" })));
+            }
+            match hql::parse_query(&qs) {
+                Ok(plan) if plan.limit.is_some_and(|limit| limit <= CAP) => {}
+                Ok(_) => {
+                    return (
+                        cors(),
+                        Json(json!({ "error": format!("consulta deve declarar LIMIT <= {CAP}") })),
+                    );
+                }
+                Err(error) => {
+                    return (cors(), Json(json!({ "error": error })));
+                }
+            }
+            let db_path = st.db_path.clone();
+            let result = tokio::task::spawn_blocking(move || hql::execute_query(&db_path, &qs))
                 .await
                 .unwrap_or_else(|e| Err(format!("task panic: {e}")));
             match result {
@@ -161,10 +190,7 @@ async fn query_hql(
 /// Retorna o Fato selado se a linha casou com alguma regra do artefato,
 /// ou `{"drift": true}` se caiu em Schema Drift.
 /// Útil para integração com o Probe nativo sem partilha de memória.
-async fn ingest_line(
-    State(st): State<Arc<AppState>>,
-    body: String,
-) -> impl IntoResponse {
+async fn ingest_line(State(st): State<Arc<AppState>>, body: String) -> impl IntoResponse {
     let line = body.trim().to_string();
     let body = if line.is_empty() {
         json!({ "error": "body vazio — envie uma linha de log no corpo da requisição" })
@@ -172,27 +198,35 @@ async fn ingest_line(
         let of = st.runner.lock().await.process_observation(&line);
         match of {
             None => {
-                // Truncar por CARACTERES, não por bytes: `&line[..80]` num corpo
-                // HTTP multibyte (UTF-8) que caísse a meio de um caractere
-                // panicava o handler (índice fora de fronteira de char).
-                let short: String = line.chars().take(80).collect();
-                let short200: String = line.chars().take(200).collect();
-                warn!("[POST /ingest] Schema Drift: {}", short);
-                json!({ "drift": true, "line": short200 })
-            }
-            Some(mut f) => {
-                match st.db.lock().await.write_fact(&mut f) {
-                    Err(e) => json!({ "error": e.to_string() }),
-                    Ok(lsn) => {
-                        let fact_copy = f.clone();
-                        let mut rec = st.recent.lock().await;
-                        rec.push_front(fact_copy);
-                        while rec.len() > CAP { rec.pop_back(); }
-                        st.total.fetch_add(1, Ordering::Relaxed);
-                        json!({ "ok": true, "lsn": lsn, "fact": f })
+                let fingerprint = blake3::hash(line.as_bytes()).to_hex().to_string();
+                match st.quarantine.lock().await.append("gateway-http", &line) {
+                    Ok(()) => {
+                        warn!("[POST /ingest] Schema Drift: b3:{}", &fingerprint[..16]);
+                        json!({
+                            "drift": true,
+                            "quarantined": true,
+                            "fingerprint": format!("b3:{}", &fingerprint[..16]),
+                        })
+                    }
+                    Err(error) => {
+                        error!("falha ao cifrar quarentena: {error}");
+                        json!({ "error": "falha ao persistir quarentena cifrada" })
                     }
                 }
             }
+            Some(mut f) => match st.db.lock().await.write_fact(&mut f) {
+                Err(e) => json!({ "error": e.to_string() }),
+                Ok(lsn) => {
+                    let fact_copy = f.clone();
+                    let mut rec = st.recent.lock().await;
+                    rec.push_front(fact_copy);
+                    while rec.len() > CAP {
+                        rec.pop_back();
+                    }
+                    st.total.fetch_add(1, Ordering::Relaxed);
+                    json!({ "ok": true, "lsn": lsn, "fact": f })
+                }
+            },
         }
     };
     (cors(), Json(body))
@@ -202,12 +236,15 @@ async fn ingest_line(
 
 async fn verify_db(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let r = st.db.lock().await.verify();
-    (cors(), Json(json!({
-        "status":  r.status,
-        "facts":   r.facts,
-        "root":    r.root,
-        "message": r.message,
-    })))
+    (
+        cors(),
+        Json(json!({
+            "status":  r.status,
+            "facts":   r.facts,
+            "root":    r.root,
+            "message": r.message,
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -218,25 +255,56 @@ async fn verify_db(State(st): State<Arc<AppState>>) -> impl IntoResponse {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let _ = std::fs::remove_file(DB_PATH);
-    let _ = std::fs::remove_file(format!("{DB_PATH}.anchor"));
+    let addr: std::net::SocketAddr = std::env::var("FORGE_GATEWAY_ADDR")
+        .unwrap_or_else(|_| ADDR_DEFAULT.into())
+        .parse()
+        .context("FORGE_GATEWAY_ADDR inválido")?;
+    if !addr.ip().is_loopback() {
+        anyhow::bail!("gateway sem TLS/RBAC é restrito a loopback; recebido {addr}");
+    }
+    if std::env::var("FORGE_CORS_ORIGIN").is_ok_and(|origin| origin == "*") {
+        anyhow::bail!("FORGE_CORS_ORIGIN='*' é proibido");
+    }
 
-    let artifact_path = resolve_latest_artifact("../registry/postgresql")
+    let artifact_dir =
+        std::env::var("FORGE_ARTIFACT_DIR").unwrap_or_else(|_| "../registry/postgresql".into());
+    let artifact_path = resolve_latest_artifact(&artifact_dir)
         .context("Nenhuma versao do conector postgresql encontrada no registry")?;
 
-    let runner = ReconstitutiveRunner::load(&artifact_path).context("artefato .hcx ausente — rode: python forge_compiler.py")?;
+    let runner = ReconstitutiveRunner::load(&artifact_path)
+        .context("artefato .hcx ausente — rode: python forge_compiler.py")?;
     info!("Runner carregado (plano: {})", runner.plan_str());
-    let db = HeraclitusDB::new(DB_PATH).context("abrir db")?;
+    let db_path = std::env::var("FORGE_GATEWAY_DB").unwrap_or_else(|_| DB_PATH_DEFAULT.into());
+    let db = HeraclitusDB::new(&db_path).context("abrir db íntegro")?;
+    let verified = db.verify();
+    let mut recent = VecDeque::with_capacity(CAP);
+    export_facts(&db_path, 0, |_, fact| {
+        recent.push_front(fact);
+        if recent.len() > CAP {
+            recent.pop_back();
+        }
+        true
+    })
+    .context("reconstruir janela recente do gateway")?;
+    let quarantine_path =
+        std::env::var("FORGE_QUARANTINE_PATH").unwrap_or_else(|_| "gateway.quarantine.hq".into());
+    let quarantine = QuarantineWriter::open(
+        quarantine_path,
+        key_from_env().context("carregar FORGE_QUARANTINE_KEY")?,
+    )
+    .context("abrir quarentena cifrada")?;
 
     let state = Arc::new(AppState {
-        recent: Mutex::new(VecDeque::with_capacity(CAP)),
-        total: AtomicU64::new(0),
+        recent: Mutex::new(recent),
+        total: AtomicU64::new(verified.facts as u64),
         db: Mutex::new(db),
         runner: Mutex::new(runner),
+        quarantine: Mutex::new(quarantine),
+        db_path,
     });
 
-    // Tarefa de ingestão contínua (simula stream PostgreSQL)
-    {
+    // Dados sintéticos são exclusivamente demo e nunca entram por omissão.
+    if std::env::var("FORGE_DEMO_SAMPLES").is_ok_and(|v| v == "1") {
         let st = state.clone();
         tokio::spawn(async move {
             let mut i = 0usize;
@@ -253,7 +321,9 @@ async fn main() -> Result<()> {
                     }
                     let mut rec = st.recent.lock().await;
                     rec.push_front(f);
-                    while rec.len() > CAP { rec.pop_back(); }
+                    while rec.len() > CAP {
+                        rec.pop_back();
+                    }
                     st.total.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -262,17 +332,20 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .route("/stats",   get(stats))
-        .route("/facts",   get(facts))
-        .route("/query",   get(query_hql))    // HQL nativo
-        .route("/ingest",  post(ingest_line)) // ingestão avulsa
-        .route("/verify",  get(verify_db))    // integridade física + criptográfica
+        .route("/stats", get(stats))
+        .route("/facts", get(facts))
+        .route("/query", get(query_hql)) // HQL nativo
+        .route("/ingest", post(ingest_line)) // ingestão avulsa
+        .route("/verify", get(verify_db)) // integridade física + criptográfica
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state);
 
-    info!("Heraclitus gateway  ->  http://{ADDR}");
+    info!("Heraclitus gateway  ->  http://{addr}");
     info!("  GET  /facts?limit=N  GET  /stats  GET  /healthz");
-    info!("  GET  /query?q=<HQL>  POST /ingest  GET  /verify   (CORS *)");
-    let listener = tokio::net::TcpListener::bind(ADDR).await.context("bind falhou")?;
+    info!("  GET  /query?q=<HQL>  POST /ingest  GET  /verify");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("bind falhou")?;
     axum::serve(listener, app).await.context("serve falhou")?;
     Ok(())
 }

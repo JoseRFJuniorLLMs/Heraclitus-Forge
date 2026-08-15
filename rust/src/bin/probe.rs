@@ -36,9 +36,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use heraclitus::db::HeraclitusDB;
+use heraclitus::quarantine::{key_from_env, QuarantineWriter, KEY_ENV};
 use heraclitus::runner::ReconstitutiveRunner;
 
 fn resolve_latest_artifact(base: &str) -> Option<String> {
@@ -49,18 +50,16 @@ fn resolve_latest_artifact(base: &str) -> Option<String> {
     let mut highest = (0, 0, 0);
     let mut highest_path = None;
 
-    for entry in std::fs::read_dir(dir).ok()? {
-        if let Ok(e) = entry {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('v') && name.ends_with(".hcx") {
-                let ver_str = &name[1..name.len() - 4];
-                let parts: Vec<u32> = ver_str.split('.').filter_map(|s| s.parse().ok()).collect();
-                if parts.len() == 3 {
-                    let tuple = (parts[0], parts[1], parts[2]);
-                    if tuple >= highest {
-                        highest = tuple;
-                        highest_path = Some(e.path().to_string_lossy().to_string());
-                    }
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('v') && name.ends_with(".hcx") {
+            let ver_str = &name[1..name.len() - 4];
+            let parts: Vec<u32> = ver_str.split('.').filter_map(|s| s.parse().ok()).collect();
+            if parts.len() == 3 {
+                let tuple = (parts[0], parts[1], parts[2]);
+                if tuple >= highest {
+                    highest = tuple;
+                    highest_path = Some(e.path().to_string_lossy().to_string());
                 }
             }
         }
@@ -102,17 +101,47 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let selftest = args.iter().any(|a| a == "--selftest");
-    let use_tcp  = args.iter().any(|a| a == "--tcp");
+    let use_tcp = args.iter().any(|a| a == "--tcp");
 
-    let _ = std::fs::remove_file(DB);
-    let _ = std::fs::remove_file(format!("{DB}.anchor"));
+    let db_path = if selftest {
+        std::env::temp_dir()
+            .join(format!("forge_probe_selftest_{}.hdb", std::process::id()))
+            .to_string_lossy()
+            .to_string()
+    } else {
+        std::env::var("FORGE_PROBE_DB").unwrap_or_else(|_| DB.into())
+    };
+    if selftest {
+        for ext in ["", ".anchor", ".anchor.sig", ".key", ".pub"] {
+            let _ = std::fs::remove_file(format!("{db_path}{ext}"));
+        }
+    }
 
-    let artifact_path = resolve_latest_artifact("../registry/postgresql")
+    let artifact_dir =
+        std::env::var("FORGE_ARTIFACT_DIR").unwrap_or_else(|_| "../registry/postgresql".into());
+    let artifact_path = resolve_latest_artifact(&artifact_dir)
         .context("Nenhuma versao do conector postgresql encontrada no registry")?;
 
-    let mut runner = ReconstitutiveRunner::load(&artifact_path)
-        .context("Falha ao carregar artefato .hcx")?;
-    let mut db = HeraclitusDB::new(DB).context("Falha ao abrir db")?;
+    let mut runner =
+        ReconstitutiveRunner::load(&artifact_path).context("Falha ao carregar artefato .hcx")?;
+    let mut db = HeraclitusDB::new(&db_path).context("Falha ao abrir db íntegro")?;
+    let quarantine_path = if selftest {
+        std::env::temp_dir().join(format!(
+            "forge_probe_selftest_{}.quarantine.hq",
+            std::process::id()
+        ))
+    } else {
+        std::env::var("FORGE_QUARANTINE_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| "probe.quarantine.hq".into())
+    };
+    let quarantine_key = if selftest && std::env::var(KEY_ENV).is_err() {
+        [9u8; 32]
+    } else {
+        key_from_env().context("carregar chave da quarentena")?
+    };
+    let mut quarantine_writer = QuarantineWriter::open(&quarantine_path, quarantine_key)
+        .context("abrir quarentena cifrada")?;
 
     // Canal unificado: todas as fontes entregam (src_addr, log_line) aqui.
     let (tx, rx) = mpsc::channel::<(String, String)>();
@@ -163,7 +192,9 @@ fn main() -> Result<()> {
         thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
-                    Err(e) => { error!("[TCP] accept erro: {e}"); }
+                    Err(e) => {
+                        error!("[TCP] accept erro: {e}");
+                    }
                     Ok(stream) => {
                         let src = stream
                             .peer_addr()
@@ -196,7 +227,10 @@ fn main() -> Result<()> {
     // (opcional --selftest)
     // ------------------------------------------------------------------
     if selftest {
-        info!("[selftest] enviando {} datagrama(s) via UDP...", SELFTEST_LINES.len());
+        info!(
+            "[selftest] enviando {} datagrama(s) via UDP...",
+            SELFTEST_LINES.len()
+        );
         thread::spawn(|| {
             let s = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
             for line in SELFTEST_LINES {
@@ -207,7 +241,10 @@ fn main() -> Result<()> {
 
         // Se --tcp também, envia as mesmas linhas via TCP
         if use_tcp {
-            info!("[selftest] enviando {} linha(s) via TCP...", SELFTEST_LINES.len());
+            info!(
+                "[selftest] enviando {} linha(s) via TCP...",
+                SELFTEST_LINES.len()
+            );
             thread::spawn(|| {
                 thread::sleep(Duration::from_millis(200)); // aguarda TCP listener subir
                 use std::io::Write;
@@ -235,7 +272,7 @@ fn main() -> Result<()> {
     // Loop principal de processamento
     // ------------------------------------------------------------------
     let mut sealed: u64 = 0;
-    let mut quarantine: u64 = 0;
+    let mut quarantined: u64 = 0;
     let mut got_any = false;
     let mut last_stats = Instant::now();
 
@@ -251,27 +288,26 @@ fn main() -> Result<()> {
             Ok((src, line)) => {
                 got_any = true;
                 match runner.process_observation(&line) {
-                    Some(mut f) => {
-                        match db.write_fact(&mut f) {
-                            Err(e) => error!("Erro ao gravar fato: {e}"),
-                            Ok(lsn) => {
-                                sealed += 1;
-                                let b = &f["fact.behavior"];
-                                info!(
-                                    "[{src}] LSN {lsn} | {:<22} | {:<18} | {}",
-                                    b["action"].as_str().unwrap_or(""),
-                                    b["class"].as_str().unwrap_or(""),
-                                    b["risk_level"].as_str().unwrap_or("")
-                                );
-                            }
+                    Some(mut f) => match db.write_fact(&mut f) {
+                        Err(e) => error!("Erro ao gravar fato: {e}"),
+                        Ok(lsn) => {
+                            sealed += 1;
+                            let b = &f["fact.behavior"];
+                            info!(
+                                "[{src}] LSN {lsn} | {:<22} | {:<18} | {}",
+                                b["action"].as_str().unwrap_or(""),
+                                b["class"].as_str().unwrap_or(""),
+                                b["risk_level"].as_str().unwrap_or("")
+                            );
                         }
-                    }
+                    },
                     None => {
-                        quarantine += 1;
-                        warn!(
-                            "[{src}] [SCHEMA DRIFT → quarentena] {}",
-                            &line[..line.len().min(60)]
-                        );
+                        quarantine_writer
+                            .append(&src, &line)
+                            .context("persistir Schema Drift na quarentena cifrada")?;
+                        quarantined += 1;
+                        let short: String = line.chars().take(60).collect();
+                        warn!("[{src}] [SCHEMA DRIFT → quarentena] {}", short);
                     }
                 }
             }
@@ -283,7 +319,7 @@ fn main() -> Result<()> {
                     break;
                 }
                 if last_stats.elapsed() >= Duration::from_secs(10) {
-                    info!("-- stats: selados={sealed} quarentena={quarantine} --");
+                    info!("-- stats: selados={sealed} quarentena={quarantined} --");
                     last_stats = Instant::now();
                 }
             }
@@ -301,20 +337,26 @@ fn main() -> Result<()> {
         // TCP (--tcp): dobra os números (mesmas linhas enviadas por ambos)
         let factor: u64 = if use_tcp { 2 } else { 1 };
         let expect_sealed = 7 * factor;
-        let expect_quar   = 1 * factor;
+        let expect_quar = factor;
 
         info!(
-            "[selftest] resultado: selados={sealed}/{expect_sealed}  quarentena={quarantine}/{expect_quar}"
+            "[selftest] resultado: selados={sealed}/{expect_sealed}  quarentena={quarantined}/{expect_quar}"
         );
 
         let vr = db.verify();
-        info!("[selftest] db.verify() → {} (fatos: {})", vr.status, vr.facts);
+        info!(
+            "[selftest] db.verify() → {} (fatos: {})",
+            vr.status, vr.facts
+        );
 
-        let ok = sealed == expect_sealed && quarantine == expect_quar && vr.status == "INTEG_OK";
+        let ok = sealed == expect_sealed && quarantined == expect_quar && vr.status == "INTEG_OK";
         info!("[selftest] {}", if ok { "✓ OK" } else { "✗ FALHOU" });
 
-        let _ = std::fs::remove_file(DB);
-        let _ = std::fs::remove_file(format!("{DB}.anchor"));
+        drop(quarantine_writer);
+        for ext in ["", ".anchor", ".anchor.sig", ".key", ".pub"] {
+            let _ = std::fs::remove_file(format!("{db_path}{ext}"));
+        }
+        let _ = std::fs::remove_file(&quarantine_path);
 
         if !ok {
             std::process::exit(1);

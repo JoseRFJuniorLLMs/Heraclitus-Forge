@@ -9,7 +9,7 @@
 
 use std::fs;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tracing::error;
 
 use heraclitus::runner::ReconstitutiveRunner;
@@ -39,19 +39,26 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(Value::Null);
-    let cases = tm.get("cases").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+    let cases = tm
+        .get("cases")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
 
     let mut covered = 0usize;
     for c in &cases {
         let input = c.get("input").and_then(|v| v.as_str()).unwrap_or("");
-        let expect = c.get("expect_action").and_then(|v| v.as_str()).unwrap_or("");
+        let expect = c
+            .get("expect_action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if let Some(f) = runner.process_observation(input) {
             if f["fact.behavior"]["action"].as_str() == Some(expect) {
                 covered += 1;
             }
         }
     }
-    
+
     // ATENÇÃO: NÃO REMOVER OU ALTERAR ESSE PRINTLN. O FORGE PYTHON DEPENDE DELE NO STDOUT.
     println!("{covered} {}", cases.len());
     Ok(())

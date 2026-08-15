@@ -2,7 +2,7 @@
 //!
 //! O MESMO state machine `Msg`/`RaftNode` da simulação por ticks, agora sobre
 //! **TCP real**: cada nó tem um listener; as mensagens são enquadradas
-//! (`u32` LE de comprimento + `bincode` de `(from_id, Msg)`); o relógio lógico
+//! (`u32` LE de comprimento + JSON de `(versão, from_id, Msg)`); o relógio lógico
 //! do Raft é dirigido por um `tokio::time::interval`. Ligação por mensagem
 //! (best-effort — se o peer estiver em baixo, o próximo heartbeat/eleição
 //! reenvia; pool de ligações fica como otimização futura, como no `net.rs` do
@@ -23,6 +23,7 @@ use crate::raft::{Msg, RaftNode};
 /// Teto de um frame (recusa antes de alocar do fio — um comprimento corrompido
 /// não pode pedir GiBs). Um bloco de Fato é minúsculo; 16 MiB sobra.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
+const WIRE_VERSION: u16 = 1;
 
 async fn write_frame(sock: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
     sock.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
@@ -48,7 +49,7 @@ async fn read_frame(sock: &mut TcpStream) -> std::io::Result<Vec<u8>> {
 /// Liga a um peer, envia um frame e fecha. Best-effort: um peer em baixo ou uma
 /// ligação recusada não é erro fatal (o Raft reenvia no próximo tick).
 async fn send_msg(addr: SocketAddr, from: usize, msg: Msg) {
-    let bytes = match bincode::serialize(&(from as u32, msg)) {
+    let bytes = match serde_json::to_vec(&(WIRE_VERSION, from as u32, msg)) {
         Ok(b) => b,
         Err(_) => return,
     };
@@ -75,7 +76,14 @@ pub fn serve(
     listener: TcpListener,
     addrs: Vec<SocketAddr>,
     tick_period: Duration,
-) -> tokio::task::JoinHandle<()> {
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    let local = listener.local_addr()?;
+    if !local.ip().is_loopback() || addrs.iter().any(|addr| !addr.ip().is_loopback()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "wire Raft do Forge não possui mTLS e é restrito a loopback",
+        ));
+    }
     let addrs = Arc::new(addrs);
     let id = node.lock().unwrap().id;
 
@@ -93,7 +101,9 @@ pub fn serve(
                 let addrs = addrs.clone();
                 tokio::spawn(async move {
                     while let Ok(bytes) = read_frame(&mut sock).await {
-                        if let Ok((from, msg)) = bincode::deserialize::<(u32, Msg)>(&bytes) {
+                        if let Ok((WIRE_VERSION, from, msg)) =
+                            serde_json::from_slice::<(u16, u32, Msg)>(&bytes)
+                        {
                             // Secção crítica curta e SÍNCRONA (o `handle` não tem
                             // `.await`); o lock é libertado antes de qualquer envio.
                             let outs = { node.lock().unwrap().handle(from as usize, msg) };
@@ -106,14 +116,14 @@ pub fn serve(
     }
 
     // Relógio lógico: tick periódico → eleição/heartbeat conforme o papel.
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         let mut tick = tokio::time::interval(tick_period);
         loop {
             tick.tick().await;
             let outs = { node.lock().unwrap().tick() };
             dispatch(outs, id, &addrs);
         }
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -130,7 +140,15 @@ mod tests {
         let n = CTR.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!("forge_wire_{}_{}.hdb", std::process::id(), n));
         let s = p.to_str().unwrap().to_string();
-        for ext in ["", ".anchor", ".anchor.sig", ".key", ".pub", ".raftmeta", ".raftlog"] {
+        for ext in [
+            "",
+            ".anchor",
+            ".anchor.sig",
+            ".key",
+            ".pub",
+            ".raftmeta",
+            ".raftlog",
+        ] {
             let _ = std::fs::remove_file(format!("{s}{ext}"));
         }
         s
@@ -185,10 +203,20 @@ mod tests {
 
         let mut handles = Vec::new();
         for (i, l) in listeners.into_iter().enumerate() {
-            handles.push(serve(nodes[i].clone(), l, addrs.clone(), Duration::from_millis(25)));
+            handles.push(
+                serve(
+                    nodes[i].clone(),
+                    l,
+                    addrs.clone(),
+                    Duration::from_millis(25),
+                )
+                .unwrap(),
+            );
         }
 
-        let leader = wait_leader(&nodes, 240).await.expect("nenhum líder eleito sobre TCP");
+        let leader = wait_leader(&nodes, 240)
+            .await
+            .expect("nenhum líder eleito sobre TCP");
 
         // O líder ingere 3 Fatos (durável local) e regista-os no log Raft.
         {
@@ -205,8 +233,8 @@ mod tests {
 
         let l_lsn = nodes[leader].lock().unwrap().last_lsn();
         assert_eq!(l_lsn, BASE_LSN + 3, "líder não gravou os 3 Fatos");
-        for i in 0..3 {
-            let n = nodes[i].lock().unwrap();
+        for (i, node) in nodes.iter().enumerate().take(3) {
+            let n = node.lock().unwrap();
             assert_eq!(n.last_lsn(), l_lsn, "nó {i} não convergiu sobre TCP");
             assert_eq!(n.db.verify().status, "INTEG_OK", "nó {i} não íntegro");
         }

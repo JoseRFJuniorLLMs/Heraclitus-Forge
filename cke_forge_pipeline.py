@@ -19,9 +19,8 @@ Uso:
   python cke_forge_pipeline.py -                   # stdin (pipe do fabric)
   python cke_forge_pipeline.py quarantine.log --min-samples 3 --json-report
 """
-from __future__ import annotations
 
-import _console  # noqa: F401  (consola UTF-8 no Windows)
+from __future__ import annotations
 
 import argparse
 import json
@@ -29,9 +28,10 @@ import re
 import sys
 from pathlib import Path
 
+import _console  # noqa: F401  (consola UTF-8 no Windows)
 import cke
-import forge_compiler
 import forge_ai
+import forge_compiler
 
 # Mínimo de logs por cluster para tentar compilar um conector.
 # Clusters menores podem ser ruído pontual — não valem um .hcx.
@@ -41,6 +41,7 @@ MIN_SAMPLES_DEFAULT = 2
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _fingerprint_from_template(tmpl: str, idx: int) -> str:
     """Deriva um fingerprint curto e seguro (a-z0-9_) a partir do template."""
@@ -80,9 +81,7 @@ def _heuristic_profile(fingerprint: str, cluster_info: dict) -> dict:
             }
         ],
         "behavior": [],
-        "test_matrix": [
-            {"input": cluster_info["sample"], "expect_action": "log.info"}
-        ],
+        "test_matrix": [{"input": cluster_info["sample"], "expect_action": "log.info"}],
         "benchmark": {"estimated_eps": 50_000, "avg_latency_ms": 1.5},
     }
 
@@ -95,6 +94,7 @@ def _raw_lines_for_cluster(all_lines: list[str], template: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Pipeline principal
 # ---------------------------------------------------------------------------
+
 
 def run_pipeline(quarantine_lines: list[str], min_samples: int = MIN_SAMPLES_DEFAULT) -> dict:
     """
@@ -169,15 +169,17 @@ def run_pipeline(quarantine_lines: list[str], min_samples: int = MIN_SAMPLES_DEF
                 profile = forge_ai.derive_profile(
                     fingerprint=fingerprint,
                     vendor=f"Auto-detectado — cluster {idx}",
-                    samples=raw[:6],   # até 6 amostras reais
+                    samples=raw[:6],  # até 6 amostras reais
                 )
                 method = "claude"
                 print(f"  ✓ Perfil derivado via Claude ({len(raw)} amostra(s))")
             else:
                 profile = _heuristic_profile(fingerprint, cluster_info)
                 method = "heurística"
-                print(f"  ✓ Perfil heurístico gerado (regex CKE)")
-        except Exception as exc:
+                print("  ✓ Perfil heurístico gerado (regex CKE)")
+        # Cada cluster é uma unidade independente; uma falha de SDK/plugin não
+        # pode descartar os demais clusters do lote.
+        except Exception as exc:  # noqa: BLE001
             err = f"cluster {idx} ({fingerprint}): erro ao derivar perfil — {exc}"
             print(f"  ✗ {err}")
             report["errors"].append(err)
@@ -193,16 +195,18 @@ def run_pipeline(quarantine_lines: list[str], min_samples: int = MIN_SAMPLES_DEF
                 sample_log=sample[:300],
             )
             print(f"  ✓ Compilado [{method}]: {artifact_path}")
-            report["compiled"].append({
-                "cluster": idx,
-                "fingerprint": fingerprint,
-                "count": count,
-                "method": method,
-                "path": artifact_path,
-                "coverage_pct": cluster_info["coverage_pct"],
-            })
+            report["compiled"].append(
+                {
+                    "cluster": idx,
+                    "fingerprint": fingerprint,
+                    "count": count,
+                    "method": method,
+                    "path": artifact_path,
+                    "coverage_pct": cluster_info["coverage_pct"],
+                }
+            )
             report["clusters_compiled"] += 1
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - isolamento por cluster
             err = f"cluster {idx} ({fingerprint}): erro ao compilar .hcx — {exc}"
             print(f"  ✗ {err}")
             report["errors"].append(err)
@@ -230,6 +234,7 @@ def run_pipeline(quarantine_lines: list[str], min_samples: int = MIN_SAMPLES_DEF
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -277,9 +282,7 @@ def main() -> None:
             sys.exit(1)
         print(f"=== Heraclitus CKE→Forge — {p} ({p.stat().st_size} bytes) ===")
         quarantine_lines = [
-            ln.strip()
-            for ln in p.read_text(encoding="utf-8").splitlines()
-            if ln.strip()
+            ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()
         ]
 
     report = run_pipeline(quarantine_lines, min_samples=args.min_samples)

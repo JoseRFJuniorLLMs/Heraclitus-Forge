@@ -40,14 +40,14 @@ CLI
     python forge_sign.py verify registry/x/v1.0.0.hcx
     python forge_sign.py verify-all                   # varre o registry inteiro
 """
-from __future__ import annotations
 
-import _console  # noqa: F401  (consola UTF-8 no Windows)
+from __future__ import annotations
 
 import hashlib
 import os
 import stat
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
@@ -55,6 +55,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+
+import _console  # noqa: F401  (consola UTF-8 no Windows)
 
 HERE = Path(__file__).resolve().parent
 REGISTRY = HERE / "registry"
@@ -77,6 +79,7 @@ def privkey_path() -> Path:
 # Chaves
 # ---------------------------------------------------------------------------
 
+
 def keygen(*, force: bool = False) -> tuple[Path, Path]:
     """Gera o par de publicação. Recusa-se a sobrepor uma chave existente."""
     priv_p = privkey_path()
@@ -90,10 +93,8 @@ def keygen(*, force: bool = False) -> tuple[Path, Path]:
     key = Ed25519PrivateKey.generate()
     raw = key.private_bytes_raw()
     priv_p.write_bytes(raw)
-    try:
+    with suppress(OSError):
         priv_p.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600 (no-op no Windows)
-    except OSError:
-        pass
 
     REGISTRY.mkdir(parents=True, exist_ok=True)
     pub_hex = key.public_key().public_bytes_raw().hex()
@@ -124,6 +125,7 @@ def load_public() -> Ed25519PublicKey | None:
 # Digest canónico
 # ---------------------------------------------------------------------------
 
+
 def artifact_digest(pkg: Path) -> bytes:
     """
     Digest canónico do artefato. Determinístico: a mesma pasta dá sempre o mesmo
@@ -151,18 +153,16 @@ def artifact_digest(pkg: Path) -> bytes:
 # Assinar / verificar
 # ---------------------------------------------------------------------------
 
-def sign_artifact(pkg: Path, key: Ed25519PrivateKey | None = None) -> str:
-    key = key or load_private()
+
+def sign_artifact(
+    pkg: Path,
+    signer: Ed25519PrivateKey | None = None,
+) -> str:
+    signer = signer or load_private()
     digest = artifact_digest(pkg)
-    sig = key.sign(digest)
-    pub = key.public_key().public_bytes_raw().hex()
-    body = (
-        f"format={FORMAT}\n"
-        f"alg=ed25519\n"
-        f"key={pub}\n"
-        f"digest={digest.hex()}\n"
-        f"sig={sig.hex()}\n"
-    )
+    sig = signer.sign(digest)
+    pub = signer.public_key().public_bytes_raw().hex()
+    body = f"format={FORMAT}\nalg=ed25519\nkey={pub}\ndigest={digest.hex()}\nsig={sig.hex()}\n"
     (pkg / SIG_NAME).write_text(body, encoding="utf-8")
     return sig.hex()
 
@@ -185,12 +185,9 @@ def verify_artifact(pkg: Path) -> tuple[str, str]:
 
     raw = sig_file.read_text(encoding="utf-8").strip()
     if raw.startswith("ed25519:sig:"):
-        return ("LEGACY_MOCK",
-                "selo antigo sem chave — não prova origem (ver registry/README.md)")
+        return ("LEGACY_MOCK", "selo antigo sem chave — não prova origem (ver registry/README.md)")
 
-    fields = dict(
-        line.split("=", 1) for line in raw.splitlines() if "=" in line
-    )
+    fields = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
     if fields.get("format") != FORMAT or "sig" not in fields:
         return "BAD_SIGNATURE", f"formato irreconhecível: {raw[:40]!r}"
 
@@ -199,14 +196,18 @@ def verify_artifact(pkg: Path) -> tuple[str, str]:
         return "NO_PUBKEY", f"{PUBKEY_PATH} não existe"
 
     if fields.get("key") != pub.public_bytes_raw().hex():
-        return ("WRONG_KEY",
-                f"assinado por {fields.get('key', '?')[:16]}…, "
-                f"o registry confia em {pub.public_bytes_raw().hex()[:16]}…")
+        return (
+            "WRONG_KEY",
+            f"assinado por {fields.get('key', '?')[:16]}…, "
+            f"o registry confia em {pub.public_bytes_raw().hex()[:16]}…",
+        )
 
     actual = artifact_digest(pkg)
     if actual.hex() != fields.get("digest"):
-        return ("TAMPERED",
-                f"digest agora {actual.hex()[:16]}…, assinado {fields.get('digest','?')[:16]}…")
+        return (
+            "TAMPERED",
+            f"digest agora {actual.hex()[:16]}…, assinado {fields.get('digest', '?')[:16]}…",
+        )
 
     try:
         pub.verify(bytes.fromhex(fields["sig"]), actual)
@@ -238,8 +239,11 @@ def main() -> None:
 
     elif cmd in ("sign", "sign-all"):
         key = load_private()
-        alvos = [Path(a) for a in args[1:] if not a.startswith("-")] \
-            if cmd == "sign" else list(iter_artifacts())
+        alvos = (
+            [Path(a) for a in args[1:] if not a.startswith("-")]
+            if cmd == "sign"
+            else list(iter_artifacts())
+        )
         if not alvos:
             raise SystemExit("[ERRO] nada para assinar")
         for pkg in alvos:
@@ -247,8 +251,11 @@ def main() -> None:
             print(f"[+] assinado {pkg}  sig={sig[:16]}…")
 
     elif cmd in ("verify", "verify-all"):
-        alvos = [Path(a) for a in args[1:] if not a.startswith("-")] \
-            if cmd == "verify" and len(args) > 1 else list(iter_artifacts())
+        alvos = (
+            [Path(a) for a in args[1:] if not a.startswith("-")]
+            if cmd == "verify" and len(args) > 1
+            else list(iter_artifacts())
+        )
         if not alvos:
             raise SystemExit(f"[ERRO] nenhum artefato em {REGISTRY}")
         mau = 0
@@ -256,7 +263,9 @@ def main() -> None:
             estado, detalhe = verify_artifact(pkg)
             if estado != "OK":
                 mau += 1
-            print(f"  {_MARK.get(estado, '✗')} {estado:14s} {pkg.parent.name}/{pkg.name}  — {detalhe}")
+            print(
+                f"  {_MARK.get(estado, '✗')} {estado:14s} {pkg.parent.name}/{pkg.name}  — {detalhe}"
+            )
         print(f"\n{len(alvos) - mau}/{len(alvos)} artefato(s) com assinatura válida.")
         sys.exit(1 if mau else 0)
 

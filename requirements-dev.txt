@@ -1,0 +1,6 @@
+-r requirements-ai.txt
+-r requirements-dashboard.txt
+
+pip-audit>=2.9
+pytest>=8.0
+ruff>=0.12

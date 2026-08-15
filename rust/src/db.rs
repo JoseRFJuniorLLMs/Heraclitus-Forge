@@ -34,7 +34,7 @@ use crate::{cpm, fbfact};
 
 fn from_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -82,7 +82,7 @@ fn load_or_create_key(key_path: &str, pub_path: &str) -> std::io::Result<Signing
     }
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("getrandom: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("getrandom: {e}")))?;
     let sk = SigningKey::from_bytes(&seed);
     fs::write(key_path, to_hex(&seed))?;
     restrict_key_perms(key_path);
@@ -268,6 +268,25 @@ pub struct HeraclitusDB {
     signing_key: SigningKey,
 }
 
+/// Verifica um `.hdb` sem abrir/criar a chave privada. Esta é a superfície
+/// correta para exportadores, auditores e pipelines read-only: `HeraclitusDB::new`
+/// pode criar sidecars ausentes, o que seria uma mutação inaceitável durante
+/// uma verificação de cadeia de custódia.
+pub fn verify_file(db_path: &str) -> VerifyResult {
+    let verifier = HeraclitusDB {
+        db_path: db_path.to_string(),
+        anchor_path: format!("{db_path}.anchor"),
+        anchor_sig_path: format!("{db_path}.anchor.sig"),
+        pub_path: format!("{db_path}.pub"),
+        current_lsn: BASE_LSN,
+        trusted_root: String::new(),
+        // Nunca usada por `verify`; existe apenas porque o writer mantém a
+        // chave no mesmo tipo. Uma seed fixa aqui não toca o disco nem assina.
+        signing_key: SigningKey::from_bytes(&[0u8; 32]),
+    };
+    verifier.verify()
+}
+
 impl HeraclitusDB {
     pub fn new(db_path: &str) -> std::io::Result<Self> {
         let existed = std::path::Path::new(db_path).exists();
@@ -299,6 +318,21 @@ impl HeraclitusDB {
         // disco (mesma filosofia replay-from-log do HeraclitusDB de produção).
         if existed {
             db.recover()?;
+            let verified = db.verify();
+            if verified.status != "INTEG_OK" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "recusa abrir .hdb não íntegro ({}): {}",
+                        verified.status, verified.message
+                    ),
+                ));
+            }
+        } else {
+            // Um banco vazio também possui âncora assinada. Sem isto, fechar
+            // antes do primeiro Fato e reabrir pareceria adulteração por
+            // ausência de `.anchor.sig`.
+            db.persist_anchor()?;
         }
         Ok(db)
     }
@@ -435,65 +469,83 @@ impl HeraclitusDB {
     ///   2. **CRC-32C do payload CRF v2** (camada física — CPM-200)
     ///   3. LSN sequencial
     ///   4. Folha BLAKE3 e cadeia Merkle (camada criptográfica)
-    pub fn append_replicated_block(&mut self, block: &[u8]) -> Result<u64, crate::error::HeraclitusError> {
+    pub fn append_replicated_block(
+        &mut self,
+        block: &[u8],
+    ) -> Result<u64, crate::error::HeraclitusError> {
         if block.len() < HEADER_SIZE || &block[..4] != b"FACT" {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption("bloco inválido".into()));
+            return Err(crate::error::HeraclitusError::DatabaseCorruption(
+                "bloco inválido".into(),
+            ));
         }
-        let lsn_bytes = block[4..12].try_into()
-            .map_err(|_| crate::error::HeraclitusError::DatabaseCorruption("lsn inválido".into()))?;
+        let lsn_bytes = block[4..12].try_into().map_err(|_| {
+            crate::error::HeraclitusError::DatabaseCorruption("lsn inválido".into())
+        })?;
         let lsn = u64::from_be_bytes(lsn_bytes);
-        let payload_len_bytes = block[56..60].try_into()
-            .map_err(|_| crate::error::HeraclitusError::DatabaseCorruption("payload_len inválido".into()))?;
+        let payload_len_bytes = block[56..60].try_into().map_err(|_| {
+            crate::error::HeraclitusError::DatabaseCorruption("payload_len inválido".into())
+        })?;
         let payload_len = u32::from_be_bytes(payload_len_bytes) as usize;
         if HEADER_SIZE + payload_len != block.len() {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption("tamanho de bloco inconsistente".into()));
+            return Err(crate::error::HeraclitusError::DatabaseCorruption(
+                "tamanho de bloco inconsistente".into(),
+            ));
         }
 
         let payload = &block[HEADER_SIZE..];
 
         // --- Validação física: CRC-32C (CPM-200) ---
         let fact = match cpm::decode_record(payload) {
-            cpm::CpmDecoded::Record(rec, _) => {
-                cpm::record_to_fact(&rec)
-                    .map_err(|_| crate::error::HeraclitusError::DatabaseCorruption(
-                        format!("payload CRF v2 inválido no LSN {lsn}")
-                    ))?
-            }
+            cpm::CpmDecoded::Record(rec, _) => cpm::record_to_fact(&rec).map_err(|_| {
+                crate::error::HeraclitusError::DatabaseCorruption(format!(
+                    "payload CRF v2 inválido no LSN {lsn}"
+                ))
+            })?,
             cpm::CpmDecoded::Torn => {
-                return Err(crate::error::HeraclitusError::DatabaseCorruption(
-                    format!("CRC-32C físico falhou no LSN {lsn} — possível corrupção de disco")
-                ));
+                return Err(crate::error::HeraclitusError::DatabaseCorruption(format!(
+                    "CRC-32C físico falhou no LSN {lsn} — possível corrupção de disco"
+                )));
             }
         };
 
         // --- Validação de ordem do LSN ---
         if lsn != self.current_lsn + 1 {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption(
-                format!("LSN fora de ordem: esperado {}, recebido {lsn}", self.current_lsn + 1)
-            ));
+            return Err(crate::error::HeraclitusError::DatabaseCorruption(format!(
+                "LSN fora de ordem: esperado {}, recebido {lsn}",
+                self.current_lsn + 1
+            )));
         }
 
         // --- Validação criptográfica: folha + cadeia Merkle BLAKE3 ---
         let leaf = b3_hex(&core_bytes(&fact));
         let integ = fact.get("fact.integrity");
-        let emb_leaf = integ.and_then(|i| i.get("leaf_hash")).and_then(|v| v.as_str()).unwrap_or("");
+        let emb_leaf = integ
+            .and_then(|i| i.get("leaf_hash"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if emb_leaf != leaf {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption(
-                format!("folha BLAKE3 divergente no LSN {lsn}")
-            ));
+            return Err(crate::error::HeraclitusError::DatabaseCorruption(format!(
+                "folha BLAKE3 divergente no LSN {lsn}"
+            )));
         }
         let new_root = fold_chain(&self.trusted_root, &leaf);
-        let emb_root = integ.and_then(|i| i.get("merkle_root_anchor")).and_then(|v| v.as_str()).unwrap_or("");
+        let emb_root = integ
+            .and_then(|i| i.get("merkle_root_anchor"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if emb_root != new_root {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption(
-                format!("cadeia Merkle divergente no LSN {lsn}")
-            ));
+            return Err(crate::error::HeraclitusError::DatabaseCorruption(format!(
+                "cadeia Merkle divergente no LSN {lsn}"
+            )));
         }
 
-        let mut f = OpenOptions::new().append(true).open(&self.db_path)
-            .map_err(|e| crate::error::HeraclitusError::Io(e))?;
-        f.write_all(block).map_err(|e| crate::error::HeraclitusError::Io(e))?;
-        f.sync_all().map_err(|e| crate::error::HeraclitusError::Io(e))?; // follower durável antes do ack
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(&self.db_path)
+            .map_err(crate::error::HeraclitusError::Io)?;
+        f.write_all(block)
+            .map_err(crate::error::HeraclitusError::Io)?;
+        f.sync_all().map_err(crate::error::HeraclitusError::Io)?; // follower durável antes do ack
         self.current_lsn = lsn;
         self.trusted_root = new_root;
         self.persist_anchor().ok();
@@ -506,7 +558,9 @@ impl HeraclitusDB {
     /// 1. CRC-32C (físico): detecta bit-rot ou truncamento acidental.
     /// 2. BLAKE3 Merkle chain (criptográfico): detecta adulteração intencional.
     pub fn verify(&self) -> VerifyResult {
-        let trusted_root = fs::read_to_string(&self.anchor_path).ok().map(|s| s.trim().to_string());
+        let trusted_root = fs::read_to_string(&self.anchor_path)
+            .ok()
+            .map(|s| s.trim().to_string());
 
         // Streaming (Marco A): um bloco em RAM de cada vez — verify() escala
         // com o tamanho do BLOCO, não do banco. Semântica de status idêntica.
@@ -524,7 +578,9 @@ impl HeraclitusDB {
                     }
                 },
                 cpm::CpmDecoded::Torn => {
-                    violation = Some(format!("CRC-32C físico falhou no LSN {lsn} — bit-rot detectado"));
+                    violation = Some(format!(
+                        "CRC-32C físico falhou no LSN {lsn} — bit-rot detectado"
+                    ));
                     return false;
                 }
             };
@@ -532,14 +588,20 @@ impl HeraclitusDB {
             // --- Camada 2: criptográfica BLAKE3 Merkle ---
             let leaf = b3_hex(&core_bytes(&fact));
             let integ = fact.get("fact.integrity");
-            if let Some(stored) = integ.and_then(|i| i.get("leaf_hash")).and_then(|v| v.as_str()) {
+            if let Some(stored) = integ
+                .and_then(|i| i.get("leaf_hash"))
+                .and_then(|v| v.as_str())
+            {
                 if stored != leaf {
                     violation = Some(format!("Folha BLAKE3 adulterada no LSN {lsn}"));
                     return false;
                 }
             }
             chain = fold_chain(&chain, &leaf);
-            if let Some(stored) = integ.and_then(|i| i.get("merkle_root_anchor")).and_then(|v| v.as_str()) {
+            if let Some(stored) = integ
+                .and_then(|i| i.get("merkle_root_anchor"))
+                .and_then(|v| v.as_str())
+            {
                 if stored != chain {
                     violation = Some(format!("Cadeia Merkle quebrada no LSN {lsn}"));
                     return false;
@@ -550,24 +612,53 @@ impl HeraclitusDB {
         });
 
         if let Some(msg) = violation {
-            return VerifyResult { status: "VIOLATED".into(), facts: count, root: String::new(), message: msg };
+            return VerifyResult {
+                status: "VIOLATED".into(),
+                facts: count,
+                root: String::new(),
+                message: msg,
+            };
         }
         match outcome {
-            Err(e) => VerifyResult { status: "ERROR".into(), facts: count, root: String::new(),
-                                     message: format!("Erro de leitura: {e}") },
-            Ok(ScanOutcome::NoFile) => VerifyResult { status: "ERROR".into(), facts: 0, root: String::new(),
-                                                      message: "Arquivo de banco não encontrado.".into() },
-            Ok(ScanOutcome::BadMaster) => VerifyResult { status: "CORRUPTED".into(), facts: 0, root: String::new(),
-                                                         message: "Cabeçalho mestre inválido.".into() },
-            Ok(ScanOutcome::BadBlockMagic) => VerifyResult { status: "VIOLATED".into(), facts: count,
-                root: String::new(), message: "Assinatura de bloco corrompida.".into() },
-            Ok(ScanOutcome::Truncated { lsn }) => VerifyResult { status: "VIOLATED".into(), facts: count,
-                root: String::new(), message: format!("Payload truncado no LSN {lsn}") },
+            Err(e) => VerifyResult {
+                status: "ERROR".into(),
+                facts: count,
+                root: String::new(),
+                message: format!("Erro de leitura: {e}"),
+            },
+            Ok(ScanOutcome::NoFile) => VerifyResult {
+                status: "ERROR".into(),
+                facts: 0,
+                root: String::new(),
+                message: "Arquivo de banco não encontrado.".into(),
+            },
+            Ok(ScanOutcome::BadMaster) => VerifyResult {
+                status: "CORRUPTED".into(),
+                facts: 0,
+                root: String::new(),
+                message: "Cabeçalho mestre inválido.".into(),
+            },
+            Ok(ScanOutcome::BadBlockMagic) => VerifyResult {
+                status: "VIOLATED".into(),
+                facts: count,
+                root: String::new(),
+                message: "Assinatura de bloco corrompida.".into(),
+            },
+            Ok(ScanOutcome::Truncated { lsn }) => VerifyResult {
+                status: "VIOLATED".into(),
+                facts: count,
+                root: String::new(),
+                message: format!("Payload truncado no LSN {lsn}"),
+            },
             Ok(ScanOutcome::Done) => {
                 if let Some(anchor) = &trusted_root {
                     if &chain != anchor {
-                        return VerifyResult { status: "VIOLATED".into(), facts: count, root: chain,
-                                              message: "Raiz divergente da âncora.".into() };
+                        return VerifyResult {
+                            status: "VIOLATED".into(),
+                            facts: count,
+                            root: chain,
+                            message: "Raiz divergente da âncora.".into(),
+                        };
                     }
                 }
                 // --- Camada 3: assinatura ed25519 da âncora (Marco B) ---
@@ -575,9 +666,19 @@ impl HeraclitusDB {
                 // sem a chave privada não há `.anchor.sig` válido. Se a chave
                 // pública existe, a assinatura é OBRIGATÓRIA.
                 if let Some(msg) = self.verify_anchor_signature(&chain) {
-                    return VerifyResult { status: "VIOLATED".into(), facts: count, root: chain, message: msg };
+                    return VerifyResult {
+                        status: "VIOLATED".into(),
+                        facts: count,
+                        root: chain,
+                        message: msg,
+                    };
                 }
-                VerifyResult { status: "INTEG_OK".into(), facts: count, root: chain, message: String::new() }
+                VerifyResult {
+                    status: "INTEG_OK".into(),
+                    facts: count,
+                    root: chain,
+                    message: String::new(),
+                }
             }
         }
     }
@@ -590,7 +691,9 @@ impl HeraclitusDB {
     fn verify_anchor_signature(&self, root: &str) -> Option<String> {
         let pub_hex = match fs::read_to_string(&self.pub_path) {
             Ok(s) => s,
-            Err(_) => return None, // sem chave pública ⇒ modo legado (Merkle-only)
+            Err(_) => {
+                return Some("chave pública ed25519 ausente — cadeia Merkle não autenticada".into())
+            }
         };
         let vk = from_hex(&pub_hex)
             .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
@@ -655,7 +758,8 @@ mod tests {
 
     fn tmp_path(tag: &str) -> String {
         let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("forge_{}_{}_{}.hdb", tag, std::process::id(), n));
+        let p =
+            std::env::temp_dir().join(format!("forge_{}_{}_{}.hdb", tag, std::process::id(), n));
         let s = p.to_str().unwrap().to_string();
         for ext in ["", ".anchor", ".anchor.sig", ".key", ".pub"] {
             let _ = fs::remove_file(format!("{s}{ext}"));
@@ -691,7 +795,10 @@ mod tests {
 
         let mut seen = Vec::new();
         let st = export_facts(&p, 0, |lsn, f| {
-            seen.push((lsn, f["fact.behavior"]["action"].as_str().unwrap().to_string()));
+            seen.push((
+                lsn,
+                f["fact.behavior"]["action"].as_str().unwrap().to_string(),
+            ));
             true
         })
         .unwrap();
@@ -701,7 +808,10 @@ mod tests {
         assert_eq!(st.undecodable, 0);
         assert_eq!(seen.len(), 5);
         // Ordem de LSN estritamente crescente — a ponte depende disto para retomar.
-        assert!(seen.windows(2).all(|w| w[0].0 < w[1].0), "LSN tem de crescer");
+        assert!(
+            seen.windows(2).all(|w| w[0].0 < w[1].0),
+            "LSN tem de crescer"
+        );
         assert_eq!(seen[0].1, "action0");
         assert_eq!(seen[4].1, "action4");
         assert_eq!(st.last_lsn, seen[4].0);
@@ -770,8 +880,14 @@ mod tests {
             3,
             "cada bloco é exportado OU contado como partido — nada desaparece"
         );
-        assert!(after.torn + after.undecodable >= 1, "o bloco adulterado tem de ser apanhado");
-        assert!(after.exported < 3, "um bloco adulterado não pode sair como Fato válido");
+        assert!(
+            after.torn + after.undecodable >= 1,
+            "o bloco adulterado tem de ser apanhado"
+        );
+        assert!(
+            after.exported < 3,
+            "um bloco adulterado não pode sair como Fato válido"
+        );
     }
 
     /// Um `.hdb` que não existe não é um panic nem um sucesso vazio ambíguo.
@@ -805,13 +921,21 @@ mod tests {
         // Sessão 2: REABRE e escreve mais 2.
         {
             let mut db = HeraclitusDB::new(p).unwrap();
-            assert_eq!(db.current_lsn, BASE_LSN + 3, "LSN não recuperado no reabrir");
+            assert_eq!(
+                db.current_lsn,
+                BASE_LSN + 3,
+                "LSN não recuperado no reabrir"
+            );
             for i in 3..5 {
                 let mut f = fact(&format!("a{i}"));
                 db.write_fact(&mut f).unwrap();
             }
             let r = db.verify();
-            assert_eq!(r.status, "INTEG_OK", "reabrir+append quebrou a cadeia: {}", r.message);
+            assert_eq!(
+                r.status, "INTEG_OK",
+                "reabrir+append quebrou a cadeia: {}",
+                r.message
+            );
             assert_eq!(r.facts, 5);
         }
         let _ = fs::remove_file(p);
@@ -832,13 +956,18 @@ mod tests {
         }
         // Sobrescreve a assinatura com uma de tamanho válido mas errada.
         fs::write(format!("{p}.anchor.sig"), "0".repeat(128)).unwrap();
-        let db = HeraclitusDB::new(&p).unwrap();
-        assert_eq!(db.verify().status, "VIOLATED", "sig corrompida devia falhar");
+        let r = verify_file(&p);
+        assert_eq!(r.status, "VIOLATED", "sig corrompida devia falhar");
+        assert!(
+            HeraclitusDB::new(&p).is_err(),
+            "writer tem de recusar origem violada"
+        );
     }
 
     /// Marco B — a propriedade central: um atacante com acesso de ESCRITA aos
     /// ficheiros de dados (mas SEM a chave privada) reescreve `.hdb` + `.anchor`
     /// + `.anchor.sig` de forma internamente consistente, assinando com a SUA
+    ///
     /// chave. A chave pública fixada da vítima (`.pub`) rejeita a assinatura
     /// estranha — o buraco "reescreve tudo consistente" fica fechado.
     #[test]
@@ -863,10 +992,21 @@ mod tests {
         // continua a fixar a chave original da vítima.
         fs::copy(&attacker, &victim).unwrap();
         fs::copy(format!("{attacker}.anchor"), format!("{victim}.anchor")).unwrap();
-        fs::copy(format!("{attacker}.anchor.sig"), format!("{victim}.anchor.sig")).unwrap();
+        fs::copy(
+            format!("{attacker}.anchor.sig"),
+            format!("{victim}.anchor.sig"),
+        )
+        .unwrap();
 
-        let db = HeraclitusDB::new(&victim).unwrap();
-        let r = db.verify();
-        assert_eq!(r.status, "VIOLATED", "assinatura de chave estranha devia ser rejeitada: {}", r.message);
+        let r = verify_file(&victim);
+        assert_eq!(
+            r.status, "VIOLATED",
+            "assinatura de chave estranha devia ser rejeitada: {}",
+            r.message
+        );
+        assert!(
+            HeraclitusDB::new(&victim).is_err(),
+            "writer tem de recusar chave estranha"
+        );
     }
 }

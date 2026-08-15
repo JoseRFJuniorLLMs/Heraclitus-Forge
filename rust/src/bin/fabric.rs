@@ -3,29 +3,44 @@
 //! Substitui o antigo `heraclitus_fabric.py`. Executa o "ciclo de Segunda-Feira" em
 //! velocidade nativa: Discover -> Deploy Runners (1 por ativo) -> Observe (ingestao)
 //! -> Schema Drift -> Quarentena -> handoff para o CKE (Knowledge Cloud / Python) via
-//! `quarantine.log`.
+//! uma quarentena cifrada.
 //!
 //! O Forge (compilacao de `.hcx`) permanece em Python/Design-Time: aqui os artefatos
 //! ja devem existir no Registry — rode `python forge_compiler.py` antes, ou puxe da nuvem.
 
-use std::collections::HashMap;
-use std::fs;
-use std::io::Write;
-
 use anyhow::{Context, Result};
-use tracing::{info, warn, error};
+use std::collections::HashMap;
+use tracing::{error, info, warn};
 
 use heraclitus::db::HeraclitusDB;
+use heraclitus::quarantine::QuarantineWriter;
 use heraclitus::runner::ReconstitutiveRunner;
 
 const REGISTRY: &str = "../registry";
-const DB_PATH: &str = "fabric.hdb";
-const QUARANTINE: &str = "quarantine.log";
 
 struct Asset {
     ip: &'static str,
     fingerprint: &'static str,
     vendor: &'static str,
+}
+
+fn resolve_latest_artifact(base: &std::path::Path) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(base)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let version = name.strip_prefix('v')?.strip_suffix(".hcx")?;
+            let parts: Vec<u32> = version
+                .split('.')
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .ok()?;
+            (parts.len() == 3).then(|| ((parts[0], parts[1], parts[2]), entry.path()))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, path)| path)
 }
 
 const PG_STREAM: &[&str] = &[
@@ -50,7 +65,8 @@ const DRIFT_STREAM: &[&str] = &[
 fn monitor(
     runners: &mut HashMap<&'static str, ReconstitutiveRunner>,
     db: &mut HeraclitusDB,
-    quarantine: &mut Vec<String>,
+    quarantine: &mut QuarantineWriter,
+    quarantined: &mut usize,
     ip: &str,
     lines: &[&str],
 ) -> Result<()> {
@@ -65,15 +81,20 @@ fn monitor(
                 let b = &f["fact.behavior"];
                 info!(
                     "{} | LSN {} | {:<24} | {:<18} | {}",
-                    ip, lsn,
+                    ip,
+                    lsn,
                     b["action"].as_str().unwrap_or(""),
                     b["class"].as_str().unwrap_or(""),
                     b["risk_level"].as_str().unwrap_or("")
                 );
             }
             None => {
-                quarantine.push((*raw).to_string());
-                warn!("{} | [SCHEMA DRIFT -> quarentena] {}", ip, &raw[..raw.len().min(56)]);
+                quarantine
+                    .append(ip, raw)
+                    .context("gravar observação na quarentena cifrada")?;
+                *quarantined += 1;
+                let preview: String = raw.chars().take(56).collect();
+                warn!("{} | [SCHEMA DRIFT -> quarentena] {}", ip, preview);
             }
         }
     }
@@ -83,28 +104,55 @@ fn monitor(
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let _ = fs::remove_file(DB_PATH);
-    let _ = fs::remove_file(format!("{DB_PATH}.anchor"));
-    let _ = fs::remove_file(QUARANTINE);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args != ["--demo"] {
+        anyhow::bail!(
+            "fabric contém apenas dados sintéticos e só pode ser executado com --demo; \
+             para ingestão operacional use o binário probe"
+        );
+    }
 
-    info!("=== Heraclitus Fabric (nativo) — ciclo de Segunda-Feira ===");
+    // A demonstração nunca toca em caminhos operacionais: banco, chave e
+    // quarentena vivem num diretório temporário removido no fim do processo.
+    let demo_dir = tempfile::tempdir().context("criar diretório temporário da demo")?;
+    let db_path = demo_dir.path().join("fabric.hdb");
+    let quarantine_path = demo_dir.path().join("fabric.quarantine.hq");
+    let mut quarantine_key = [0u8; 32];
+    getrandom::getrandom(&mut quarantine_key)
+        .map_err(|error| anyhow::anyhow!("gerar chave efêmera da demo: {error}"))?;
+
+    info!("=== Heraclitus Fabric (demo isolada) — ciclo de Segunda-Feira ===");
 
     let assets = [
-        Asset { ip: "10.0.4.15", fingerprint: "postgresql", vendor: "PostgreSQL Cluster" },
-        Asset { ip: "10.0.4.12", fingerprint: "linux_sshd", vendor: "Linux OS (OpenSSH)" },
+        Asset {
+            ip: "10.0.4.15",
+            fingerprint: "postgresql",
+            vendor: "PostgreSQL Cluster",
+        },
+        Asset {
+            ip: "10.0.4.12",
+            fingerprint: "linux_sshd",
+            vendor: "Linux OS (OpenSSH)",
+        },
     ];
 
     // 1. Discover & Deploy — 1 Runner por ativo (artefato vindo do Registry)
     info!("[1] Discover & Deploy");
     let mut runners: HashMap<&'static str, ReconstitutiveRunner> = HashMap::new();
     for a in &assets {
-        let art = format!("{REGISTRY}/{}.hcx", a.fingerprint);
-        if !std::path::Path::new(&art).exists() {
-            warn!("{} ({}): artefato ausente -> rode `python forge_compiler.py` (Design-Time)",
-                     a.ip, a.fingerprint);
+        let artifact_dir = std::path::Path::new(REGISTRY).join(a.fingerprint);
+        let Some(art) = resolve_latest_artifact(&artifact_dir) else {
+            warn!(
+                "{} ({}): artefato ausente -> rode `python forge_compiler.py` (Design-Time)",
+                a.ip, a.fingerprint
+            );
             continue;
-        }
-        match ReconstitutiveRunner::load(&art) {
+        };
+        let Some(art_text) = art.to_str() else {
+            error!("{}: caminho de artefato não é UTF-8", art.display());
+            continue;
+        };
+        match ReconstitutiveRunner::load(art_text) {
             Ok(r) => {
                 info!("[OK] {} -> {} ({})", a.ip, a.fingerprint, a.vendor);
                 runners.insert(a.ip, r);
@@ -117,35 +165,49 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let mut db = HeraclitusDB::new(DB_PATH).context("Falha ao abrir db")?;
-    let mut quarantine: Vec<String> = Vec::new();
+    let db_path_text = db_path.to_string_lossy();
+    let mut db = HeraclitusDB::new(&db_path_text).context("Falha ao abrir db temporário")?;
+    let mut quarantine = QuarantineWriter::open(&quarantine_path, quarantine_key)
+        .context("Falha ao abrir quarentena cifrada temporária")?;
+    let mut quarantined = 0usize;
 
     // 2. Observe — trafego operacional do PostgreSQL (brute force)
     info!("[2] Observe — trafego PostgreSQL (brute force)");
-    monitor(&mut runners, &mut db, &mut quarantine, "10.0.4.15", PG_STREAM)?;
+    monitor(
+        &mut runners,
+        &mut db,
+        &mut quarantine,
+        &mut quarantined,
+        "10.0.4.15",
+        PG_STREAM,
+    )?;
 
     // 3. Schema Drift — formatos desconhecidos vao para a quarentena
     info!("[3] Schema Drift — formatos desconhecidos");
-    monitor(&mut runners, &mut db, &mut quarantine, "10.0.4.12", DRIFT_STREAM)?;
+    monitor(
+        &mut runners,
+        &mut db,
+        &mut quarantine,
+        &mut quarantined,
+        "10.0.4.12",
+        DRIFT_STREAM,
+    )?;
 
     // 4. Learn — handoff para o CKE (Knowledge Cloud, Python)
     info!("[4] Learn — handoff p/ o CKE (Knowledge Cloud)");
-    if quarantine.is_empty() {
+    if quarantined == 0 {
         info!("quarentena vazia.");
     } else {
-        let mut f = fs::File::create(QUARANTINE).context("Falha ao criar quarantine.log")?;
-        for q in &quarantine {
-            writeln!(f, "{q}").ok();
-        }
-        info!("{} observacoes -> {}", quarantine.len(), QUARANTINE);
-        info!("rode: python cke.py {}   (clusteriza e gera sementes de conector)", QUARANTINE);
+        info!(
+            "{} observacoes cifradas em {} (temporário; demo não faz handoff)",
+            quarantined,
+            quarantine.path().display()
+        );
     }
 
     // 5. Integridade
     let r = db.verify();
     info!("[5] db.verify(): {} (Fatos: {})", r.status, r.facts);
-    let _ = fs::remove_file(DB_PATH);
-    let _ = fs::remove_file(format!("{DB_PATH}.anchor"));
 
     Ok(())
 }

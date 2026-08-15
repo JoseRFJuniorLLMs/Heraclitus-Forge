@@ -24,7 +24,9 @@ struct Manifest {
     #[serde(default = "default_schema")]
     schema_version: String,
 }
-fn default_schema() -> String { "v9".into() }
+fn default_schema() -> String {
+    "v9".into()
+}
 
 #[derive(Deserialize)]
 struct Architecture {
@@ -74,9 +76,15 @@ struct SetSpec {
     #[serde(default)]
     identity: BTreeMap<String, String>,
 }
-fn default_action() -> String { "log.info".into() }
-fn default_class() -> String { "observation".into() }
-fn default_risk() -> String { "Low".into() }
+fn default_action() -> String {
+    "log.info".into()
+}
+fn default_class() -> String {
+    "observation".into()
+}
+fn default_risk() -> String {
+    "Low".into()
+}
 
 #[derive(Deserialize)]
 struct BehaviorModel {
@@ -107,7 +115,9 @@ struct OntoBehavior {
     #[serde(default = "default_conf")]
     confidence_score: f64,
 }
-fn default_conf() -> f64 { 0.9 }
+fn default_conf() -> f64 {
+    0.9
+}
 
 // ---------------------------------------------------------------------------
 // Representacao compilada (caminho quente)
@@ -161,23 +171,30 @@ impl ReconstitutiveRunner {
     pub fn load(artifact_path: &str) -> Result<Self, crate::error::HeraclitusError> {
         let dir = Path::new(artifact_path);
         let read = |name: &str| -> Result<String, crate::error::HeraclitusError> {
-            std::fs::read_to_string(dir.join(name))
-                .map_err(|_| crate::error::HeraclitusError::ArtifactError(format!("Componente do artefato ausente: {name}")))
+            std::fs::read_to_string(dir.join(name)).map_err(|_| {
+                crate::error::HeraclitusError::ArtifactError(format!(
+                    "Componente do artefato ausente: {name}"
+                ))
+            })
         };
-        let parse_yaml = |s: &str, name: &str| -> Result<serde_yaml::Value, crate::error::HeraclitusError> {
-            serde_yaml::from_str(s).map_err(|e| crate::error::HeraclitusError::ArtifactError(format!("YAML invalido em {name}: {e}")))
-        };
+        let parse_yaml =
+            |s: &str, name: &str| -> Result<serde_yaml::Value, crate::error::HeraclitusError> {
+                serde_yaml::from_str(s).map_err(|e| {
+                    crate::error::HeraclitusError::ArtifactError(format!(
+                        "YAML invalido em {name}: {e}"
+                    ))
+                })
+            };
 
-        let manifest: Manifest =
-            serde_yaml::from_str(&read("manifest.yaml")?).map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?;
-        let architecture: Architecture =
-            serde_yaml::from_str(&read("architecture.yaml")?).map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?;
-        let reasoning: Reasoning =
-            serde_yaml::from_str(&read("reasoning.yaml")?).map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?;
-        let behavior: BehaviorModel =
-            serde_yaml::from_str(&read("behavior.model")?).map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?;
-        let ontology: Ontology =
-            serde_yaml::from_str(&read("ontology.yaml")?).unwrap_or_default();
+        let manifest: Manifest = serde_yaml::from_str(&read("manifest.yaml")?)
+            .map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?;
+        let architecture: Architecture = serde_yaml::from_str(&read("architecture.yaml")?)
+            .map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?;
+        let reasoning: Reasoning = serde_yaml::from_str(&read("reasoning.yaml")?)
+            .map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?;
+        let behavior: BehaviorModel = serde_yaml::from_str(&read("behavior.model")?)
+            .map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?;
+        let ontology: Ontology = serde_yaml::from_str(&read("ontology.yaml")?).unwrap_or_default();
         // valida que os yaml restantes ao menos parseiam
         let _ = parse_yaml(&read("manifest.yaml")?, "manifest.yaml")?;
 
@@ -192,8 +209,15 @@ impl ReconstitutiveRunner {
                 "regex" => {
                     parse_engine = ParseEngine::Regex;
                     if let serde_yaml::Value::Mapping(m) = &node.config {
-                        if let Some(p) = m.get(serde_yaml::Value::from("pattern")).and_then(|v| v.as_str()) {
-                            parse_regex = Some(Regex::new(p).map_err(|e| crate::error::HeraclitusError::ArtifactError(format!("regex parse: {e}")))?);
+                        if let Some(p) = m
+                            .get(serde_yaml::Value::from("pattern"))
+                            .and_then(|v| v.as_str())
+                        {
+                            parse_regex = Some(Regex::new(p).map_err(|e| {
+                                crate::error::HeraclitusError::ArtifactError(format!(
+                                    "regex parse: {e}"
+                                ))
+                            })?);
                         }
                     }
                 }
@@ -208,7 +232,9 @@ impl ReconstitutiveRunner {
             let mut conds = Vec::new();
             for c in r.when {
                 let matches = match c.matches {
-                    Some(p) => Some(Regex::new(&p).map_err(|e| crate::error::HeraclitusError::ArtifactError(format!("regex reason: {e}")))?),
+                    Some(p) => Some(Regex::new(&p).map_err(|e| {
+                        crate::error::HeraclitusError::ArtifactError(format!("regex reason: {e}"))
+                    })?),
                     None => None,
                 };
                 conds.push(CompiledCond {
@@ -220,7 +246,11 @@ impl ReconstitutiveRunner {
                     severity_in: c.severity_in,
                 });
             }
-            rules.push(CompiledRule { id: r.id, when: conds, set: r.set });
+            rules.push(CompiledRule {
+                id: r.id,
+                when: conds,
+                set: r.set,
+            });
         }
 
         // --- read signature ---
@@ -238,7 +268,8 @@ impl ReconstitutiveRunner {
             rules,
             signatures: behavior.signatures,
             state: HashMap::new(),
-            tpl_re: Regex::new(r"\$\{(\w+)\}").map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?,
+            tpl_re: Regex::new(r"\$\{(\w+)\}")
+                .map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?,
             parser_signature,
         })
     }
@@ -268,7 +299,11 @@ impl ReconstitutiveRunner {
                         tokens.insert(k.to_string(), v.to_string());
                     }
                 }
-                if tokens.is_empty() { None } else { Some(tokens) }
+                if tokens.is_empty() {
+                    None
+                } else {
+                    Some(tokens)
+                }
             }
         }
     }
@@ -281,7 +316,11 @@ impl ReconstitutiveRunner {
             })
             .trim()
             .to_string();
-        if out.is_empty() { None } else { Some(out) }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     fn reason(&self, tokens: &HashMap<String, String>) -> Semantic {
@@ -294,7 +333,9 @@ impl ReconstitutiveRunner {
                 };
                 return Semantic {
                     rule_id: rule.id.clone(),
-                    action: self.render(&rule.set.action, &ctx).unwrap_or_else(default_action),
+                    action: self
+                        .render(&rule.set.action, &ctx)
+                        .unwrap_or_else(default_action),
                     behavior_class: self
                         .render(&rule.set.behavior_class, &ctx)
                         .unwrap_or_else(default_class),
@@ -324,7 +365,10 @@ impl ReconstitutiveRunner {
             if sig.trigger_action != action {
                 continue;
             }
-            let w = self.state.entry((sig.id.clone(), actor.to_string())).or_default();
+            let w = self
+                .state
+                .entry((sig.id.clone(), actor.to_string()))
+                .or_default();
             w.push_back(ts);
             let cutoff = ts - (sig.window_secs as i64) * 1_000_000;
             while let Some(&front) = w.front() {
@@ -439,17 +483,26 @@ fn conditions_match(conds: &[CompiledCond], ctx: &mut HashMap<String, String>) -
 }
 
 /// Planner — ordenacao topologica da DAG (Algoritmo de Kahn, spec secao 3).
-fn compile_execution_plan(nodes: &BTreeMap<String, DagNode>) -> Result<Vec<String>, crate::error::HeraclitusError> {
+fn compile_execution_plan(
+    nodes: &BTreeMap<String, DagNode>,
+) -> Result<Vec<String>, crate::error::HeraclitusError> {
     let mut in_degree: BTreeMap<&str, usize> = nodes.keys().map(|k| (k.as_str(), 0)).collect();
-    let mut adj: BTreeMap<&str, Vec<&str>> = nodes.keys().map(|k| (k.as_str(), Vec::new())).collect();
+    let mut adj: BTreeMap<&str, Vec<&str>> =
+        nodes.keys().map(|k| (k.as_str(), Vec::new())).collect();
 
     for (u, spec) in nodes {
         for dep in &spec.depends_on {
             if !nodes.contains_key(dep) {
-                return Err(crate::error::HeraclitusError::ArtifactError(format!("Dependencia inexistente '{dep}' em '{u}'.")));
+                return Err(crate::error::HeraclitusError::ArtifactError(format!(
+                    "Dependencia inexistente '{dep}' em '{u}'."
+                )));
             }
-            if let Some(n) = adj.get_mut(dep.as_str()) { n.push(u.as_str()); }
-            if let Some(n) = in_degree.get_mut(u.as_str()) { *n += 1; }
+            if let Some(n) = adj.get_mut(dep.as_str()) {
+                n.push(u.as_str());
+            }
+            if let Some(n) = in_degree.get_mut(u.as_str()) {
+                *n += 1;
+            }
         }
     }
 
@@ -471,39 +524,11 @@ fn compile_execution_plan(nodes: &BTreeMap<String, DagNode>) -> Result<Vec<Strin
         }
     }
     if order.len() != nodes.len() {
-        return Err(crate::error::HeraclitusError::RunnerError("Ciclo detectado na DAG de ingestao.".into()));
+        return Err(crate::error::HeraclitusError::RunnerError(
+            "Ciclo detectado na DAG de ingestao.".into(),
+        ));
     }
     Ok(order)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Artefato REAL do registry (resolvido a partir do crate, independente do cwd).
-    const ARTIFACT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../registry/postgresql/v1.1.0.hcx");
-
-    fn runner() -> ReconstitutiveRunner {
-        ReconstitutiveRunner::load(ARTIFACT)
-            .expect("artefato postgresql v1.1.0 ausente — rode: python forge_compiler.py")
-    }
-
-    #[test]
-    fn matches_known_postgres_line_into_a_fact() {
-        let mut r = runner();
-        let line = "2026-06-26 01:20:05.123 UTC [14802] FATAL:  password authentication failed for user \"admin\"";
-        let of = r.process_observation(line).expect("linha conhecida deveria casar (não é drift)");
-        assert_eq!(of["fact.behavior"]["action"], "authentication.failure");
-        // O Fato carrega proveniência do artefato que o produziu.
-        assert!(of["fact.knowledge_version"].as_str().unwrap().contains("postgresql"));
-    }
-
-    #[test]
-    fn unknown_line_is_schema_drift() {
-        let mut r = runner();
-        let of = r.process_observation("=== ruído totalmente fora do schema 42 xyz ===");
-        assert!(of.is_none(), "linha desconhecida deveria cair em Schema Drift (None)");
-    }
 }
 
 /// Resolve a versão MAIS RECENTE de um conector no registry versionado
@@ -534,4 +559,45 @@ pub fn resolve_latest_artifact(base: &str) -> Option<String> {
         }
     }
     highest_path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Artefato REAL do registry (resolvido a partir do crate, independente do cwd).
+    const ARTIFACT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../registry/postgresql/v1.1.0.hcx"
+    );
+
+    fn runner() -> ReconstitutiveRunner {
+        ReconstitutiveRunner::load(ARTIFACT)
+            .expect("artefato postgresql v1.1.0 ausente — rode: python forge_compiler.py")
+    }
+
+    #[test]
+    fn matches_known_postgres_line_into_a_fact() {
+        let mut r = runner();
+        let line = "2026-06-26 01:20:05.123 UTC [14802] FATAL:  password authentication failed for user \"admin\"";
+        let of = r
+            .process_observation(line)
+            .expect("linha conhecida deveria casar (não é drift)");
+        assert_eq!(of["fact.behavior"]["action"], "authentication.failure");
+        // O Fato carrega proveniência do artefato que o produziu.
+        assert!(of["fact.knowledge_version"]
+            .as_str()
+            .unwrap()
+            .contains("postgresql"));
+    }
+
+    #[test]
+    fn unknown_line_is_schema_drift() {
+        let mut r = runner();
+        let of = r.process_observation("=== ruído totalmente fora do schema 42 xyz ===");
+        assert!(
+            of.is_none(),
+            "linha desconhecida deveria cair em Schema Drift (None)"
+        );
+    }
 }

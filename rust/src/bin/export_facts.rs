@@ -20,8 +20,16 @@
 //! A última linha vai para **stderr**, não stdout, para não contaminar o JSONL:
 //! um resumo `{"scanned":…,"exported":…,"torn":…,"last_lsn":…}`.
 
+use std::fs;
 use std::io::{BufWriter, Write};
 use std::process::ExitCode;
+
+/// Versao do envelope JSONL consumido por `bridge.py`. Alteracoes
+/// incompatíveis exigem um novo numero; o consumidor recusa versoes
+/// desconhecidas antes de escrever qualquer evento no destino.
+const BRIDGE_CONTRACT_VERSION: &str = "forge-heraclitusdb/1";
+const FACT_SCHEMA_VERSION: &str = "operational-fact/1.0";
+const DESTINATION_API_VERSION: &str = "heraclitus.v1";
 
 fn usage() -> ! {
     eprintln!(
@@ -51,11 +59,17 @@ fn main() -> ExitCode {
         match args[i].as_str() {
             "--from-lsn" => {
                 i += 1;
-                from_lsn = args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                from_lsn = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
             }
             "--limit" => {
                 i += 1;
-                limit = args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                limit = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage());
             }
             other => {
                 eprintln!("argumento desconhecido: {other}");
@@ -65,14 +79,80 @@ fn main() -> ExitCode {
         i += 1;
     }
 
+    // Faz primeiro uma fotografia privada da origem (dados + sidecars públicos).
+    // Se um writer estiver a anexar em paralelo, a cópia fica inconsistente e a
+    // verificação abaixo falha fechada; nunca exportamos uma mistura de épocas.
+    let snapshot_dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("erro ao criar snapshot temporário: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let snapshot_path = snapshot_dir.path().join("source.hdb");
+    let snapshot = snapshot_path.to_string_lossy().to_string();
+    for ext in ["", ".anchor", ".anchor.sig", ".pub"] {
+        let src = format!("{db_path}{ext}");
+        let dst = format!("{snapshot}{ext}");
+        if let Err(e) = fs::copy(&src, &dst) {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "status": "INTEGRITY_ERROR",
+                    "message": format!("sidecar obrigatório ausente/ilegível {src}: {e}")
+                })
+            );
+            return ExitCode::from(4);
+        }
+    }
+
+    let verified = heraclitus::db::verify_file(&snapshot);
+    if verified.status != "INTEG_OK" {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "status": verified.status,
+                "facts": verified.facts,
+                "message": verified.message
+            })
+        );
+        return ExitCode::from(4);
+    }
+    let public_key = fs::read_to_string(format!("{snapshot}.pub"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let anchor_signature = fs::read_to_string(format!("{snapshot}.anchor.sig"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let source_id = blake3::hash(public_key.as_bytes()).to_hex().to_string();
+    let attestation = serde_json::json!({
+        "status": "INTEG_OK",
+        "bridge_contract": BRIDGE_CONTRACT_VERSION,
+        "fact_schema": FACT_SCHEMA_VERSION,
+        "destination_api": DESTINATION_API_VERSION,
+        "verified_root": verified.root.clone(),
+        "verified_facts": verified.facts,
+        "source_id": source_id.clone(),
+        "public_key": public_key,
+        "anchor_signature": anchor_signature,
+        "algorithm": "ed25519+blake3+crc32c"
+    });
+
     // stdout com buffer: um `write!` por Fato sem uma syscall por Fato.
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
     let mut emitted: u64 = 0;
     let mut write_err: Option<std::io::Error> = None;
 
-    let stats = match heraclitus::db::export_facts(&db_path, from_lsn, |lsn, fact| {
-        let line = serde_json::json!({ "lsn": lsn, "fact": fact });
+    let stats = match heraclitus::db::export_facts(&snapshot, from_lsn, |lsn, fact| {
+        let line = serde_json::json!({
+            "contract_version": BRIDGE_CONTRACT_VERSION,
+            "lsn": lsn,
+            "fact": fact,
+            "attestation": attestation.clone()
+        });
         // `serde_json::to_writer` + '\n': JSONL estrito, sem indentação.
         if let Err(e) = serde_json::to_writer(&mut out, &line).map_err(std::io::Error::from) {
             write_err = Some(e);
@@ -112,6 +192,10 @@ fn main() -> ExitCode {
             "torn":        stats.torn,
             "undecodable": stats.undecodable,
             "last_lsn":    stats.last_lsn,
+            "integrity":   "INTEG_OK",
+            "contract_version": BRIDGE_CONTRACT_VERSION,
+            "source_id":   source_id,
+            "verified_root": attestation["verified_root"],
         })
     );
 

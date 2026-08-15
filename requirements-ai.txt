@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Opcional: forja de conector via IA. A chamada também exige
+# ANTHROPIC_API_KEY e FORGE_AI_MODEL definidos explicitamente.
+anthropic>=0.40
+pydantic>=2.0

@@ -11,27 +11,27 @@ Correção crítica em relação ao protótipo anterior:
   - Substituído por `client.messages.create(tools=[...], tool_choice=...)` com
     o schema JSON do ConnectorProfile como input_schema da tool.
 
-Requer: pip install anthropic pydantic
-        export ANTHROPIC_API_KEY=sk-ant-...
+Requer: pip install -r requirements-ai.txt
+        export ANTHROPIC_API_KEY=...
+        export FORGE_AI_MODEL=<modelo aprovado pela organização>
 """
 
 from __future__ import annotations
 
+import os
+
 import _console  # noqa: F401  (consola UTF-8 no Windows)
 
-import os
-from typing import List, Optional
-
-MODEL = "claude-opus-4-5"   # modelo LTS homologado (ajuste se necessário)
+MODEL_ENV = "FORGE_AI_MODEL"
 
 
 def available() -> bool:
     """True se é possível chamar o Claude (pacote instalado + API key)."""
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    if not os.getenv("ANTHROPIC_API_KEY") or not os.getenv(MODEL_ENV):
         return False
     try:
         import anthropic  # noqa: F401
-        import pydantic   # noqa: F401
+        import pydantic  # noqa: F401
     except ImportError:
         return False
     return True
@@ -42,16 +42,16 @@ def _schema():
     from pydantic import BaseModel, Field
 
     class Condition(BaseModel):
-        field: Optional[str] = Field(None, description="token a inspecionar, ex: message, severity")
-        matches: Optional[str] = Field(None, description="regex com grupos nomeados")
-        equals: Optional[str] = None
-        contains: Optional[str] = None
-        severity_in: Optional[List[str]] = None
+        field: str | None = Field(None, description="token a inspecionar, ex: message, severity")
+        matches: str | None = Field(None, description="regex com grupos nomeados")
+        equals: str | None = None
+        contains: str | None = None
+        severity_in: list[str] | None = None
 
     class Identity(BaseModel):
-        actor_name: Optional[str] = Field(None, description="template \\${grupo} do ator")
-        target_id: Optional[str] = None
-        source_ip: Optional[str] = None
+        actor_name: str | None = Field(None, description="template \\${grupo} do ator")
+        target_id: str | None = None
+        source_ip: str | None = None
 
     class SetSpec(BaseModel):
         action: str = Field(description="ação canônica, ex: authentication.failure")
@@ -61,7 +61,7 @@ def _schema():
 
     class Rule(BaseModel):
         id: str
-        when: List[Condition]
+        when: list[Condition]
         set: SetSpec
 
     class Escalate(BaseModel):
@@ -77,17 +77,15 @@ def _schema():
 
     class Parse(BaseModel):
         engine: str = Field(description="'regex' ou 'keyvalue'")
-        pattern: Optional[str] = Field(
-            None, description="regex com grupos nomeados (se engine=regex)"
-        )
+        pattern: str | None = Field(None, description="regex com grupos nomeados (se engine=regex)")
 
     class ConnectorProfile(BaseModel):
         vendor: str
         domain: str
         confidence: float = Field(description="0.0 a 1.0")
         parse: Parse
-        reasoning: List[Rule]
-        behavior: List[Signature]
+        reasoning: list[Rule]
+        behavior: list[Signature]
 
     return ConnectorProfile
 
@@ -104,7 +102,7 @@ _SYSTEM = (
 )
 
 
-def derive_profile(fingerprint: str, vendor: str, samples: List[str]) -> dict:
+def derive_profile(fingerprint: str, vendor: str, samples: list[str]) -> dict:
     """
     Chama o Claude via tool calling e devolve um profile completo no mesmo
     shape de CONNECTOR_PROFILES (forge_compiler.py), pronto para compilação.
@@ -119,13 +117,15 @@ def derive_profile(fingerprint: str, vendor: str, samples: List[str]) -> dict:
     """
     if not available():
         raise RuntimeError(
-            "forge_ai indisponível: defina ANTHROPIC_API_KEY e instale 'anthropic pydantic'"
+            "forge_ai indisponível: defina ANTHROPIC_API_KEY e FORGE_AI_MODEL; "
+            "instale requirements-ai.txt"
         )
 
     import anthropic
 
     ConnectorProfile = _schema()
     client = anthropic.Anthropic()
+    model = os.environ[MODEL_ENV]
 
     amostras = "\n".join(f"  - {s}" for s in samples)
     prompt = (
@@ -148,7 +148,7 @@ def derive_profile(fingerprint: str, vendor: str, samples: List[str]) -> dict:
     ]
 
     response = client.messages.create(
-        model=MODEL,
+        model=model,
         max_tokens=8192,
         system=_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
@@ -178,9 +178,7 @@ def derive_profile(fingerprint: str, vendor: str, samples: List[str]) -> dict:
 
     # Completa os campos que forge_compiler espera mas não fazem parte do schema AI
     default_action = (
-        profile["reasoning"][0]["set"]["action"]
-        if profile.get("reasoning")
-        else "log.info"
+        profile["reasoning"][0]["set"]["action"] if profile.get("reasoning") else "log.info"
     )
     profile.setdefault(
         "test_matrix",
@@ -208,6 +206,7 @@ if __name__ == "__main__":
                 ],
             )
             import json
+
             print(json.dumps(prof, ensure_ascii=False, indent=2))
         except RuntimeError as e:
             print(f"[ERRO] {e}")

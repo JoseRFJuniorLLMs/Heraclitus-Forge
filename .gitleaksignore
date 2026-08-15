@@ -1,0 +1,10 @@
+# The registry files contain Ed25519 PUBLIC verification keys by design. Each
+# artifact is schema-checked and cryptographically verified by `verify-all`.
+bb84e84ab238d4539956b52243ce402575522ac6:registry/linux_sshd/v1.0.0.hcx/signature.sig:generic-api-key:3
+bb84e84ab238d4539956b52243ce402575522ac6:registry/linux_sshd/v1.1.0.hcx/signature.sig:generic-api-key:3
+bb84e84ab238d4539956b52243ce402575522ac6:registry/postgresql/v1.0.0.hcx/signature.sig:generic-api-key:3
+bb84e84ab238d4539956b52243ce402575522ac6:registry/postgresql/v1.1.0.hcx/signature.sig:generic-api-key:3
+bb84e84ab238d4539956b52243ce402575522ac6:registry/postgresql/v1.2.0.hcx/signature.sig:generic-api-key:3
+
+# Historical type annotation in `forge_sign.py`; not a credential.
+bb84e84ab238d4539956b52243ce402575522ac6:forge_sign.py:generic-api-key:154

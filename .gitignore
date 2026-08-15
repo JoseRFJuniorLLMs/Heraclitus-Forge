@@ -5,6 +5,8 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+.ruff_cache/
+.venv*/
 
 # Estado de retoma da ponte (bridge.py) — local à máquina, nunca partilhado:
 # guarda o último LSN exportado deste .hdb para este HeraclitusDB.
@@ -21,6 +23,9 @@ venv/
 *.hdb.anchor
 storage.hdb*
 quarantine.log
+.bridge_quarantine.jsonl
+.bridge_quarantine.hq
+*.hq
 
 # Material de chave (Marco B) — a CHAVE PRIVADA NUNCA pode ser commitada.
 # .pub/.anchor.sig do .hdb sao regeneraveis com o proprio .hdb; ficam de fora.

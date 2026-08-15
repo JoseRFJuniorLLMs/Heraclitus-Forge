@@ -12,22 +12,20 @@ esteira multiagente (Claude). Aqui ele esta versionado em codigo para tornar o
 pipeline reprodutivel e testavel. Cada profile descreve UM conector.
 """
 
-import _console  # noqa: F401  (consola UTF-8 no Windows)
-import os
 import json
-import hashlib
+import os
 import pathlib
 import subprocess
 
 import yaml
 
+import _console  # noqa: F401  (consola UTF-8 no Windows)
 
 # ---------------------------------------------------------------------------
 # BASE DE CONHECIMENTO DOS CONECTORES (saida do "Format Detector + Semantic Mapper")
 # ---------------------------------------------------------------------------
 
 CONNECTOR_PROFILES = {
-
     # === CASO DE USO 1: PostgreSQL (headline) ============================
     "postgresql": {
         "vendor": "PostgreSQL Global Development Group",
@@ -46,8 +44,12 @@ CONNECTOR_PROFILES = {
         "reasoning": [
             {
                 "id": "pg_auth_failure",
-                "when": [{"field": "message",
-                          "matches": r'password authentication failed for user "(?P<target_user>[^"]+)"'}],
+                "when": [
+                    {
+                        "field": "message",
+                        "matches": r'password authentication failed for user "(?P<target_user>[^"]+)"',
+                    }
+                ],
                 "set": {
                     "action": "authentication.failure",
                     "behavior_class": "credential_attack",
@@ -57,8 +59,12 @@ CONNECTOR_PROFILES = {
             },
             {
                 "id": "pg_connection_authorized",
-                "when": [{"field": "message",
-                          "matches": r"connection authorized: user=(?P<target_user>\w+)(?: database=(?P<target_db>\w+))?"}],
+                "when": [
+                    {
+                        "field": "message",
+                        "matches": r"connection authorized: user=(?P<target_user>\w+)(?: database=(?P<target_db>\w+))?",
+                    }
+                ],
                 "set": {
                     "action": "authentication.success",
                     "behavior_class": "session",
@@ -117,20 +123,29 @@ CONNECTOR_PROFILES = {
             },
         ],
         "test_matrix": [
-            {"input": '2026-06-26 01:20:05.123 UTC [14802] FATAL:  password authentication failed for user "admin"',
-             "expect_action": "authentication.failure"},
-            {"input": '2026-06-26 01:20:11.500 UTC [14808] admin@prod LOG:  connection authorized: user=admin database=prod',
-             "expect_action": "authentication.success"},
-            {"input": '2026-06-26 01:20:12.000 UTC [14808] admin@prod LOG:  statement: SELECT * FROM salaries;',
-             "expect_action": "query.execute"},
-            {"input": '2026-06-26 01:20:13.000 UTC [14809] guest@prod ERROR:  permission denied for table salaries',
-             "expect_action": "authorization.failure"},
-            {"input": '2026-06-26 01:20:00.001 UTC [14801] LOG:  database system is ready to accept connections',
-             "expect_action": "log.info"},
+            {
+                "input": '2026-06-26 01:20:05.123 UTC [14802] FATAL:  password authentication failed for user "admin"',
+                "expect_action": "authentication.failure",
+            },
+            {
+                "input": "2026-06-26 01:20:11.500 UTC [14808] admin@prod LOG:  connection authorized: user=admin database=prod",
+                "expect_action": "authentication.success",
+            },
+            {
+                "input": "2026-06-26 01:20:12.000 UTC [14808] admin@prod LOG:  statement: SELECT * FROM salaries;",
+                "expect_action": "query.execute",
+            },
+            {
+                "input": "2026-06-26 01:20:13.000 UTC [14809] guest@prod ERROR:  permission denied for table salaries",
+                "expect_action": "authorization.failure",
+            },
+            {
+                "input": "2026-06-26 01:20:00.001 UTC [14801] LOG:  database system is ready to accept connections",
+                "expect_action": "log.info",
+            },
         ],
         "benchmark": {"estimated_eps": 145000, "avg_latency_ms": 0.8},
     },
-
     # === Conector legado mantido (SSH / syslog) ==========================
     "linux_sshd": {
         "vendor": "Linux OS (OpenSSH)",
@@ -151,44 +166,66 @@ CONNECTOR_PROFILES = {
         "reasoning": [
             {
                 "id": "ssh_auth_failure",
-                "when": [{"field": "message",
-                          "matches": r"Failed password for (?:invalid user )?(?P<target_user>\S+) from (?P<src_ip>\S+)"}],
+                "when": [
+                    {
+                        "field": "message",
+                        "matches": r"Failed password for (?:invalid user )?(?P<target_user>\S+) from (?P<src_ip>\S+)",
+                    }
+                ],
                 "set": {
                     "action": "authentication.failure",
                     "behavior_class": "credential_attack",
                     "risk": "High",
-                    "identity": {"actor_name": "${target_user}", "target_id": "${host}",
-                                 "source_ip": "${src_ip}"},
+                    "identity": {
+                        "actor_name": "${target_user}",
+                        "target_id": "${host}",
+                        "source_ip": "${src_ip}",
+                    },
                 },
             },
             {
                 "id": "ssh_invalid_user",
-                "when": [{"field": "message",
-                          "matches": r"Invalid user (?P<target_user>\S+) from (?P<src_ip>\S+)"}],
+                "when": [
+                    {
+                        "field": "message",
+                        "matches": r"Invalid user (?P<target_user>\S+) from (?P<src_ip>\S+)",
+                    }
+                ],
                 "set": {
                     "action": "authentication.invalid_user",
                     "behavior_class": "reconnaissance",
                     "risk": "Medium",
-                    "identity": {"actor_name": "${target_user}", "target_id": "${host}",
-                                 "source_ip": "${src_ip}"},
+                    "identity": {
+                        "actor_name": "${target_user}",
+                        "target_id": "${host}",
+                        "source_ip": "${src_ip}",
+                    },
                 },
             },
             {
                 "id": "ssh_auth_success",
-                "when": [{"field": "message",
-                          "matches": r"Accepted (?:password|publickey) for (?P<target_user>\S+) from (?P<src_ip>\S+)"}],
+                "when": [
+                    {
+                        "field": "message",
+                        "matches": r"Accepted (?:password|publickey) for (?P<target_user>\S+) from (?P<src_ip>\S+)",
+                    }
+                ],
                 "set": {
                     "action": "authentication.success",
                     "behavior_class": "session",
                     "risk": "Low",
-                    "identity": {"actor_name": "${target_user}", "target_id": "${host}",
-                                 "source_ip": "${src_ip}"},
+                    "identity": {
+                        "actor_name": "${target_user}",
+                        "target_id": "${host}",
+                        "source_ip": "${src_ip}",
+                    },
                 },
             },
             {
                 "id": "ssh_session_opened",
-                "when": [{"field": "message",
-                          "matches": r"session opened for user (?P<target_user>\S+)"}],
+                "when": [
+                    {"field": "message", "matches": r"session opened for user (?P<target_user>\S+)"}
+                ],
                 "set": {
                     "action": "session.open",
                     "behavior_class": "session",
@@ -207,16 +244,21 @@ CONNECTOR_PROFILES = {
             },
         ],
         "test_matrix": [
-            {"input": "Aug  6 10:00:01 srv01 sshd[2000]: Failed password for deploy from 203.0.113.45 port 40000 ssh2",
-             "expect_action": "authentication.failure"},
-            {"input": "Aug  6 10:00:10 srv01 sshd[2100]: Accepted password for admin from 10.0.0.5 port 41000 ssh2",
-             "expect_action": "authentication.success"},
-            {"input": "Aug  6 10:00:22 srv01 sshd[2200]: Invalid user oracle from 198.51.100.7 port 42000",
-             "expect_action": "authentication.invalid_user"},
+            {
+                "input": "Aug  6 10:00:01 srv01 sshd[2000]: Failed password for deploy from 203.0.113.45 port 40000 ssh2",
+                "expect_action": "authentication.failure",
+            },
+            {
+                "input": "Aug  6 10:00:10 srv01 sshd[2100]: Accepted password for admin from 10.0.0.5 port 41000 ssh2",
+                "expect_action": "authentication.success",
+            },
+            {
+                "input": "Aug  6 10:00:22 srv01 sshd[2200]: Invalid user oracle from 198.51.100.7 port 42000",
+                "expect_action": "authentication.invalid_user",
+            },
         ],
         "benchmark": {"estimated_eps": 82000, "avg_latency_ms": 1.2},
     },
-
     # === Fallback generico para formatos proprietarios key=value =========
     "keyvalue_generic": {
         "vendor": "Proprietario (Key-Value)",
@@ -226,8 +268,10 @@ CONNECTOR_PROFILES = {
         "reasoning": [
             {
                 "id": "kv_destructive_failure",
-                "when": [{"field": "STATUS", "equals": "failed"},
-                         {"field": "ACTION", "matches": r"(delete|drop|truncate)"}],
+                "when": [
+                    {"field": "STATUS", "equals": "failed"},
+                    {"field": "ACTION", "matches": r"(delete|drop|truncate)"},
+                ],
                 "set": {
                     "action": "data.deletion.failure",
                     "behavior_class": "data_tampering",
@@ -256,8 +300,10 @@ CONNECTOR_PROFILES = {
             },
         ],
         "test_matrix": [
-            {"input": "USER=carlos_mgi ACTION=delete_record TARGET=table_benefits STATUS=failed",
-             "expect_action": "data.deletion.failure"},
+            {
+                "input": "USER=carlos_mgi ACTION=delete_record TARGET=table_benefits STATUS=failed",
+                "expect_action": "data.deletion.failure",
+            },
         ],
         "benchmark": {"estimated_eps": 60000, "avg_latency_ms": 1.5},
     },
@@ -265,16 +311,13 @@ CONNECTOR_PROFILES = {
 
 
 class HeraclitusForgeCompiler:
-    SIGNED_FILES = [
-        "manifest.yaml", "architecture.yaml", "ontology.yaml",
-        "reasoning.yaml", "behavior.model", "test_matrix.json", "benchmarks.json",
-    ]
-
     def __init__(self, output_dir: str = "./registry"):
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-    def _resolve_profile(self, fingerprint: str, vendor: str = None, sample_log: str = None) -> dict:
+    def _resolve_profile(
+        self, fingerprint: str, vendor: str | None = None, sample_log: str | None = None
+    ) -> dict:
         # Formatos conhecidos: profile determinístico (rápido, reprodutível).
         if fingerprint in CONNECTOR_PROFILES:
             return CONNECTOR_PROFILES[fingerprint]
@@ -282,19 +325,24 @@ class HeraclitusForgeCompiler:
         if vendor is not None and sample_log is not None:
             try:
                 import forge_ai
+
                 if forge_ai.available():
-                    print("[Forge AI] formato desconhecido -> derivando conector via Claude "
-                          "(claude-opus-4-8)...")
+                    print(
+                        "[Forge AI] formato desconhecido -> derivando conector via modelo "
+                        f"configurado em FORGE_AI_MODEL={os.environ['FORGE_AI_MODEL']}..."
+                    )
                     return forge_ai.derive_profile(fingerprint, vendor, [sample_log])
                 print("[Forge AI] sem ANTHROPIC_API_KEY/anthropic -> fallback key-value generico")
-            except Exception as e:
+            # Fronteira opcional com SDK/API externa: qualquer falha deve cair
+            # no perfil determinístico, nunca abortar a compilação local.
+            except Exception as e:  # noqa: BLE001
                 print(f"[Forge AI] indisponivel ({e}) -> fallback key-value generico")
         return CONNECTOR_PROFILES["keyvalue_generic"]
 
     def _get_next_version(self, vendor_dir: str) -> str:
         if not os.path.exists(vendor_dir):
             return "1.0.0"
-        
+
         highest = [1, 0, 0]
         for d in os.listdir(vendor_dir):
             if d.startswith("v") and d.endswith(".hcx"):
@@ -305,7 +353,7 @@ class HeraclitusForgeCompiler:
                         highest = parts
                 except ValueError:
                     pass
-        
+
         # Increment minor version
         return f"{highest[0]}.{highest[1] + 1}.0"
 
@@ -315,8 +363,10 @@ class HeraclitusForgeCompiler:
         print(f"[*] Amostra: {sample_log[:80]}")
 
         profile = self._resolve_profile(artifact_id, vendor=vendor, sample_log=sample_log)
-        print(f"[+] Agentes Ativos: Format Detector & Semantic Mapper "
-              f"(profile='{artifact_id}', engine='{profile['parse']['engine']}')")
+        print(
+            f"[+] Agentes Ativos: Format Detector & Semantic Mapper "
+            f"(profile='{artifact_id}', engine='{profile['parse']['engine']}')"
+        )
 
         vendor_dir = os.path.join(self.output_dir, artifact_id)
         next_version = self._get_next_version(vendor_dir)
@@ -339,18 +389,22 @@ class HeraclitusForgeCompiler:
         architecture = {
             "version": "6.0",
             "dag": {
-                "parse": {"engine": profile["parse"]["engine"],
-                          "depends_on": [],
-                          "config": {k: v for k, v in profile["parse"].items() if k != "engine"}},
-                "normalize": {"engine": "reasoner",
-                              "depends_on": ["parse"],
-                              "config": {"ruleset": "reasoning.yaml"}},
-                "behavior": {"engine": "sliding_window",
-                             "depends_on": ["normalize"],
-                             "config": {"model": "behavior.model"}},
-                "emit": {"engine": "fact_emitter",
-                         "depends_on": ["behavior"],
-                         "config": {}},
+                "parse": {
+                    "engine": profile["parse"]["engine"],
+                    "depends_on": [],
+                    "config": {k: v for k, v in profile["parse"].items() if k != "engine"},
+                },
+                "normalize": {
+                    "engine": "reasoner",
+                    "depends_on": ["parse"],
+                    "config": {"ruleset": "reasoning.yaml"},
+                },
+                "behavior": {
+                    "engine": "sliding_window",
+                    "depends_on": ["normalize"],
+                    "config": {"model": "behavior.model"},
+                },
+                "emit": {"engine": "fact_emitter", "depends_on": ["behavior"], "config": {}},
             },
         }
         self._dump_yaml(package_path, "architecture.yaml", architecture)
@@ -386,8 +440,10 @@ class HeraclitusForgeCompiler:
         if coverage.get("skipped"):
             print("[i] Coverage: pulado (binario Rust 'coverage' nao compilado em rust/)")
         else:
-            print(f"[+] Coverage (runner Rust): "
-                  f"{coverage['covered']}/{coverage['total']} = {coverage['rate']:.1f}%")
+            print(
+                f"[+] Coverage (runner Rust): "
+                f"{coverage['covered']}/{coverage['total']} = {coverage['rate']:.1f}%"
+            )
 
         # --- 8. signature.sig (Ed25519 REAL — Marco B, ver forge_sign.py) ----
         # Era um SHA-256 truncado com um prefixo "ed25519:" a mentir: nao havia
@@ -397,6 +453,7 @@ class HeraclitusForgeCompiler:
         print("[+] Finalizando com blindagem criptografica...")
         try:
             import forge_sign
+
             sig = forge_sign.sign_artifact(pathlib.Path(package_path))
             print(f"[+] Assinatura ed25519: {sig[:16]}...")
         except SystemExit as e:
@@ -425,21 +482,23 @@ class HeraclitusForgeCompiler:
         if not exe:
             return {"covered": None, "total": len(cases), "rate": None, "skipped": True}
         try:
-            out = subprocess.run([exe, package_path], capture_output=True, text=True,
-                                 timeout=120, check=True)
+            # Executável local conhecido; lista de argumentos e shell=False.
+            out = subprocess.run(  # noqa: S603
+                [exe, package_path], capture_output=True, text=True, timeout=120, check=True
+            )
             covered, total = (int(x) for x in out.stdout.split()[:2])
             rate = 100.0 * covered / (total or 1)
             return {"covered": covered, "total": total, "rate": rate, "skipped": False}
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
             print(f"[i] Coverage via runner Rust falhou ({e}); pulando")
             return {"covered": None, "total": len(cases), "rate": None, "skipped": True}
 
     @staticmethod
     def _coverage_bin():
         here = os.path.dirname(os.path.abspath(__file__))
-        target = os.environ.get("CARGO_TARGET_DIR") or os.path.join(here, "rust", "target")
         name = "coverage.exe" if os.name == "nt" else "coverage"
-        exe = os.path.join(target, "release", name)
+        override = os.environ.get("FORGE_COVERAGE_BIN")
+        exe = override or os.path.join(here, "rust", "target", "release", name)
         return exe if os.path.exists(exe) else None
 
     # -- helpers de escrita -------------------------------------------------
@@ -460,27 +519,41 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(
         description="Forge — compila conhecimento num artefato .hcx versionado.",
-        epilog=("Formatos com perfil deterministico: " + ", ".join(CONNECTOR_PROFILES) + ". "
-                "Um artifact_id fora dessa lista usa o Forge AI (precisa de ANTHROPIC_API_KEY) "
-                "e, sem chave, cai no perfil keyvalue_generic."),
+        epilog=(
+            "Formatos com perfil deterministico: " + ", ".join(CONNECTOR_PROFILES) + ". "
+            "Um artifact_id fora dessa lista usa o Forge AI (precisa de ANTHROPIC_API_KEY) "
+            "e, sem chave, cai no perfil keyvalue_generic."
+        ),
     )
-    ap.add_argument("artifact_id", nargs="?", default="postgresql",
-                    help="identificador do conector (ex.: postgresql, linux_sshd, nginx)")
+    ap.add_argument(
+        "artifact_id",
+        nargs="?",
+        default="postgresql",
+        help="identificador do conector (ex.: postgresql, linux_sshd, nginx)",
+    )
     ap.add_argument("--vendor", default="PostgreSQL Global Development Group")
-    ap.add_argument("--sample", default=None,
-                    help="UMA linha de exemplo do log; ou use --sample-file")
-    ap.add_argument("--sample-file", default=None,
-                    help="ficheiro de log: usa a primeira linha nao vazia como amostra")
+    ap.add_argument(
+        "--sample", default=None, help="UMA linha de exemplo do log; ou use --sample-file"
+    )
+    ap.add_argument(
+        "--sample-file",
+        default=None,
+        help="ficheiro de log: usa a primeira linha nao vazia como amostra",
+    )
     args = ap.parse_args()
 
     sample = args.sample
     if args.sample_file:
         with open(args.sample_file, encoding="utf-8") as fh:
-            sample = next((l.strip() for l in fh if l.strip()), None)
+            sample = next((line.strip() for line in fh if line.strip()), None)
     if not sample:
-        sample = ('2026-06-26 01:20:05.123 UTC [14802] FATAL:  '
-                  'password authentication failed for user "admin"')
+        sample = (
+            "2026-06-26 01:20:05.123 UTC [14802] FATAL:  "
+            'password authentication failed for user "admin"'
+        )
 
     HeraclitusForgeCompiler().compile_knowledge(
-        artifact_id=args.artifact_id, vendor=args.vendor, sample_log=sample,
+        artifact_id=args.artifact_id,
+        vendor=args.vendor,
+        sample_log=sample,
     )

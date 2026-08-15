@@ -1,6 +1,6 @@
 use std::array::TryFromSliceError;
-use std::time::SystemTimeError;
 use std::string::FromUtf8Error;
+use std::time::SystemTimeError;
 
 #[derive(thiserror::Error, Debug)]
 pub enum HeraclitusError {

@@ -15,11 +15,12 @@ conector `.hcx` completo) é o passo opcional de IA em `forge_ai.py`
 (requer `ANTHROPIC_API_KEY`).
 """
 
-import _console  # noqa: F401  (consola UTF-8 no Windows)
 import math
 import os
 import re
 from collections import defaultdict
+
+import _console  # noqa: F401  (consola UTF-8 no Windows)
 
 # Máscaras estruturais (ordem importa: específicas primeiro).
 _MASKS = [
@@ -125,14 +126,16 @@ def analyze(quarantine):
             valid = True
         except re.error:
             valid = False
-        report.append({
-            "template": tmpl,
-            "count": len(lines),
-            "coverage_pct": round(100.0 * len(lines) / max(len(quarantine), 1), 1),
-            "sample": lines[0][:90],
-            "suggested_regex": seed,
-            "regex_valid": valid,
-        })
+        report.append(
+            {
+                "template": tmpl,
+                "count": len(lines),
+                "coverage_pct": round(100.0 * len(lines) / max(len(quarantine), 1), 1),
+                "sample": lines[0][:90],
+                "suggested_regex": seed,
+                "regex_valid": valid,
+            }
+        )
     return {
         "total_quarantine": len(quarantine),
         "num_clusters": len(clusters),
@@ -162,11 +165,15 @@ if __name__ == "__main__":
         ]
         print("=== Heraclitus CKE — quarentena de demonstracao ===\n")
     result = analyze(quarantine)
-    print(f"Total: {result['total_quarantine']} | clusters: {result['num_clusters']} | "
-          f"entropia: {result['entropy_bits']} bits\n")
+    print(
+        f"Total: {result['total_quarantine']} | clusters: {result['num_clusters']} | "
+        f"entropia: {result['entropy_bits']} bits\n"
+    )
     for i, c in enumerate(result["clusters"], 1):
-        print(f"[Cluster {i}] {c['count']} logs ({c['coverage_pct']}%) | regex_valido={c['regex_valid']}")
+        print(
+            f"[Cluster {i}] {c['count']} logs ({c['coverage_pct']}%) | regex_valido={c['regex_valid']}"
+        )
         print(f"  template: {c['template']}")
         print(f"  amostra : {c['sample']}")
         print(f"  seed rgx: {c['suggested_regex']}")
-        print(f"  -> pacote de telemetria enviado ao Forge p/ compilar novo conector\n")
+        print("  -> pacote de telemetria enviado ao Forge p/ compilar novo conector\n")

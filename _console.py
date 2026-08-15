@@ -11,14 +11,12 @@ Uso, no topo do módulo:
 
     import _console  # noqa: F401  (efeito ao importar)
 """
+
 from __future__ import annotations
 
 import sys
+from contextlib import suppress
 
 for _stream in (sys.stdout, sys.stderr):
-    try:
+    with suppress(AttributeError, ValueError):
         _stream.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        # Stream redirecionado/substituído (pytest, pipe, subprocess) — nesses
-        # casos o encoding já é decidido por quem redirecionou.
-        pass
