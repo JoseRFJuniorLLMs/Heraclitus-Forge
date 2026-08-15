@@ -68,6 +68,28 @@ DEFAULT_QUARANTINE = HERE / ".bridge_quarantine.hq"
 SUBJECT_HMAC_ENV = "FORGE_SUBJECT_HMAC_KEY"
 QUARANTINE_KEY_ENV = "FORGE_QUARANTINE_KEY"
 QUARANTINE_AAD = b"heraclitus-forge-quarantine-v1"
+
+#: Versão do envelope de quarentena escrita hoje. A v1 (sem `kid`) continua a
+#: ser LIDA — envelopes antigos não ficam órfãos por causa desta mudança.
+QUARANTINE_ENVELOPE_VERSION = 2
+
+#: Tecto por linha ao decifrar (ver `rust/src/quarantine.rs`). Um registo é uma
+#: observação, não um ficheiro.
+QUARANTINE_MAX_LINE_BYTES = 8 * 1024 * 1024
+
+
+def quarantine_key_id(key: bytes) -> str:
+    """
+    Impressão digital da chave — 8 primeiros bytes do BLAKE3, em hex.
+
+    Sem isto, rodar a `FORGE_QUARANTINE_KEY` transforma todos os registos
+    antigos em lixo indistinguível de corrupção: a autenticação falha e não há
+    forma de saber que a causa foi a chave errada. Tem de bater bit a bit com
+    `quarantine::key_id` do lado Rust — há um teste de interoperabilidade.
+    """
+    import blake3
+
+    return blake3.blake3(key).digest()[:8].hex()
 SCHEMA_VERSION = "operational-fact/1.0"
 BRIDGE_CONTRACT_VERSION = "forge-heraclitusdb/1"
 DESTINATION_API_VERSION = "heraclitus.v1"
@@ -560,7 +582,8 @@ def _quarantine(
         plaintext, QUARANTINE_AAD, nonce, key or _quarantine_key()
     )
     envelope = {
-        "v": 1,
+        "v": QUARANTINE_ENVELOPE_VERSION,
+        "kid": quarantine_key_id(key or _quarantine_key()),
         "nonce": nonce.hex(),
         "ciphertext": ciphertext.hex(),
     }
@@ -579,14 +602,33 @@ def decrypt_quarantine(path: Path, *, key: bytes | None = None):
         raise BridgeStateError("PyNaCl é obrigatório para decifrar a quarentena") from exc
 
     cipher_key = key or _quarantine_key()
+    expected_kid = quarantine_key_id(cipher_key)
     with open(path, encoding="ascii") as fh:
         for number, line in enumerate(fh, 1):
             if not line.strip():
                 continue
+            if len(line) > QUARANTINE_MAX_LINE_BYTES:
+                raise BridgeStateError(
+                    f"quarentena: linha {number} excede "
+                    f"{QUARANTINE_MAX_LINE_BYTES} bytes"
+                )
             try:
                 envelope = json.loads(line)
-                if envelope.get("v") != 1:
+                version = envelope.get("v")
+                if not isinstance(version, int) or not (
+                    1 <= version <= QUARANTINE_ENVELOPE_VERSION
+                ):
                     raise ValueError("versão desconhecida")
+                # v2 traz a impressão digital da chave. Erro explícito de chave
+                # rodada em vez de um "adulterada" que manda investigar o ataque
+                # errado. Envelopes v1 (sem kid) continuam a ser aceites.
+                kid = envelope.get("kid")
+                if kid is not None and kid != expected_kid:
+                    raise BridgeStateError(
+                        f"quarentena: linha {number} foi cifrada com a chave {kid}, "
+                        f"mas {QUARANTINE_KEY_ENV} é {expected_kid} — a chave rodou; "
+                        f"use a anterior para ler este registo"
+                    )
                 nonce = bytes.fromhex(envelope["nonce"])
                 ciphertext = bytes.fromhex(envelope["ciphertext"])
                 if len(nonce) != 24:
