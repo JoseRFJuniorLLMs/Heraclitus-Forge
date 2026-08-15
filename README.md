@@ -80,8 +80,44 @@ cargo run --release --bin cluster_demo -- --demo
 cargo run --release --bin bench -- --demo 10000
 ```
 
-Para uma fonte real, configure caminhos explícitos, segredo HMAC do titular e
-chave da quarentena; faça primeiro o dry-run da ponte:
+## Ingestão real
+
+Os binários acima são **demonstrações** — o `connector_postgresql` apaga o
+`.hdb` ao arrancar e adultera o último LSN ao sair, de propósito, para mostrar
+que o `verify()` deteta. Para ler uma fonte a sério use o `ingest`:
+
+```powershell
+$env:FORGE_QUARANTINE_KEY = "<64 caracteres hex>"
+
+# segue o ficheiro ao vivo, como um tail -f
+cargo run --release --bin ingest -- C:\logs\postgresql.log `
+    --artifact ..\registry\postgresql --db producao.hdb --follow
+
+# ou processa o que houver e sai (bom para agendar)
+cargo run --release --bin ingest -- amostra.log `
+    --artifact ..\registry\linux_sshd --db producao.hdb --from-start --once
+```
+
+O `ingest` **abre** o `.hdb` existente (recupera LSN e cadeia Merkle), nunca
+apaga e nunca adultera. Retoma de onde ficou por um sidecar `<db>.ingest-state`,
+deteta rotação e truncagem do ficheiro, e só processa linhas completas — uma
+linha ainda a ser escrita espera pela passagem seguinte.
+
+Linhas que nenhuma regra do artefato casa (Schema Drift) vão para a **quarentena
+cifrada**, nunca para o ecrã: podem conter dados pessoais. Daí a
+`FORGE_QUARANTINE_KEY` ser obrigatória.
+
+Num ficheiro que ainda não conhece, começa no **fim**. Arrancar a ler um log de
+meses inundaria o banco com histórico que ninguém pediu; `--from-start` é
+explícito para quem quer o histórico.
+
+> **Entrega pelo menos uma vez.** O deslocamento é gravado depois de os Fatos
+> irem para o disco, por isso uma paragem abrupta pode reprocessar as últimas
+> linhas. É o compromisso certo aqui: num sistema de auditoria, repetir é
+> recuperável, perder não é.
+
+Para a ponte, configure caminhos explícitos, segredo HMAC do titular e
+chave da quarentena; faça primeiro o dry-run:
 
 ```powershell
 $env:HERACLITUS_ARTIFACT = 'D:\seguro\registry\postgresql'
