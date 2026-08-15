@@ -1,0 +1,5 @@
+domain: web_access
+core_binding:
+  ontology_version: core-ontology-v9
+behavior_model:
+  confidence_score: 0.97

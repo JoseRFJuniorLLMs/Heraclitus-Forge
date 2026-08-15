@@ -1,0 +1,26 @@
+version: '6.0'
+dag:
+  parse:
+    engine: regex
+    depends_on: []
+    config:
+      pattern: ^(?P<src_ip>\S+) \S+ (?P<auth_user>\S+) \[(?P<ts>[^\]]+)\] "(?P<method>[A-Z]+)
+        (?P<path>\S+)[^"]*" (?P<status>\d{3}) (?P<bytes>\S+) "(?P<referer>[^"]*)"
+        "(?P<agent>[^"]*)"$
+  normalize:
+    engine: reasoner
+    depends_on:
+    - parse
+    config:
+      ruleset: reasoning.yaml
+  behavior:
+    engine: sliding_window
+    depends_on:
+    - normalize
+    config:
+      model: behavior.model
+  emit:
+    engine: fact_emitter
+    depends_on:
+    - behavior
+    config: {}

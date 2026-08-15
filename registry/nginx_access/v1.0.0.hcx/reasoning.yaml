@@ -1,0 +1,61 @@
+rules:
+- id: http_auth_failure
+  when:
+  - field: status
+    equals: '401'
+  set:
+    action: authentication.failure
+    behavior_class: credential_attack
+    risk: High
+    identity:
+      actor_name: ${auth_user}
+      target_id: ${path}
+      source_ip: ${src_ip}
+- id: http_authz_violation
+  when:
+  - field: status
+    equals: '403'
+  set:
+    action: authorization.failure
+    behavior_class: privilege_violation
+    risk: Critical
+    identity:
+      actor_name: ${auth_user}
+      target_id: ${path}
+      source_ip: ${src_ip}
+- id: http_not_found
+  when:
+  - field: status
+    equals: '404'
+  set:
+    action: resource.missing
+    behavior_class: reconnaissance
+    risk: Medium
+    identity:
+      actor_name: ${auth_user}
+      target_id: ${path}
+      source_ip: ${src_ip}
+- id: http_server_error
+  when:
+  - field: status
+    matches: ^5\d\d$
+  set:
+    action: service.error
+    behavior_class: availability
+    risk: Medium
+    identity:
+      actor_name: ${auth_user}
+      target_id: ${path}
+      source_ip: ${src_ip}
+- id: http_success
+  when:
+  - field: status
+    matches: ^2\d\d$
+  set:
+    action: data.access
+    behavior_class: session
+    risk: Low
+    identity:
+      actor_name: ${auth_user}
+      target_id: ${path}
+      source_ip: ${src_ip}

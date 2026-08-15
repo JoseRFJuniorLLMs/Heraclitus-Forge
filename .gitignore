@@ -11,6 +11,7 @@ venv/
 # Estado de retoma da ponte (bridge.py) — local à máquina, nunca partilhado:
 # guarda o último LSN exportado deste .hdb para este HeraclitusDB.
 .bridge_state.json
+.bridge_state.json.lock
 
 # Artefatos gerados em runtime (regeneraveis pelo Forge / DB)
 #
