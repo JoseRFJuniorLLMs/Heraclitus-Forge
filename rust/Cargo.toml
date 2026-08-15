@@ -47,6 +47,11 @@ path = "src/bin/coverage.rs"
 name = "export_facts"
 path = "src/bin/export_facts.rs"
 
+# Marco D: ingestor real (segue um ficheiro de log ao vivo)
+[[bin]]
+name = "ingest"
+path = "src/bin/ingest.rs"
+
 [[bin]]
 name = "quarantine"
 path = "src/bin/quarantine.rs"
