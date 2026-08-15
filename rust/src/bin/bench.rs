@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use heraclitus::db::HeraclitusDB;
+use heraclitus::db::FactStore;
 use heraclitus::runner::ReconstitutiveRunner;
 
 const ARTIFACT_DIR: &str = "../registry/postgresql";
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
     let temp = tempfile::tempdir().context("criar diretório temporário")?;
     let db_path = temp.path().join("bench.hdb").to_string_lossy().into_owned();
     let mut runner2 = ReconstitutiveRunner::load(&artifact).context("carregar artefato")?;
-    let mut db = HeraclitusDB::new(&db_path).context("abrir db temporário")?;
+    let mut db = FactStore::new(&db_path).context("abrir db temporário")?;
 
     let m = n.min(10_000);
     let t1 = Instant::now();
@@ -73,7 +73,7 @@ fn main() -> Result<()> {
     }
     let dt1 = t1.elapsed().as_secs_f64();
     let eps1 = m as f64 / dt1;
-    info!("[2] Ponta a ponta (Runner + HeraclitusDB append)");
+    info!("[2] Ponta a ponta (Runner + FactStore append)");
     info!("    {m} fatos gravados | {:.3}s | {:.0} EPS", dt1, eps1);
 
     let r = db.verify();

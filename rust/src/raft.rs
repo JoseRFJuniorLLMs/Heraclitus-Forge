@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::db::HeraclitusDB;
+use crate::db::FactStore;
 
 pub const BASE_LSN: u64 = 14_812_337;
 
@@ -66,7 +66,7 @@ pub struct RaftNode {
     pub leader: Option<usize>,
     pub log: Vec<LogEntry>,
     pub commit_lsn: u64,
-    pub db: HeraclitusDB,
+    pub db: FactStore,
 
     peers: Vec<usize>,
     votes: usize,
@@ -78,7 +78,7 @@ pub struct RaftNode {
     next_index: HashMap<usize, u64>,
     match_index: HashMap<usize, u64>,
 
-    // Marco C: estado de consenso DURÁVEL (à la meta.bin do HeraclitusDB).
+    // Marco C: estado de consenso DURÁVEL (à la meta.bin do FactStore).
     meta_path: String, // `<db>.raftmeta` — (currentTerm, votedFor)
     log_path: String,  // `<db>.raftlog`  — entradas do log Raft (term|lsn|root|block)
 }
@@ -136,7 +136,7 @@ fn replay_log(path: &str) -> Vec<LogEntry> {
 }
 
 impl RaftNode {
-    pub fn new(id: usize, peers: Vec<usize>, db: HeraclitusDB) -> Self {
+    pub fn new(id: usize, peers: Vec<usize>, db: FactStore) -> Self {
         let meta_path = format!("{}.raftmeta", db.db_path);
         let log_path = format!("{}.raftlog", db.db_path);
         let (term, voted_for) = load_meta(&meta_path);
@@ -509,7 +509,7 @@ impl RaftNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::HeraclitusDB;
+    use crate::db::FactStore;
     use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -534,8 +534,8 @@ mod tests {
         s
     }
 
-    fn tmp_db() -> HeraclitusDB {
-        HeraclitusDB::new(&fresh_path()).unwrap()
+    fn tmp_db() -> FactStore {
+        FactStore::new(&fresh_path()).unwrap()
     }
 
     fn fact(action: &str) -> Value {
@@ -703,7 +703,7 @@ mod tests {
         // termo 5. Sem persistir votedFor, o restart re-votaria ⇒ split-brain.
         let path = fresh_path();
         {
-            let db = HeraclitusDB::new(&path).unwrap();
+            let db = FactStore::new(&path).unwrap();
             let mut n = RaftNode::new(0, vec![1, 2], db);
             n.handle(
                 1,
@@ -716,7 +716,7 @@ mod tests {
             );
         }
         // Restart: reabre o mesmo banco/estado.
-        let db = HeraclitusDB::new(&path).unwrap();
+        let db = FactStore::new(&path).unwrap();
         let mut n = RaftNode::new(0, vec![1, 2], db);
         assert_eq!(n.term, 5, "currentTerm não sobreviveu ao restart");
         let resp = n.handle(
@@ -745,7 +745,7 @@ mod tests {
         // entradas, um restart recupera last_lsn e last_term.
         let path = fresh_path();
         {
-            let db = HeraclitusDB::new(&path).unwrap();
+            let db = FactStore::new(&path).unwrap();
             let mut n = RaftNode::new(0, vec![1, 2], db);
             n.term = 3;
             for i in 0..3 {
@@ -755,7 +755,7 @@ mod tests {
             }
             assert_eq!(n.last_lsn(), BASE_LSN + 3);
         }
-        let db = HeraclitusDB::new(&path).unwrap();
+        let db = FactStore::new(&path).unwrap();
         let n = RaftNode::new(0, vec![1, 2], db);
         assert_eq!(
             n.last_lsn(),

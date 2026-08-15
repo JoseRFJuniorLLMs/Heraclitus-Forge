@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use tracing::{error, info};
 
-use heraclitus::db::{verify_file, HeraclitusDB};
+use heraclitus::db::{verify_file, FactStore};
 use heraclitus::hql;
 use heraclitus::runner::ReconstitutiveRunner;
 
@@ -86,7 +86,7 @@ fn main() -> Result<()> {
         let artifact = heraclitus::runner::resolve_latest_artifact(ARTIFACT_DIR)
             .context("nenhuma versao do conector no registry (rode o Forge antes)")?;
         let mut runner = ReconstitutiveRunner::load(&artifact).context("carregar artefato .hcx")?;
-        let mut db = HeraclitusDB::new(&db_path).context("abrir db")?;
+        let mut db = FactStore::new(&db_path).context("abrir db")?;
         let mut sealed = 0usize;
         for s in SAMPLES {
             if let Some(mut f) = runner.process_observation(s) {

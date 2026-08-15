@@ -6,7 +6,7 @@
 //! do Raft é dirigido por um `tokio::time::interval`. Ligação por mensagem
 //! (best-effort — se o peer estiver em baixo, o próximo heartbeat/eleição
 //! reenvia; pool de ligações fica como otimização futura, como no `net.rs` do
-//! HeraclitusDB).
+//! FactStore).
 //!
 //! As propriedades de segurança (voto durável, Figura-8) vivem no `RaftNode` e
 //! são idênticas na simulação e aqui — este módulo só transporta os `Msg`.
@@ -129,7 +129,7 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::HeraclitusDB;
+    use crate::db::FactStore;
     use crate::raft::BASE_LSN;
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -196,7 +196,7 @@ mod tests {
         let nodes: Vec<Arc<Mutex<RaftNode>>> = (0..3)
             .map(|i| {
                 let peers: Vec<usize> = (0..3).filter(|&j| j != i).collect();
-                let db = HeraclitusDB::new(&fresh_path()).unwrap();
+                let db = FactStore::new(&fresh_path()).unwrap();
                 Arc::new(Mutex::new(RaftNode::new(i, peers, db)))
             })
             .collect();

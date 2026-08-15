@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tracing::{error, info, warn};
 
-use heraclitus::db::HeraclitusDB;
+use heraclitus::db::FactStore;
 use heraclitus::quarantine::{key_from_env, QuarantineWriter, KEY_ENV};
 use heraclitus::runner::ReconstitutiveRunner;
 
@@ -124,7 +124,7 @@ fn main() -> Result<()> {
 
     let mut runner =
         ReconstitutiveRunner::load(&artifact_path).context("Falha ao carregar artefato .hcx")?;
-    let mut db = HeraclitusDB::new(&db_path).context("Falha ao abrir db íntegro")?;
+    let mut db = FactStore::new(&db_path).context("Falha ao abrir db íntegro")?;
     let quarantine_path = if selftest {
         std::env::temp_dir().join(format!(
             "forge_probe_selftest_{}.quarantine.hq",

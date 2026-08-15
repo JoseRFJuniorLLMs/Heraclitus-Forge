@@ -80,6 +80,38 @@ cargo run --release --bin cluster_demo -- --demo
 cargo run --release --bin bench -- --demo 10000
 ```
 
+## Implantação: o ingestor como serviço
+
+Um ingestor que só corre quando alguém se lembra não é um ingestor. O `ingest`
+sabe falar com o SCM do Windows — regista-se, arranca no boot e é reiniciado
+automaticamente se morrer:
+
+```powershell
+cd windows
+.orge-ingest-service.ps1 install `
+    -Source   C:\logs
+ginxccess.log `
+    -Artifact D:\DEV\Heraclitus-Forgeegistry
+ginx_access
+
+.orge-ingest-service.ps1 status    # estado, conta, fonte, destino
+.orge-ingest-service.ps1 logs      # segue o log rotativo diário
+.orge-ingest-service.ps1 uninstall # remove o serviço; os dados ficam
+```
+
+Corre sob a **conta virtual** `NT SERVICE\HeraclitusForgeIngest`, com privilégio
+mínimo: lê a fonte e o registry, escreve no data dir e nos logs. Nada mais.
+
+O install **gera a `FORGE_QUARANTINE_KEY`** se ainda não existir e mostra-a uma
+única vez — guarde-a em custódia. Sem ela a quarentena fica ilegível para sempre,
+e é lá que ficam as observações que ainda não têm conector.
+
+A configuração vai por ambiente de máquina (`FORGE_INGEST_SOURCE`,
+`FORGE_INGEST_ARTIFACT`, `FORGE_INGEST_DB`), porque o SCM lança o binário sem
+argumentos. Faltar uma delas é erro de instalação: o serviço regista o motivo no
+log e **para**, em vez de o SCM ficar a reiniciar em ciclo algo que nunca vai
+arrancar.
+
 ## Ingestão real
 
 Os binários acima são **demonstrações** — o `connector_postgresql` apaga o

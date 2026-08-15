@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use tracing::{error, info, warn};
 
-use heraclitus::db::HeraclitusDB;
+use heraclitus::db::FactStore;
 use heraclitus::quarantine::QuarantineWriter;
 use heraclitus::runner::ReconstitutiveRunner;
 
@@ -64,7 +64,7 @@ const DRIFT_STREAM: &[&str] = &[
 
 fn monitor(
     runners: &mut HashMap<&'static str, ReconstitutiveRunner>,
-    db: &mut HeraclitusDB,
+    db: &mut FactStore,
     quarantine: &mut QuarantineWriter,
     quarantined: &mut usize,
     ip: &str,
@@ -166,7 +166,7 @@ fn main() -> Result<()> {
     }
 
     let db_path_text = db_path.to_string_lossy();
-    let mut db = HeraclitusDB::new(&db_path_text).context("Falha ao abrir db temporário")?;
+    let mut db = FactStore::new(&db_path_text).context("Falha ao abrir db temporário")?;
     let mut quarantine = QuarantineWriter::open(&quarantine_path, quarantine_key)
         .context("Falha ao abrir quarentena cifrada temporária")?;
     let mut quarantined = 0usize;

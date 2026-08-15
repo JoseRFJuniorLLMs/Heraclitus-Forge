@@ -1,4 +1,4 @@
-//! Heraclitus — runtime nativo (port Rust do Runner + HeraclitusDB).
+//! Heraclitus — runtime nativo (port Rust do Runner + FactStore).
 //!
 //! O Forge (compilacao de conhecimento, Design-Time) permanece em Python, como
 //! manda a spec (esteira de IA isolada). Este crate porta APENAS o caminho quente

@@ -287,7 +287,7 @@ pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::HeraclitusDB;
+    use crate::db::FactStore;
     use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -299,7 +299,7 @@ mod tests {
         let s = p.to_str().unwrap().to_string();
         let _ = std::fs::remove_file(&s);
         let _ = std::fs::remove_file(format!("{s}.anchor"));
-        let mut db = HeraclitusDB::new(&s).unwrap();
+        let mut db = FactStore::new(&s).unwrap();
         for (action, target) in pairs {
             let mut f = json!({
                 "fact_id": "019f035c-1823-7fe9-8c54-02b2d1acc30c",
