@@ -1,4 +1,13 @@
-//! HeraclitusDB — armazenamento append-only `.hdb` com integridade BLAKE3 + CRC-32C.
+//! `FactStore` — armazenamento append-only `.hdb` com integridade BLAKE3 + CRC-32C.
+//!
+//! > **Não confundir com o [HeraclitusDB](https://github.com/JoseRFJuniorLLMs/HeraclitusDB).**
+//! > Este tipo chamou-se `HeraclitusDB` até 2026-08-15 e colidia com o nome de um
+//! > projeto **separado**: um banco event-sourced em rede (gRPC :7474, segmentos
+//! > `HRKL`/`HFTR`, grafo + vetor + texto). Este aqui é o store **embebido** do
+//! > runtime de borda: blocos `HERA`/`FACT`, âncora ed25519 externa, feito para
+//! > line-rate no sítio onde o log nasce. Os formatos são incompatíveis e nenhum
+//! > lê o ficheiro do outro — por isso existe uma ponte (`export_facts` +
+//! > `bridge.py`), e não uma migração. Ver `INTEGRATION_CONTRACT.md`.
 //!
 //! ## Arquitetura de integridade em duas camadas
 //!
@@ -218,7 +227,7 @@ pub struct ExportStats {
 /// Por bloco: valida o CRC-32C (camada física CPM-200), decodifica o corpo
 /// `fbfact` e chama `f(lsn, fact)`. Blocos com CRC partido são **saltados e
 /// contados** — nunca silenciados; quem julga a integridade da cadeia é o
-/// [`HeraclitusDB::verify`], não o exportador.
+/// [`FactStore::verify`], não o exportador.
 ///
 /// `from_lsn` retoma uma exportação anterior (entrega apenas `lsn > from_lsn`);
 /// devolver `false` no callback interrompe (limite de lote).
@@ -253,7 +262,7 @@ where
     Ok(st)
 }
 
-pub struct HeraclitusDB {
+pub struct FactStore {
     pub db_path: String,
     anchor_path: String,
     /// `<db>.anchor.sig` — assinatura ed25519 (hex) sobre a raiz da âncora.
@@ -269,11 +278,11 @@ pub struct HeraclitusDB {
 }
 
 /// Verifica um `.hdb` sem abrir/criar a chave privada. Esta é a superfície
-/// correta para exportadores, auditores e pipelines read-only: `HeraclitusDB::new`
+/// correta para exportadores, auditores e pipelines read-only: `FactStore::new`
 /// pode criar sidecars ausentes, o que seria uma mutação inaceitável durante
 /// uma verificação de cadeia de custódia.
 pub fn verify_file(db_path: &str) -> VerifyResult {
-    let verifier = HeraclitusDB {
+    let verifier = FactStore {
         db_path: db_path.to_string(),
         anchor_path: format!("{db_path}.anchor"),
         anchor_sig_path: format!("{db_path}.anchor.sig"),
@@ -287,7 +296,7 @@ pub fn verify_file(db_path: &str) -> VerifyResult {
     verifier.verify()
 }
 
-impl HeraclitusDB {
+impl FactStore {
     pub fn new(db_path: &str) -> std::io::Result<Self> {
         let existed = std::path::Path::new(db_path).exists();
         if !existed {
@@ -780,14 +789,14 @@ mod tests {
         })
     }
 
-    // -- export_facts: a superfície que a ponte Forge -> HeraclitusDB consome --
+    // -- export_facts: a superfície que a ponte Forge -> FactStore consome --
 
     /// O exportador tem de devolver os Fatos ÍNTEGROS e por ordem de LSN, e o
     /// `last_lsn` tem de ser o ponto de retoma correto.
     #[test]
     fn export_facts_yields_every_written_fact() {
         let p = tmp_path("export_all");
-        let mut db = HeraclitusDB::new(&p).unwrap();
+        let mut db = FactStore::new(&p).unwrap();
         for i in 0..5 {
             let mut f = fact(&format!("action{i}"));
             db.write_fact(&mut f).unwrap();
@@ -822,7 +831,7 @@ mod tests {
     #[test]
     fn export_facts_from_lsn_resumes_without_duplicates() {
         let p = tmp_path("export_resume");
-        let mut db = HeraclitusDB::new(&p).unwrap();
+        let mut db = FactStore::new(&p).unwrap();
         for i in 0..6 {
             let mut f = fact(&format!("a{i}"));
             db.write_fact(&mut f).unwrap();
@@ -859,7 +868,7 @@ mod tests {
     #[test]
     fn export_facts_counts_tampered_blocks_instead_of_yielding_them() {
         let p = tmp_path("export_tamper");
-        let mut db = HeraclitusDB::new(&p).unwrap();
+        let mut db = FactStore::new(&p).unwrap();
         let mut lsns = Vec::new();
         for i in 0..3 {
             let mut f = fact(&format!("a{i}"));
@@ -911,7 +920,7 @@ mod tests {
 
         // Sessão 1: cria e escreve 3 fatos.
         {
-            let mut db = HeraclitusDB::new(p).unwrap();
+            let mut db = FactStore::new(p).unwrap();
             for i in 0..3 {
                 let mut f = fact(&format!("a{i}"));
                 db.write_fact(&mut f).unwrap();
@@ -920,7 +929,7 @@ mod tests {
         }
         // Sessão 2: REABRE e escreve mais 2.
         {
-            let mut db = HeraclitusDB::new(p).unwrap();
+            let mut db = FactStore::new(p).unwrap();
             assert_eq!(
                 db.current_lsn,
                 BASE_LSN + 3,
@@ -948,7 +957,7 @@ mod tests {
     fn tampered_anchor_signature_is_rejected() {
         let p = tmp_path("sigtamper");
         {
-            let mut db = HeraclitusDB::new(&p).unwrap();
+            let mut db = FactStore::new(&p).unwrap();
             for i in 0..2 {
                 db.write_fact(&mut fact(&format!("a{i}"))).unwrap();
             }
@@ -959,7 +968,7 @@ mod tests {
         let r = verify_file(&p);
         assert_eq!(r.status, "VIOLATED", "sig corrompida devia falhar");
         assert!(
-            HeraclitusDB::new(&p).is_err(),
+            FactStore::new(&p).is_err(),
             "writer tem de recusar origem violada"
         );
     }
@@ -974,7 +983,7 @@ mod tests {
     fn foreign_key_signature_is_rejected() {
         let victim = tmp_path("victim");
         {
-            let mut db = HeraclitusDB::new(&victim).unwrap();
+            let mut db = FactStore::new(&victim).unwrap();
             for i in 0..2 {
                 db.write_fact(&mut fact(&format!("v{i}"))).unwrap();
             }
@@ -983,7 +992,7 @@ mod tests {
         // Atacante: banco próprio (⇒ chave própria) com Fatos diferentes.
         let attacker = tmp_path("attacker");
         {
-            let mut db = HeraclitusDB::new(&attacker).unwrap();
+            let mut db = FactStore::new(&attacker).unwrap();
             for i in 0..3 {
                 db.write_fact(&mut fact(&format!("x{i}"))).unwrap();
             }
@@ -1005,7 +1014,7 @@ mod tests {
             r.message
         );
         assert!(
-            HeraclitusDB::new(&victim).is_err(),
+            FactStore::new(&victim).is_err(),
             "writer tem de recusar chave estranha"
         );
     }

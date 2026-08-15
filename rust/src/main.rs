@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{error, info, warn};
 
-use heraclitus::db::HeraclitusDB;
+use heraclitus::db::FactStore;
 use heraclitus::quarantine::{key_from_env, QuarantineWriter};
 use heraclitus::runner::ReconstitutiveRunner;
 
@@ -70,7 +70,7 @@ fn main() -> Result<()> {
     } else {
         required_env("HERACLITUS_DB_PATH")?
     };
-    let mut db = HeraclitusDB::new(&db_path)
+    let mut db = FactStore::new(&db_path)
         .with_context(|| format!("Falha ao abrir banco íntegro {db_path}"))?;
     let quarantine_path = if let Some(ref dir) = demo_dir {
         dir.path().join("connector-demo.quarantine.hq")

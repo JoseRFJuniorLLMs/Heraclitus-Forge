@@ -70,6 +70,14 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Log rotativo diario do ingestor em modo servico: sem consola, o ficheiro e a
+# unica forma de saber o que aconteceu.
+tracing-appender = "0.2"
+
+# O ingestor corre como servico do Windows (mesmo padrao do heraclitus-service):
+# aparece em services.msc, arranca no boot e o SCM aplica a recuperacao.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
 # Gateway de ingestao (backend do dashboard) — stack Rust recomendada
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 axum = "0.7"

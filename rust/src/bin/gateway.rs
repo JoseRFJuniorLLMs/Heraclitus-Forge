@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use heraclitus::db::{export_facts, HeraclitusDB};
+use heraclitus::db::{export_facts, FactStore};
 use heraclitus::hql;
 use heraclitus::quarantine::{key_from_env, QuarantineWriter};
 use heraclitus::runner::ReconstitutiveRunner;
@@ -82,7 +82,7 @@ const SAMPLES: &[&str] = &[
 struct AppState {
     recent: Mutex<VecDeque<Value>>,
     total: AtomicU64,
-    db: Mutex<HeraclitusDB>,
+    db: Mutex<FactStore>,
     runner: Mutex<ReconstitutiveRunner>,
     quarantine: Mutex<QuarantineWriter>,
     db_path: String,
@@ -275,7 +275,7 @@ async fn main() -> Result<()> {
         .context("artefato .hcx ausente — rode: python forge_compiler.py")?;
     info!("Runner carregado (plano: {})", runner.plan_str());
     let db_path = std::env::var("FORGE_GATEWAY_DB").unwrap_or_else(|_| DB_PATH_DEFAULT.into());
-    let db = HeraclitusDB::new(&db_path).context("abrir db íntegro")?;
+    let db = FactStore::new(&db_path).context("abrir db íntegro")?;
     let verified = db.verify();
     let mut recent = VecDeque::with_capacity(CAP);
     export_facts(&db_path, 0, |_, fact| {

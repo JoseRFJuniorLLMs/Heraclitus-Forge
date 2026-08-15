@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use anyhow::{Context, Result};
 use tracing::{error, info};
 
-use heraclitus::db::HeraclitusDB;
+use heraclitus::db::FactStore;
 use heraclitus::raft::{Msg, RaftNode};
 use heraclitus::runner::ReconstitutiveRunner;
 
@@ -42,7 +42,7 @@ impl Cluster {
             nodes.push(RaftNode::new(
                 id,
                 peers,
-                HeraclitusDB::new(&path).context("Erro ao criar DB")?,
+                FactStore::new(&path).context("Erro ao criar DB")?,
             ));
         }
         Ok(Self {

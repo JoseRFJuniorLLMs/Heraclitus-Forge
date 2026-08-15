@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use heraclitus::db::HeraclitusDB;
+use heraclitus::db::FactStore;
 use heraclitus::quarantine::QuarantineWriter;
 use heraclitus::runner::{resolve_latest_artifact, ReconstitutiveRunner};
 
@@ -48,6 +48,9 @@ const FINGERPRINT_BYTES: usize = 256;
 /// alto o suficiente para não queimar CPU num ficheiro parado.
 const POLL: Duration = Duration::from_millis(400);
 
+/// Nome do serviço do Windows. O install script usa o mesmo.
+pub const SERVICE_NAME: &str = "HeraclitusForgeIngest";
+
 struct Args {
     source: PathBuf,
     artifact_dir: String,
@@ -57,6 +60,37 @@ struct Args {
     follow: bool,
     from_start: bool,
     once: bool,
+}
+
+impl Args {
+    /// Configuração para o modo serviço.
+    ///
+    /// O SCM lança o binário **sem argumentos** — não há linha de comando onde
+    /// pôr o ficheiro a seguir. Por isso o serviço lê o ambiente, exatamente
+    /// como o `heraclitus-service` faz. Falhar aqui com uma mensagem clara vale
+    /// mais do que arrancar a seguir o ficheiro errado em silêncio.
+    fn from_env() -> Result<Self, String> {
+        let obrigatoria = |k: &str| -> Result<String, String> {
+            std::env::var(k).map_err(|_| format!("{k} e obrigatoria no modo servico"))
+        };
+        let source = PathBuf::from(obrigatoria("FORGE_INGEST_SOURCE")?);
+        let db_path = std::env::var("FORGE_INGEST_DB")
+            .unwrap_or_else(|_| r"D:\HeraclitusForge\data\ingest.hdb".into());
+        Ok(Self {
+            state_path: PathBuf::from(format!("{db_path}.ingest-state")),
+            source,
+            artifact_dir: obrigatoria("FORGE_INGEST_ARTIFACT")?,
+            db_path,
+            quarantine: PathBuf::from(
+                std::env::var("FORGE_INGEST_QUARANTINE")
+                    .unwrap_or_else(|_| r"D:\HeraclitusForge\data\quarantine.hq".into()),
+            ),
+            // Um serviço segue o ficheiro: essa é a razão de existir.
+            follow: true,
+            from_start: false,
+            once: false,
+        })
+    }
 }
 
 fn usage() -> ! {
@@ -193,7 +227,7 @@ fn drain(
     source: &Path,
     offset: u64,
     runner: &mut ReconstitutiveRunner,
-    db: &mut HeraclitusDB,
+    db: &mut FactStore,
     quarantine: &mut QuarantineWriter,
     stats: &mut Stats,
 ) -> std::io::Result<u64> {
@@ -235,7 +269,9 @@ fn drain(
     Ok(consumed)
 }
 
-fn run(a: &Args) -> anyhow::Result<Stats> {
+/// `parar` permite ao SCM interromper o laco entre passagens. Em modo consola
+/// e `None` e o comportamento e o de sempre.
+fn run(a: &Args, parar: Option<&std::sync::mpsc::Receiver<()>>) -> anyhow::Result<Stats> {
     let key = heraclitus::quarantine::key_from_env()?;
 
     let artifact = resolve_latest_artifact(&a.artifact_dir).ok_or_else(|| {
@@ -250,7 +286,7 @@ fn run(a: &Args) -> anyhow::Result<Stats> {
 
     // Abre o .hdb EXISTENTE. O `new` recupera LSN e raiz Merkle do disco; um
     // ingestor que apagasse aqui perdia o histórico a cada reinício.
-    let mut db = HeraclitusDB::new(&a.db_path)?;
+    let mut db = FactStore::new(&a.db_path)?;
     eprintln!("[ingest] destino  : {} (LSN atual {})", a.db_path, db.current_lsn);
 
     let mut quarantine = QuarantineWriter::open(&a.quarantine, key)?;
@@ -308,19 +344,161 @@ fn run(a: &Args) -> anyhow::Result<Stats> {
         if !a.follow || a.once {
             break;
         }
-        std::thread::sleep(POLL);
+        // Dorme ate ao proximo ciclo OU ate o SCM mandar parar -- o que vier
+        // primeiro. Sem isto, um `Stop` esperava o POLL inteiro e o Windows
+        // podia declarar o servico como nao-responsivo.
+        match parar {
+            Some(rx) => match rx.recv_timeout(POLL) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    tracing::info!("paragem pedida; a terminar o ciclo");
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            },
+            None => std::thread::sleep(POLL),
+        }
     }
     Ok(stats)
 }
 
+// ---------------------------------------------------------------------------
+// Modo servico do Windows
+// ---------------------------------------------------------------------------
+
+/// Pasta do log rotativo. Um serviço não tem consola: sem isto, uma falha no
+/// arranque é invisível e o operador vê apenas "o serviço parou".
+#[cfg(windows)]
+fn log_dir() -> PathBuf {
+    std::env::var("FORGE_INGEST_LOGDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into()))
+                .join("HeraclitusForge")
+                .join("logs")
+        })
+}
+
+#[cfg(windows)]
+mod service {
+    use std::ffi::OsString;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+    use windows_service::{define_windows_service, service_dispatcher};
+
+    const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+
+    define_windows_service!(ffi_service_main, service_main);
+
+    pub fn start() -> windows_service::Result<()> {
+        service_dispatcher::start(super::SERVICE_NAME, ffi_service_main)
+    }
+
+    fn service_main(_args: Vec<OsString>) {
+        // O log tem de estar vivo ANTES de qualquer coisa poder falhar.
+        let dir = super::log_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let appender = tracing_appender::rolling::daily(&dir, "forge-ingest.log");
+        let (writer, _guard) = tracing_appender::non_blocking(appender);
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(writer)
+            .try_init();
+
+        if let Err(e) = run() {
+            tracing::error!(erro = %e, "servico terminou com erro");
+        }
+    }
+
+    fn run() -> Result<(), Box<dyn std::error::Error>> {
+        let (parar_tx, parar_rx) = mpsc::channel::<()>();
+        let handler = move |control| -> ServiceControlHandlerResult {
+            match control {
+                ServiceControl::Stop | ServiceControl::Preshutdown => {
+                    let _ = parar_tx.send(());
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        };
+        let status = service_control_handler::register(super::SERVICE_NAME, handler)?;
+        let set = |estado: ServiceState, aceita: ServiceControlAccept, codigo: u32| {
+            status.set_service_status(ServiceStatus {
+                service_type: SERVICE_TYPE,
+                current_state: estado,
+                controls_accepted: aceita,
+                exit_code: ServiceExitCode::Win32(codigo),
+                checkpoint: 0,
+                wait_hint: Duration::from_secs(10),
+                process_id: None,
+            })
+        };
+
+        let args = match super::Args::from_env() {
+            Ok(a) => a,
+            Err(e) => {
+                // Configuração em falta é erro de instalação, não transitório.
+                // Sai com código != 0 para o SCM NÃO ficar a reiniciar em ciclo
+                // um serviço que nunca vai conseguir arrancar.
+                tracing::error!("configuracao invalida: {e}");
+                set(ServiceState::Stopped, ServiceControlAccept::empty(), 1)?;
+                return Ok(());
+            }
+        };
+
+        set(
+            ServiceState::Running,
+            ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN,
+            0,
+        )?;
+        tracing::info!(
+            origem = %args.source.display(),
+            artefato = %args.artifact_dir,
+            destino = %args.db_path,
+            "ingestor a arrancar"
+        );
+
+        let resultado = super::run(&args, Some(&parar_rx));
+        let codigo = match resultado {
+            Ok(s) => {
+                tracing::info!(fatos = s.facts, quarentena = s.drift, "ingestor parado");
+                0
+            }
+            Err(e) => {
+                tracing::error!(erro = %format!("{e:#}"), "ingestor falhou");
+                1
+            }
+        };
+        set(ServiceState::Stopped, ServiceControlAccept::empty(), codigo)?;
+        Ok(())
+    }
+}
+
 fn main() -> ExitCode {
+    // O SCM lança o binário com o argumento `service`. Tem de ser a PRIMEIRA
+    // coisa: o dispatcher precisa de responder ao SCM em segundos, antes de
+    // qualquer inicialização mais lenta.
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("service") {
+        if let Err(e) = service::start() {
+            eprintln!("[ERRO] dispatcher do servico: {e}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+
     tracing_subscriber::fmt::init();
     let a = parse_args();
     if !a.source.exists() {
         eprintln!("[ERRO] ficheiro nao existe: {}", a.source.display());
         return ExitCode::from(1);
     }
-    match run(&a) {
+    match run(&a, None) {
         Ok(s) => {
             eprintln!("[ingest] fim: {} fato(s), {} em quarentena", s.facts, s.drift);
             // Drift é sinal, não erro: um conector desatualizado manifesta-se
