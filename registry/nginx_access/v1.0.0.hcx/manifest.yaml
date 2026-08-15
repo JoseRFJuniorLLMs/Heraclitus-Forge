@@ -1,0 +1,6 @@
+id: br.gov.heraclitus.pipelines.nginx_access-v1.0.0
+vendor: nginx / Apache (log de acesso combinado)
+version: 1.0.0
+schema_version: v9
+domain: web_access
+compiled_at: '2026-06-26T02:10:00Z'

@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "input": "187.54.12.33 - carlos.silva [15/Aug/2026:03:12:51 -0300] \"POST /admin/login HTTP/1.1\" 401 172 \"-\" \"Mozilla/5.0\"",
+      "expect_action": "authentication.failure"
+    },
+    {
+      "input": "10.2.3.44 - ana.pereira [15/Aug/2026:03:13:19 -0300] \"GET /rh/folha/exportar HTTP/1.1\" 403 199 \"-\" \"Mozilla/5.0\"",
+      "expect_action": "authorization.failure"
+    },
+    {
+      "input": "203.0.113.7 - - [15/Aug/2026:03:13:27 -0300] \"GET /.env HTTP/1.1\" 404 153 \"-\" \"curl/8.4.0\"",
+      "expect_action": "resource.missing"
+    },
+    {
+      "input": "10.2.3.51 - joao.souza [15/Aug/2026:03:13:40 -0300] \"GET /rh/servidor/12345 HTTP/1.1\" 200 4210 \"-\" \"Mozilla/5.0\"",
+      "expect_action": "data.access"
+    },
+    {
+      "input": "10.2.3.51 - joao.souza [15/Aug/2026:03:13:55 -0300] \"DELETE /rh/beneficios/9981 HTTP/1.1\" 500 617 \"-\" \"Mozilla/5.0\"",
+      "expect_action": "service.error"
+    }
+  ]
+}

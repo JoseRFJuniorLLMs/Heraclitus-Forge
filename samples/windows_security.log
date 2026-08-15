@@ -1,0 +1,8 @@
+2026-08-15 03:20:01 SecurityEvent EventID=4624 Computer=DESK-SIAPE-042 TargetUserName=carlos.silva LogonType=2 IpAddress=10.2.3.44 Status=0x0
+2026-08-15 03:20:44 SecurityEvent EventID=4625 Computer=DESK-SIAPE-042 TargetUserName=administrador LogonType=3 IpAddress=203.0.113.90 Status=0xC000006D
+2026-08-15 03:20:47 SecurityEvent EventID=4625 Computer=DESK-SIAPE-042 TargetUserName=administrador LogonType=3 IpAddress=203.0.113.90 Status=0xC000006D
+2026-08-15 03:20:51 SecurityEvent EventID=4625 Computer=DESK-SIAPE-042 TargetUserName=administrador LogonType=3 IpAddress=203.0.113.90 Status=0xC000006D
+2026-08-15 03:21:10 SecurityEvent EventID=4672 Computer=SRV-RH-01 TargetUserName=svc-folha LogonType=5 IpAddress=- Status=0x0
+2026-08-15 03:21:33 SecurityEvent EventID=4720 Computer=SRV-RH-01 TargetUserName=usuario.novo LogonType=0 IpAddress=10.2.3.9 Status=0x0
+2026-08-15 03:22:02 SecurityEvent EventID=4726 Computer=SRV-RH-01 TargetUserName=ana.pereira LogonType=0 IpAddress=10.2.3.9 Status=0x0
+2026-08-15 03:22:40 SecurityEvent EventID=4634 Computer=DESK-SIAPE-042 TargetUserName=carlos.silva LogonType=2 IpAddress=10.2.3.44 Status=0x0

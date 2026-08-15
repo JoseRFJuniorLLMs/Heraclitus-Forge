@@ -1,0 +1,71 @@
+rules:
+- id: win_logon_failure
+  when:
+  - field: message
+    matches: EventID=4625 Computer=(?P<host>\S+) TargetUserName=(?P<target_user>\S+)
+      .*IpAddress=(?P<src_ip>\S+)
+  set:
+    action: authentication.failure
+    behavior_class: credential_attack
+    risk: High
+    identity:
+      actor_name: ${target_user}
+      target_id: ${host}
+      source_ip: ${src_ip}
+- id: win_privilege_assigned
+  when:
+  - field: message
+    matches: EventID=4672 Computer=(?P<host>\S+) TargetUserName=(?P<target_user>\S+)
+  set:
+    action: privilege.granted
+    behavior_class: privilege_violation
+    risk: High
+    identity:
+      actor_name: ${target_user}
+      target_id: ${host}
+- id: win_account_created
+  when:
+  - field: message
+    matches: EventID=4720 Computer=(?P<host>\S+) TargetUserName=(?P<target_user>\S+)
+  set:
+    action: account.created
+    behavior_class: identity_lifecycle
+    risk: High
+    identity:
+      actor_name: ${target_user}
+      target_id: ${host}
+- id: win_account_deleted
+  when:
+  - field: message
+    matches: EventID=4726 Computer=(?P<host>\S+) TargetUserName=(?P<target_user>\S+)
+  set:
+    action: account.deleted
+    behavior_class: identity_lifecycle
+    risk: Critical
+    identity:
+      actor_name: ${target_user}
+      target_id: ${host}
+- id: win_logon_success
+  when:
+  - field: message
+    matches: EventID=4624 Computer=(?P<host>\S+) TargetUserName=(?P<target_user>\S+)
+      .*IpAddress=(?P<src_ip>\S+)
+  set:
+    action: authentication.success
+    behavior_class: session
+    risk: Low
+    identity:
+      actor_name: ${target_user}
+      target_id: ${host}
+      source_ip: ${src_ip}
+- id: win_logoff
+  when:
+  - field: message
+    matches: EventID=4634 Computer=(?P<host>\S+) TargetUserName=(?P<target_user>\S+)
+  set:
+    action: session.end
+    behavior_class: session
+    risk: Low
+    identity:
+      actor_name: ${target_user}
+      target_id: ${host}

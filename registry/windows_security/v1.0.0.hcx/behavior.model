@@ -1,0 +1,8 @@
+signatures:
+- id: win_brute_force
+  trigger_action: authentication.failure
+  window_secs: 120
+  threshold: 3
+  escalate_to:
+    behavior_class: credential_attack
+    risk: Critical

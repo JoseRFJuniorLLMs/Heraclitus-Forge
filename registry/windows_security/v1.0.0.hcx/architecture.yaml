@@ -1,0 +1,25 @@
+version: '6.0'
+dag:
+  parse:
+    engine: regex
+    depends_on: []
+    config:
+      pattern: ^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) SecurityEvent (?P<message>EventID=\d+
+        .*)$
+  normalize:
+    engine: reasoner
+    depends_on:
+    - parse
+    config:
+      ruleset: reasoning.yaml
+  behavior:
+    engine: sliding_window
+    depends_on:
+    - normalize
+    config:
+      model: behavior.model
+  emit:
+    engine: fact_emitter
+    depends_on:
+    - behavior
+    config: {}
