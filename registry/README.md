@@ -47,7 +47,7 @@ python forge_sign.py verify registry/postgresql/v1.2.0.hcx
 O `signature.sig` é autodescritivo e diz **quem** assinou:
 
 ```
-format=hcx-v2
+format=hcx-v3
 alg=ed25519
 key=5254bdb1…      <- tem de bater com publisher.pub
 digest=a1182519…   <- SHA-256 canónico do artefato
@@ -59,7 +59,9 @@ mas era um SHA-256 truncado — não havia chave nenhuma, e quem alterasse um
 artefato recalculava o selo em duas linhas. O digest antigo cobria uma *lista
 fixa* de ficheiros, por isso acrescentar um ficheiro novo ao pacote nem sequer o
 mexia. O novo cobre **todos** os ficheiros, com nome e comprimento a enquadrar
-cada um.
+cada um. Desde o \`hcx-v3\`, texto UTF-8 usa finais de linha LF canónicos para a
+mesma assinatura funcionar em checkouts Windows e Linux; binários continuam
+assinados byte a byte.
 
 **Modelo de confiança.** A chave de publicação é distinta da chave da âncora do
 `.hdb`: aquela prova que *os dados* não foram adulterados na máquina que os

@@ -71,7 +71,7 @@ def test_signature_sig_e_autodescritivo(pkg, key, pinned):
     campos = dict(
         line.split("=", 1) for line in (pkg / "signature.sig").read_text().strip().splitlines()
     )
-    assert campos["format"] == "hcx-v2"
+    assert campos["format"] == "hcx-v3"
     assert campos["alg"] == "ed25519"
     # A chave viaja no ficheiro: dá para saber QUEM assinou sem adivinhar.
     assert campos["key"] == key.public_key().public_bytes_raw().hex()
@@ -172,6 +172,24 @@ def test_copia_do_artefato_tem_o_mesmo_digest(pkg, tmp_path):
     copia = tmp_path / "copia.hcx"
     shutil.copytree(pkg, copia)
     assert forge_sign.artifact_digest(copia) == forge_sign.artifact_digest(pkg)
+
+
+def test_digest_textual_e_estavel_entre_crlf_e_lf(pkg):
+    """O checkout do Git não pode invalidar a assinatura noutro sistema."""
+    manifest = pkg / "manifest.yaml"
+    manifest.write_bytes(b"id: teste\r\nversion: 1.0.0\r\n")
+    digest_crlf = forge_sign.artifact_digest(pkg)
+    manifest.write_bytes(b"id: teste\nversion: 1.0.0\n")
+    assert forge_sign.artifact_digest(pkg) == digest_crlf
+
+
+def test_digest_binario_continua_a_cobrir_bytes_crus(pkg):
+    """A normalização textual não pode mascarar alterações em binários."""
+    payload = pkg / "payload.bin"
+    payload.write_bytes(b"\xff\r\n")
+    digest_crlf = forge_sign.artifact_digest(pkg)
+    payload.write_bytes(b"\xff\n")
+    assert forge_sign.artifact_digest(pkg) != digest_crlf
 
 
 # ---------------------------------------------------------------------------

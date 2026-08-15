@@ -28,10 +28,12 @@ bytes de um ficheiro para o seguinte. Aqui o digest cobre **todos** os ficheiros
 do artefato (exceto o próprio `signature.sig`), por ordem, com o nome e o
 comprimento a enquadrar cada um:
 
-    SHA256( "hcx-v2\\n" || for each file: name || "\\0" || len || "\\0" || bytes )
+    SHA256( "hcx-v3\\n" || for each file: name || "\\0" || len || "\\0" || bytes )
 
 Acrescentar um ficheiro novo ao artefato passa a invalidar a assinatura — o que
-com a lista fixa não acontecia.
+com a lista fixa não acontecia. Para que o mesmo checkout seja verificável em
+Windows e Linux, texto UTF-8 é canonizado para finais de linha LF antes do hash;
+ficheiros binários continuam cobertos byte a byte.
 
 CLI
 ---
@@ -62,7 +64,7 @@ HERE = Path(__file__).resolve().parent
 REGISTRY = HERE / "registry"
 PUBKEY_PATH = REGISTRY / "publisher.pub"
 SIG_NAME = "signature.sig"
-FORMAT = "hcx-v2"
+FORMAT = "hcx-v3"
 
 #: Ficheiro cujo conteúdo NÃO entra no digest (é onde o digest vai parar).
 EXCLUDED = {SIG_NAME}
@@ -126,6 +128,22 @@ def load_public() -> Ed25519PublicKey | None:
 # ---------------------------------------------------------------------------
 
 
+def _canonical_file_bytes(path: Path) -> bytes:
+    """Lê o ficheiro com representação estável entre checkouts Windows/Linux.
+
+    O Git pode materializar o mesmo blob textual como CRLF no Windows e LF no
+    Linux. Se os bytes crus fossem assinados, uma assinatura criada num sistema
+    seria reportada como adulterada no outro. Conteúdo UTF-8 usa LF canónico;
+    conteúdo que não seja UTF-8 é tratado como binário e permanece byte a byte.
+    """
+    data = path.read_bytes()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
 def artifact_digest(pkg: Path) -> bytes:
     """
     Digest canónico do artefato. Determinístico: a mesma pasta dá sempre o mesmo
@@ -140,7 +158,7 @@ def artifact_digest(pkg: Path) -> bytes:
     if not files:
         raise SystemExit(f"[ERRO] artefato vazio: {pkg}")
     for p in files:
-        data = p.read_bytes()
+        data = _canonical_file_bytes(p)
         h.update(p.relative_to(pkg).as_posix().encode())
         h.update(b"\0")
         h.update(str(len(data)).encode())
