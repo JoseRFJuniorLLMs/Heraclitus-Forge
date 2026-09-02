@@ -978,6 +978,7 @@ def ingested(exporter, tmp_path_factory) -> list[dict]:
             "--from-start",
             "--once",
         ],
+        env=env,
         capture_output=True,
         text=True,
         timeout=120,

@@ -59,6 +59,9 @@ const DEFAULT_WINDOW_SECS: u64 = 60;
 /// permite ao consumidor distinguir uma fonte atrasada de uma fonte morta.
 const DEFAULT_MAX_LATENESS_SECS: u64 = 300;
 
+/// Só o modo serviço lê configuração do ambiente; em Linux isto seria código
+/// morto e o `-D warnings` da CI recusa-o — com razão.
+#[cfg(windows)]
 fn numero_env(chave: &str, omissao: u64) -> Result<u64, String> {
     match std::env::var(chave) {
         Err(_) => Ok(omissao),
@@ -94,6 +97,7 @@ impl Args {
     /// pôr o ficheiro a seguir. Por isso o serviço lê o ambiente, exatamente
     /// como o `heraclitus-service` faz. Falhar aqui com uma mensagem clara vale
     /// mais do que arrancar a seguir o ficheiro errado em silêncio.
+    #[cfg(windows)]
     fn from_env() -> Result<Self, String> {
         let obrigatoria = |k: &str| -> Result<String, String> {
             std::env::var(k).map_err(|_| format!("{k} e obrigatoria no modo servico"))
