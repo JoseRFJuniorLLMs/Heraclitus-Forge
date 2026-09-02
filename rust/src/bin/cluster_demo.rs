@@ -87,6 +87,7 @@ impl Cluster {
 
     fn submit(&mut self, fact: &mut serde_json::Value) -> Result<()> {
         let lid = self.leader_id().context("sem lider")?;
+        heraclitus::hfb2::SecurityIdentity::demo("cluster").apply(fact);
         let (lsn, root, block) = self.nodes[lid]
             .db
             .commit_local(fact)
@@ -99,7 +100,7 @@ impl Cluster {
         info!("--- {titulo} ---");
         for n in &self.nodes {
             let v = n.db.verify();
-            let root = n.db.trusted_root.clone();
+            let root = n.db.trusted_root_hex();
             let root_short = if root.len() >= 12 { &root[..12] } else { &root };
             let part = if self.partitioned[n.id] {
                 " [PARTICIONADO]"
@@ -182,7 +183,7 @@ fn main() -> Result<()> {
     let roots: Vec<String> = cluster
         .nodes
         .iter()
-        .map(|n| n.db.trusted_root.clone())
+        .map(|n| n.db.trusted_root_hex())
         .collect();
     let lsns: Vec<u64> = cluster.nodes.iter().map(|n| n.db.current_lsn).collect();
     let converged = roots.iter().all(|r| r == &roots[0]) && lsns.iter().all(|l| l == &lsns[0]);

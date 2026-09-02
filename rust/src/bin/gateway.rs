@@ -86,6 +86,11 @@ struct AppState {
     runner: Mutex<ReconstitutiveRunner>,
     quarantine: Mutex<QuarantineWriter>,
     db_path: String,
+    /// Identidade que este gateway carimba nos Fatos que grava. Configuravel
+    /// por ambiente; sem configuracao assume-se DEMO e diz-se em voz alta.
+    identity: heraclitus::hfb2::SecurityIdentity,
+    /// BLAKE3 da chave publica da ancora — identidade da origem.
+    forge_source_id: String,
 }
 
 fn cors() -> HeaderMap {
@@ -195,7 +200,29 @@ async fn ingest_line(State(st): State<Arc<AppState>>, body: String) -> impl Into
     let body = if line.is_empty() {
         json!({ "error": "body vazio — envie uma linha de log no corpo da requisição" })
     } else {
-        let of = st.runner.lock().await.process_observation(&line);
+        // O lock do banco é tomado ANTES do Runner porque o `forge_lsn` do
+        // evento canónico é o LSN que este Fato vai ocupar: prevê-lo fora da
+        // secção crítica seria uma corrida entre dois pedidos, e a proveniência
+        // apontaria para outro ponto do log.
+        let mut db = st.db.lock().await;
+        let contexto = heraclitus::runner::EmissionContext {
+            identity: &st.identity,
+            forge_source_id: &st.forge_source_id,
+            forge_lsn: db.current_lsn + 1,
+            // Um POST avulso não traz sequência de origem própria.
+            source_sequence: None,
+            source_event_id: None,
+        };
+        let of = st
+            .runner
+            .lock()
+            .await
+            .process_observation_with_context(&line, &contexto);
+        let of = match of {
+            Ok(of) => of,
+            // Violação de contrato do artefato, não desta linha.
+            Err(error) => return (cors(), Json(json!({ "error": error.to_string() }))),
+        };
         match of {
             None => {
                 let fingerprint = blake3::hash(line.as_bytes()).to_hex().to_string();
@@ -214,19 +241,22 @@ async fn ingest_line(State(st): State<Arc<AppState>>, body: String) -> impl Into
                     }
                 }
             }
-            Some(mut f) => match st.db.lock().await.write_fact(&mut f) {
-                Err(e) => json!({ "error": e.to_string() }),
-                Ok(lsn) => {
-                    let fact_copy = f.clone();
-                    let mut rec = st.recent.lock().await;
-                    rec.push_front(fact_copy);
-                    while rec.len() > CAP {
-                        rec.pop_back();
+            Some(mut f) => {
+                let written = db.write_fact(&mut f);
+                match written {
+                    Err(e) => json!({ "error": e.to_string() }),
+                    Ok(lsn) => {
+                        let fact_copy = f.clone();
+                        let mut rec = st.recent.lock().await;
+                        rec.push_front(fact_copy);
+                        while rec.len() > CAP {
+                            rec.pop_back();
+                        }
+                        st.total.fetch_add(1, Ordering::Relaxed);
+                        json!({ "ok": true, "lsn": lsn, "fact": f })
                     }
-                    st.total.fetch_add(1, Ordering::Relaxed);
-                    json!({ "ok": true, "lsn": lsn, "fact": f })
                 }
-            },
+            }
         }
     };
     (cors(), Json(body))
@@ -294,7 +324,35 @@ async fn main() -> Result<()> {
     )
     .context("abrir quarentena cifrada")?;
 
+    let identity = match (
+        std::env::var("FORGE_GATEWAY_TENANT"),
+        std::env::var("FORGE_GATEWAY_DATASOURCE"),
+        std::env::var("FORGE_GATEWAY_SENSOR"),
+    ) {
+        (Ok(tenant), Ok(datasource), Ok(sensor)) => {
+            heraclitus::hfb2::SecurityIdentity::new(tenant, datasource, sensor)
+                .map_err(|erro| anyhow::anyhow!("identidade do gateway invalida: {erro}"))?
+        }
+        _ => {
+            warn!(
+                "sem FORGE_GATEWAY_TENANT/_DATASOURCE/_SENSOR: os Fatos vao ficar                  gravados com identidade de DEMONSTRACAO, nao operacional"
+            );
+            heraclitus::hfb2::SecurityIdentity::demo("gateway")
+        }
+    };
+
+    let forge_source_id = blake3::hash(
+        std::fs::read_to_string(format!("{db_path}.pub"))
+            .context("ler a chave publica da ancora")?
+            .trim()
+            .as_bytes(),
+    )
+    .to_hex()
+    .to_string();
+
     let state = Arc::new(AppState {
+        identity,
+        forge_source_id,
         recent: Mutex::new(recent),
         total: AtomicU64::new(verified.facts as u64),
         db: Mutex::new(db),
@@ -313,12 +371,33 @@ async fn main() -> Result<()> {
                 tick.tick().await;
                 let line = SAMPLES[i % SAMPLES.len()];
                 i += 1;
-                let of = { st.runner.lock().await.process_observation(line) };
+                let mut db = st.db.lock().await;
+                let contexto = heraclitus::runner::EmissionContext {
+                    identity: &st.identity,
+                    forge_source_id: &st.forge_source_id,
+                    forge_lsn: db.current_lsn + 1,
+                    source_sequence: None,
+                    source_event_id: None,
+                };
+                let of = {
+                    st.runner
+                        .lock()
+                        .await
+                        .process_observation_with_context(line, &contexto)
+                };
+                let of = match of {
+                    Ok(of) => of,
+                    Err(error) => {
+                        error!("normalizacao canonica falhou: {error}");
+                        continue;
+                    }
+                };
                 if let Some(mut f) = of {
-                    if let Err(e) = st.db.lock().await.write_fact(&mut f) {
+                    if let Err(e) = db.write_fact(&mut f) {
                         error!("Erro ao escrever fato: {}", e);
                         continue;
                     }
+                    drop(db);
                     let mut rec = st.recent.lock().await;
                     rec.push_front(f);
                     while rec.len() > CAP {

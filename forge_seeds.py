@@ -19,6 +19,7 @@ base de comparação para avaliar o que o modelo devolve.
 **Não** finge que a API foi chamada: o `forge_ai.available()` continua a
 devolver `False` sem chave, e o pipeline continua a dizer qual caminho usou.
 """
+
 from __future__ import annotations
 
 import _console  # noqa: F401  (consola UTF-8 no Windows)
@@ -34,10 +35,19 @@ NGINX_ACCESS = {
     "vendor": "nginx / Apache (log de acesso combinado)",
     "domain": "web_access",
     "confidence": 0.97,
+    # SPEC-0071 §4.4 — modelo canónico. `category` é a categoria PRIMÁRIA; o
+    # 401 vai para `authentication` e o 403 para `privilege` por decisão do
+    # mapping versionado (rust/crates/heraclitus-security-schema).
+    "security": {
+        "security_schema": "heraclitus-security-event/1.0",
+        "category": "http",
+        "mapping_version": "nginx-access/1.0.0",
+        "required_fields": ["observed_at_micros", "datasource_id", "sensor_id"],
+    },
     "parse": {
         "engine": "regex",
         "pattern": (
-            r'^(?P<src_ip>\S+) \S+ (?P<auth_user>\S+) \[(?P<ts>[^\]]+)\] '
+            r"^(?P<src_ip>\S+) \S+ (?P<auth_user>\S+) \[(?P<ts>[^\]]+)\] "
             r'"(?P<method>[A-Z]+) (?P<path>\S+)[^"]*" '
             r'(?P<status>\d{3}) (?P<bytes>\S+) "(?P<referer>[^"]*)" "(?P<agent>[^"]*)"$'
         ),
@@ -169,6 +179,15 @@ WINDOWS_SECURITY = {
     "vendor": "Microsoft Windows (Security Event Log)",
     "domain": "identity_access",
     "confidence": 0.96,
+    # SPEC-0071 §4.4. Categoria primária `identity`: 4720/4726 são ciclo de
+    # vida de conta. Os 4624/4625 sobrepõem para `authentication` e o 4672
+    # para `privilege`, no mapping versionado.
+    "security": {
+        "security_schema": "heraclitus-security-event/1.0",
+        "category": "identity",
+        "mapping_version": "windows-security/1.0.0",
+        "required_fields": ["observed_at_micros", "datasource_id", "sensor_id"],
+    },
     "parse": {
         "engine": "regex",
         "pattern": (

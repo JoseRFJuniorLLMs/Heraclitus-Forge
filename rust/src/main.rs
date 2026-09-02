@@ -93,8 +93,19 @@ fn main() -> Result<()> {
     info!("[Ingestao] Processando {sample}...");
     let content =
         fs::read_to_string(&sample).with_context(|| format!("Falha ao ler o log {sample}"))?;
+    let identity = heraclitus::hfb2::SecurityIdentity::demo("connector-postgresql");
+    let forge_source_id = blake3::hash(fs::read_to_string(db.pub_path())?.trim().as_bytes())
+        .to_hex()
+        .to_string();
     for raw in content.lines().filter(|l| !l.trim().is_empty()) {
-        match runner.process_observation(raw) {
+        let contexto = heraclitus::runner::EmissionContext {
+            identity: &identity,
+            forge_source_id: &forge_source_id,
+            forge_lsn: db.current_lsn + 1,
+            source_sequence: None,
+            source_event_id: None,
+        };
+        match runner.process_observation_with_context(raw, &contexto)? {
             None => {
                 quarantine
                     .append("connector-file", raw)

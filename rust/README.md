@@ -15,9 +15,10 @@ Forge (Python, design-time)  ──>  .hcx  ──>  Runner + HeraclitusDB (Rust
 | Arquivo | Papel |
 | --- | --- |
 | `src/runner.rs` | Planner (Kahn) + Parser (regex/keyvalue) + Reasoner (regras `.hcx`) + Behavior Engine (janela deslizante). |
-| `src/db.rs` | Append-only `.hdb`, cadeia Merkle rolante BLAKE3 (O(1)/append), `verify()`, detecção de adulteração. |
+| `src/db.rs` | Geração **HDB2**: append-only `.hdb`, cadeia Merkle rolante BLAKE3 (O(1)/append), `verify()` sobre os bytes gravados, âncora Ed25519 atómica. |
 | `src/fact.rs` | Primitivas: UUIDv7, evidence hash BLAKE3, timestamp µs. |
-| `src/fbfact.rs` | Codec binário determinístico **zero-copy** do Fato (FlatBuffers-style; substitui JSON no `.hdb`). |
+| `src/hfb2.rs` | Registo canónico **HFB2**: identidade de segurança autenticada, extensões TLV, folha com separação de domínio. Ver [`md/HDB2-HFB2.md`](../md/HDB2-HFB2.md). |
+| `src/crc32c.rs` | CRC-32C Castagnoli — camada física, deliberadamente separada da criptográfica. |
 | `src/raft.rs` | Replicação Raft orientada a LSN: eleição, `AppendEntries` com `Previous_Merkle_Root`, validação do follower, fast-sync. |
 | `src/main.rs` | Conector PostgreSQL ponta a ponta (bin `connector_postgresql`). |
 | `src/bin/bench.rs` | Benchmark de EPS (bin `bench`). |
@@ -99,20 +100,23 @@ Meta da spec: **> 50.000 EPS** em velocidade de linha.
 | Caminho | EPS | Observação |
 | --- | --- | --- |
 | Runner-only (parse + reason + behavior) | **~87k–150k** | ≥1.74× a meta; este é o "processamento de eventos". |
-| Ponta a ponta (Runner + append durável + integridade) | **~72.000** | com codec binário fbfact (era ~43k com JSON). |
+| Ponta a ponta (Runner + append durável + integridade) | medir com `bench --demo` | um `fsync` e uma assinatura Ed25519 por Fato; `write_batch` amortiza ambos. |
 
-### Serialização zero-copy (`fbfact` vs JSON)
+### Custo do formato
 
-O payload do `.hdb` deixou de ser JSON e passou a um codec binário determinístico
-(layout da IDL FlatBuffers em [`schema/operational_fact.fbs`](schema/operational_fact.fbs);
-o `flatc` não está instalado, então o codec é escrito à mão com o mesmo layout). Ganhos
-medidos pelo `bench`:
+O payload do `.hdb` é um registo binário canónico (HFB2), não JSON. O `bench`
+mede as quatro etapas que interessam — `encode`, `decode`, folha BLAKE3 e
+round-trip de uma extensão desconhecida — além da leitura zero-copy do campo
+`action` (que valida a estrutura e lê `&str` direto do buffer, sem alocar) e do
+`verify()` sobre o banco inteiro:
 
-| Métrica | JSON | fbfact | ganho |
-| --- | --- | --- | --- |
-| Tamanho do payload | 841 B | 459 B | −45% |
-| Ler campo `action` | 344k/s (parse) | **33,7M/s (zero-copy)** | **~98×** |
-| Vazão ponta a ponta | ~43k EPS | **~72k EPS** | +67% |
+```powershell
+cargo run --release --bin bench -- --demo 100000
+```
+
+Os números dependem da máquina; corra-o em vez de citar uma tabela. O que o
+formato garante por construção é que verificar **não** exige desserializar: a
+folha é calculada sobre os bytes persistidos.
 
 O Runner é stateless exceto pelas janelas do Behavior Engine (indexadas por ator),
 então escala quase linearmente no worker-pool lock-free previsto na spec (§2). A

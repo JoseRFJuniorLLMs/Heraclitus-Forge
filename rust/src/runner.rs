@@ -6,6 +6,9 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 
+use heraclitus_security_schema::mapping::MappingSpec;
+use heraclitus_security_schema::model::hash32;
+use heraclitus_security_schema::{from_operational_fact, NormalizationContext, Normalized};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value as Json;
@@ -23,6 +26,21 @@ struct Manifest {
     version: String,
     #[serde(default = "default_schema")]
     schema_version: String,
+    /// Bloco `security:` do manifesto (SPEC-0071 secao 4.4). Ausente = conector
+    /// LEGADO: produz Fatos Operacionais validos e nao produz evento canonico.
+    /// A ausencia nunca autoriza inventar campos canonicos na leitura.
+    #[serde(default)]
+    security: Option<SecurityDeclaration>,
+}
+
+/// O que o artefato declara sobre o modelo canonico de seguranca.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityDeclaration {
+    pub security_schema: String,
+    pub category: String,
+    pub mapping_version: String,
+    pub required_fields: Vec<String>,
 }
 fn default_schema() -> String {
     "v9".into()
@@ -156,6 +174,12 @@ pub struct ReconstitutiveRunner {
     state: HashMap<(String, String), VecDeque<i64>>,
     tpl_re: Regex,
     pub parser_signature: String,
+    /// Digest SHA-256 do `.hcx` **verificado** (`hcx::verify_artifact`). E o
+    /// unico valor confiavel: o `digest=` dentro do `signature.sig` e texto que
+    /// quem adultera o artefato tambem reescreve.
+    connector_digest: [u8; 32],
+    /// Mapping canonico resolvido no load. `None` = conector legado.
+    security: Option<(SecurityDeclaration, &'static MappingSpec)>,
 }
 
 fn yaml_to_string(v: &serde_yaml::Value) -> String {
@@ -170,6 +194,20 @@ fn yaml_to_string(v: &serde_yaml::Value) -> String {
 impl ReconstitutiveRunner {
     pub fn load(artifact_path: &str) -> Result<Self, crate::error::HeraclitusError> {
         let dir = Path::new(artifact_path);
+        let trust_root = crate::hcx::resolve_trust_root(dir)?;
+        Self::load_with_trust_root(dir, &trust_root)
+    }
+
+    /// Carrega um `.hcx` usando uma trust root explicita. A assinatura e o
+    /// digest sao verificados antes da primeira leitura de YAML.
+    pub fn load_with_trust_root(
+        dir: &Path,
+        trust_root: &Path,
+    ) -> Result<Self, crate::error::HeraclitusError> {
+        let digest_hex = crate::hcx::verify_artifact(dir, trust_root)?;
+        let connector_digest = hash32::from_hex(&digest_hex, None).map_err(|erro| {
+            crate::error::HeraclitusError::ArtifactError(format!("digest do .hcx invalido: {erro}"))
+        })?;
         let read = |name: &str| -> Result<String, crate::error::HeraclitusError> {
             std::fs::read_to_string(dir.join(name)).map_err(|_| {
                 crate::error::HeraclitusError::ArtifactError(format!(
@@ -254,8 +292,63 @@ impl ReconstitutiveRunner {
         }
 
         // --- read signature ---
-        let signature_file = read("signature.sig").unwrap_or_else(|_| "unsigned".to_string());
-        let parser_signature = signature_file.trim().to_string();
+        // Finais de linha canonizados para LF, pela mesma razao que o digest do
+        // `.hcx` o faz (ver `hcx::canonical_file_bytes`): o Git materializa o
+        // mesmo blob como CRLF no Windows e LF no Linux, e sem isto o MESMO
+        // artefato produzia Fatos diferentes conforme o sistema — o que quebra
+        // qualquer comparacao byte a byte a jusante.
+        let signature_file = read("signature.sig")?;
+        let parser_signature = signature_file
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .trim()
+            .to_string();
+
+        // --- modelo canonico: resolvido no LOAD, nunca por observacao ---
+        // Um artefato que declare um mapping que este binario nao tem, ou que
+        // discorde do mapping publicado, impede o datasource de iniciar. Falhar
+        // aqui e barato; falhar na milesima linha, em producao, nao e.
+        let security = match manifest.security {
+            None => None,
+            Some(declaration) => {
+                let expected = heraclitus_security_schema::SCHEMA_VERSION;
+                if declaration.security_schema != expected {
+                    return Err(crate::error::HeraclitusError::ArtifactError(format!(
+                        "{}: declara o schema canonico {:?}; este runtime implementa {expected:?}",
+                        manifest.id, declaration.security_schema
+                    )));
+                }
+                let mapping =
+                    heraclitus_security_schema::mapping::mapping(&declaration.mapping_version)
+                        .map_err(|erro| {
+                            crate::error::HeraclitusError::ArtifactError(format!(
+                                "{}: {erro}",
+                                manifest.id
+                            ))
+                        })?;
+                if !mapping.accepts_manifest(&manifest.id) {
+                    return Err(crate::error::HeraclitusError::ArtifactError(format!(
+                        "{}: o mapping {} pertence ao conector {:?}",
+                        manifest.id, declaration.mapping_version, mapping.connector
+                    )));
+                }
+                if mapping.primary_category.as_str() != declaration.category {
+                    return Err(crate::error::HeraclitusError::ArtifactError(format!(
+                        "{}: categoria primaria diverge — artefato diz {:?}, mapping diz {:?}",
+                        manifest.id,
+                        declaration.category,
+                        mapping.primary_category.as_str()
+                    )));
+                }
+                if mapping.required_fields != declaration.required_fields {
+                    return Err(crate::error::HeraclitusError::ArtifactError(format!(
+                        "{}: required_fields divergem entre artefato e mapping",
+                        manifest.id
+                    )));
+                }
+                Some((declaration, mapping))
+            }
+        };
 
         Ok(Self {
             manifest_id: manifest.id,
@@ -271,7 +364,27 @@ impl ReconstitutiveRunner {
             tpl_re: Regex::new(r"\$\{(\w+)\}")
                 .map_err(|e| crate::error::HeraclitusError::ArtifactError(e.to_string()))?,
             parser_signature,
+            connector_digest,
+            security,
         })
+    }
+
+    /// Digest SHA-256 do `.hcx` verificado. E o que liga um evento canonico ao
+    /// conteudo exato que o produziu (gate CM1).
+    pub fn connector_digest(&self) -> [u8; 32] {
+        self.connector_digest
+    }
+
+    /// Mapping canonico deste artefato, se ele declarar um.
+    pub fn mapping_version(&self) -> Option<&str> {
+        self.security
+            .as_ref()
+            .map(|(declaration, _)| declaration.mapping_version.as_str())
+    }
+
+    /// `true` quando o artefato e legado (sem bloco `security:`).
+    pub fn is_legacy_connector(&self) -> bool {
+        self.security.is_none()
     }
 
     pub fn plan_str(&self) -> String {
@@ -424,6 +537,86 @@ impl ReconstitutiveRunner {
             "fact.reasoning_version": "reasoner-core-v6.0",
             "fact.ontology_version": self.schema_version.clone(),
         }))
+    }
+}
+
+/// O que o Runner nao pode saber sozinho: de quem e a fonte, onde e que o Fato
+/// vai cair no log, e como se volta a ele.
+///
+/// O Runner observa; quem sabe isto e o supervisor. Passar por parametro em vez
+/// de configurar no Runner e o que impede um datasource de herdar a identidade
+/// de outro quando ambos partilham o mesmo artefato.
+#[derive(Debug, Clone)]
+pub struct EmissionContext<'a> {
+    pub identity: &'a crate::hfb2::SecurityIdentity,
+    /// BLAKE3 da chave publica da ancora do `.hdb` — identifica a origem.
+    pub forge_source_id: &'a str,
+    /// LSN que este Fato VAI ocupar. O chamador confirma-o depois da escrita.
+    pub forge_lsn: u64,
+    /// Posicao na sequencia da propria fonte (offset, EventRecordID, cursor).
+    /// `None` quando o adapter nao tem uma — nao se inventa um contador.
+    pub source_sequence: Option<&'a str>,
+    pub source_event_id: Option<&'a str>,
+}
+
+impl ReconstitutiveRunner {
+    /// Observacao bruta -> Fato Operacional **com** identidade de datasource e,
+    /// quando o artefato o declara, o evento canonico em `fact.security`.
+    ///
+    /// Tres resultados distintos, e a distincao importa:
+    ///   * `Ok(None)`      — Schema Drift: nenhuma regra casou. Vai a quarentena.
+    ///   * `Ok(Some(f))`   — Fato pronto a gravar.
+    ///   * `Err(_)`        — violacao de contrato do artefato. Nao e um problema
+    ///     desta linha, e do conector: falha fechado para que o datasource pare
+    ///     em vez de degradar em silencio.
+    pub fn process_observation_with_context(
+        &mut self,
+        raw: &str,
+        context: &EmissionContext,
+    ) -> Result<Option<Json>, crate::error::HeraclitusError> {
+        let Some(mut fact) = self.process_observation(raw) else {
+            return Ok(None);
+        };
+        context.identity.apply(&mut fact);
+
+        let Some((declaration, mapping)) = self.security.as_ref() else {
+            // Conector legado (gate CM2): Fato valido, sem evento canonico.
+            return Ok(Some(fact));
+        };
+
+        let ingested = fact["fact.time"]["system_timestamp"].as_i64().unwrap_or(0);
+        let normalization = NormalizationContext {
+            tenant_id: &context.identity.tenant_id,
+            datasource_id: &context.identity.datasource_id,
+            sensor_id: &context.identity.sensor_id,
+            source_sequence: context.source_sequence,
+            // Um salto do relogio para tras entre a ingestao e a normalizacao
+            // derrubaria um evento valido; a normalizacao nunca acontece antes
+            // da ingestao, por construcao.
+            normalized_at_micros: fact::now_micros()?.max(ingested),
+            forge_source_id: context.forge_source_id,
+            forge_lsn: context.forge_lsn,
+            source_event_id: context.source_event_id,
+            connector_digest: self.connector_digest,
+        };
+
+        match from_operational_fact(&fact, mapping, &normalization) {
+            Ok(Normalized::Event(event)) => {
+                fact["fact.security"] = serde_json::to_value(&*event).map_err(|erro| {
+                    crate::error::HeraclitusError::FactEncodingError(erro.to_string())
+                })?;
+            }
+            // Ruido operacional do servico: ha Fato e nao ha evento de
+            // seguranca. Enfia-lo numa categoria seria inventar significado.
+            Ok(Normalized::NotSecurityRelevant { .. }) => {}
+            Err(erro) => {
+                return Err(crate::error::HeraclitusError::ArtifactError(format!(
+                    "{}: normalizacao canonica falhou ({}): {erro}",
+                    self.manifest_id, declaration.mapping_version
+                )))
+            }
+        }
+        Ok(Some(fact))
     }
 }
 
@@ -599,5 +792,36 @@ mod tests {
             of.is_none(),
             "linha desconhecida deveria cair em Schema Drift (None)"
         );
+    }
+
+    #[test]
+    fn runner_rejects_tampered_artifact_before_parsing_yaml() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let copy = temp.path().join("v1.1.0.hcx");
+        copy_dir(Path::new(ARTIFACT), &copy).expect("copiar artefato");
+        let architecture = copy.join("architecture.yaml");
+        let mut bytes = std::fs::read(&architecture).expect("ler architecture");
+        bytes[0] ^= 1;
+        std::fs::write(&architecture, bytes).expect("adulterar architecture");
+        let trust_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../registry/publisher.pub");
+
+        let error = ReconstitutiveRunner::load_with_trust_root(&copy, &trust_root)
+            .err()
+            .expect("runner deve falhar fechado");
+        assert!(error.to_string().contains("adulterado"));
+    }
+
+    fn copy_dir(source: &Path, destination: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let target = destination.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_dir(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), target)?;
+            }
+        }
+        Ok(())
     }
 }

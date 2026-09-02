@@ -27,7 +27,11 @@ use std::process::ExitCode;
 /// Versao do envelope JSONL consumido por `bridge.py`. Alteracoes
 /// incompatíveis exigem um novo numero; o consumidor recusa versoes
 /// desconhecidas antes de escrever qualquer evento no destino.
-const BRIDGE_CONTRACT_VERSION: &str = "forge-heraclitusdb/1";
+/// Versao 2: uma linha do JSONL deixou de ser sempre um Fato. O log passou a
+/// carregar tambem eventos de Telemetry Health, e cada linha diz o que e em
+/// `record_type`. Mudar a forma do envelope sem mudar o numero seria
+/// exatamente o que o numero existe para impedir.
+const BRIDGE_CONTRACT_VERSION: &str = "forge-heraclitusdb/2";
 const FACT_SCHEMA_VERSION: &str = "operational-fact/1.0";
 const DESTINATION_API_VERSION: &str = "heraclitus.v1";
 
@@ -91,7 +95,10 @@ fn main() -> ExitCode {
     };
     let snapshot_path = snapshot_dir.path().join("source.hdb");
     let snapshot = snapshot_path.to_string_lossy().to_string();
-    for ext in ["", ".anchor", ".anchor.sig", ".pub"] {
+    // No HDB2 a raiz, o LSN e a assinatura vivem num unico `.anchor` atomico:
+    // com dois ficheiros existia um estado intermedio em que a raiz era nova e
+    // a assinatura velha, e o banco reabria a acusar adulteracao.
+    for ext in ["", ".anchor", ".pub"] {
         let src = format!("{db_path}{ext}");
         let dst = format!("{snapshot}{ext}");
         if let Err(e) = fs::copy(&src, &dst) {
@@ -122,10 +129,12 @@ fn main() -> ExitCode {
         .unwrap_or_default()
         .trim()
         .to_string();
-    let anchor_signature = fs::read_to_string(format!("{snapshot}.anchor.sig"))
+    // A assinatura Ed25519 e um campo do ficheiro de ancora (`sig=<hex>`).
+    let anchor_signature = fs::read_to_string(format!("{snapshot}.anchor"))
         .unwrap_or_default()
-        .trim()
-        .to_string();
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("sig=").map(str::to_owned))
+        .unwrap_or_default();
     let source_id = blake3::hash(public_key.as_bytes()).to_hex().to_string();
     let attestation = serde_json::json!({
         "status": "INTEG_OK",
@@ -146,13 +155,29 @@ fn main() -> ExitCode {
     let mut emitted: u64 = 0;
     let mut write_err: Option<std::io::Error> = None;
 
-    let stats = match heraclitus::db::export_facts(&snapshot, from_lsn, |lsn, fact| {
-        let line = serde_json::json!({
+    let stats = match heraclitus::db::export_records(&snapshot, from_lsn, |lsn, record| {
+        let mut line = serde_json::json!({
             "contract_version": BRIDGE_CONTRACT_VERSION,
             "lsn": lsn,
-            "fact": fact,
+            "record_type": record.record_type(),
             "attestation": attestation.clone()
         });
+        match record {
+            heraclitus::db::ExportedRecord::Fact(fact) => line["fact"] = fact,
+            heraclitus::db::ExportedRecord::TelemetryHealth { identity, envelope } => {
+                // O envelope viaja como TEXTO, tal como foi gravado e coberto
+                // pela folha: reserializar aqui daria outros bytes e a ponte
+                // deixaria de poder afirmar que entregou o que estava no disco.
+                line["telemetry"] = serde_json::json!({
+                    "envelope": envelope,
+                    "identity": {
+                        "tenant_id": identity.tenant_id,
+                        "datasource_id": identity.datasource_id,
+                        "sensor_id": identity.sensor_id,
+                    }
+                });
+            }
+        }
         // `serde_json::to_writer` + '\n': JSONL estrito, sem indentação.
         if let Err(e) = serde_json::to_writer(&mut out, &line).map_err(std::io::Error::from) {
             write_err = Some(e);
@@ -191,6 +216,7 @@ fn main() -> ExitCode {
             "exported":    stats.exported,
             "torn":        stats.torn,
             "undecodable": stats.undecodable,
+            "skipped":     stats.skipped,
             "last_lsn":    stats.last_lsn,
             "integrity":   "INTEG_OK",
             "contract_version": BRIDGE_CONTRACT_VERSION,
@@ -203,6 +229,17 @@ fn main() -> ExitCode {
     // com código 3 para que um pipeline os apanhe sem ter de parsear o stderr.
     if stats.torn > 0 || stats.undecodable > 0 {
         return ExitCode::from(3);
+    }
+    // Registos integros de um tipo desconhecido nao sao corrupcao, mas tambem
+    // nao foram entregues. Dize-lo em voz alta: perda silenciosa nao existe.
+    if stats.skipped > 0 {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "warning": "registos de tipo desconhecido nao exportados",
+                "skipped": stats.skipped
+            })
+        );
     }
     ExitCode::SUCCESS
 }

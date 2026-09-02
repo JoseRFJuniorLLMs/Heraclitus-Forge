@@ -1,0 +1,44 @@
+# Configuração do gitleaks para o Heraclitus-Forge.
+#
+# O `.gitleaksignore` fixa achados por *commit*, o que obriga a acrescentar uma
+# linha nova sempre que um artefato é reassinado. Estas exceções são por
+# CAMINHO, porque a razão de elas existirem não muda com o commit: são todas
+# material público por desenho.
+#
+# A chave PRIVADA de publicação nunca entra no repositório — vive em
+# `~/.heraclitus/publisher.key`, fora da árvore, precisamente para que um
+# `git add -A` distraído não a possa apanhar (ver `forge_sign.py`).
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+  description = """
+  Assinaturas `.hcx` do registry: `signature.sig` contém a chave PÚBLICA
+  Ed25519 (`key=`), o digest do artefato e a assinatura (`sig=`). A pública é a
+  âncora de confiança e está versionada de propósito em `registry/publisher.pub`
+  — publicá-la é o objetivo, não um acidente.
+  """
+  paths = [
+    '''registry/.*/signature\.sig''',
+    '''registry/publisher\.pub''',
+  ]
+
+  [[rules.allowlists]]
+  description = """
+  Golden fixtures do modelo canónico: cada evento embute o `parser_signature`,
+  que é o envelope `signature.sig` do artefato que o produziu. É o mesmo
+  material público acima, agora dentro do fixture que prova a proveniência.
+  """
+  paths = [
+    '''rust/tests/golden/.*\.json''',
+  ]
+
+  [[rules.allowlists]]
+  description = "Anotação de tipo histórica em forge_sign.py; não é credencial."
+  paths = [
+    '''forge_sign\.py''',
+  ]

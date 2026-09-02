@@ -1,0 +1,188 @@
+{
+  "connector": "linux_sshd",
+  "artifact": "v1.1.0.hcx",
+  "connector_digest": "9acd2f261c9f56d00c4602c7e09a2aa42d1827d87d385858ec7d5790ed829cc6",
+  "mapping_version": "linux-sshd/1.0.0",
+  "cases": [
+    {
+      "input": "Aug  6 10:00:01 srv01 sshd[2000]: Failed password for deploy from 203.0.113.45 port 40000 ssh2",
+      "expect_action": "authentication.failure",
+      "canonical_digest": "ad53eb9648ca48c0b6a183914bf43cb9a3edd66a2c766eafaba8b7add5ca8b72",
+      "event": {
+        "schema_version": "heraclitus-security-event/1.0",
+        "category": "authentication",
+        "event_type": "authentication.failure",
+        "outcome": "failure",
+        "severity": 7,
+        "observed_at_micros": 1782782405000000,
+        "ingested_at_micros": 1782782405000000,
+        "normalized_at_micros": 1782782405001000,
+        "tenant_id": "tenant-demo",
+        "datasource_id": "fixture://linux_sshd",
+        "sensor_id": "forge-golden-fixture",
+        "source_sequence": "0",
+        "actor": {
+          "kind": "user",
+          "id": "deploy",
+          "name": "deploy",
+          "domain": null
+        },
+        "target": {
+          "kind": "host",
+          "id": "srv01",
+          "name": null,
+          "domain": null
+        },
+        "source": {
+          "address": "203.0.113.45",
+          "port": null,
+          "hostname": null
+        },
+        "destination": null,
+        "extensions": {
+          "heraclitus.behavior_class": "credential_attack",
+          "heraclitus.confidence_permille": 984,
+          "heraclitus.observed_at_source": "ingest_fallback",
+          "heraclitus.risk_level": "High"
+        },
+        "provenance": {
+          "forge_source_id": "5f3c9d2b7a1e48606f9d0c3b2a1e4860e5f3c9d2b7a1e48606f9d0c3b2a1e4860",
+          "forge_lsn": 1,
+          "source_event_id": "linux_sshd:0",
+          "raw_observation_hash": "9611cd00b8f1a5b1ec45cbb9cdd61a9cd774c7e7c6b9a899e149d2ad005ab79c",
+          "connector_id": "br.gov.heraclitus.pipelines.linux_sshd-v1.1.0",
+          "connector_version": "1.1.0",
+          "connector_digest": "9acd2f261c9f56d00c4602c7e09a2aa42d1827d87d385858ec7d5790ed829cc6",
+          "parser_signature": "format=hcx-v3\nalg=ed25519\nkey=5254bdb1261e7920294193841cc0f0a2cd0fe030f1c6840ce32b27c531d1fe1c\ndigest=9acd2f261c9f56d00c4602c7e09a2aa42d1827d87d385858ec7d5790ed829cc6\nsig=85887469bbe9104344f363809b6323ea52a0f14da3360e71ec8794ceb65e1c3727727130cdcc1e75a536363c562bf315838028693ec8e9bb1ede0d0ddaea1e05",
+          "matched_rule": "ssh_auth_failure",
+          "transformation_steps": [
+            "parse",
+            "normalize",
+            "behavior",
+            "emit"
+          ]
+        }
+      }
+    },
+    {
+      "input": "Aug  6 10:00:10 srv01 sshd[2100]: Accepted password for admin from 10.0.0.5 port 41000 ssh2",
+      "expect_action": "authentication.success",
+      "canonical_digest": "50a9d5d10cd1132ae19203b9df800a3aea40dbf7d65a2c2d688af28951c5fe3a",
+      "event": {
+        "schema_version": "heraclitus-security-event/1.0",
+        "category": "authentication",
+        "event_type": "authentication.success",
+        "outcome": "success",
+        "severity": 2,
+        "observed_at_micros": 1782782405000000,
+        "ingested_at_micros": 1782782405000000,
+        "normalized_at_micros": 1782782405001000,
+        "tenant_id": "tenant-demo",
+        "datasource_id": "fixture://linux_sshd",
+        "sensor_id": "forge-golden-fixture",
+        "source_sequence": "1",
+        "actor": {
+          "kind": "user",
+          "id": "admin",
+          "name": "admin",
+          "domain": null
+        },
+        "target": {
+          "kind": "host",
+          "id": "srv01",
+          "name": null,
+          "domain": null
+        },
+        "source": {
+          "address": "10.0.0.5",
+          "port": null,
+          "hostname": null
+        },
+        "destination": null,
+        "extensions": {
+          "heraclitus.behavior_class": "session",
+          "heraclitus.confidence_permille": 984,
+          "heraclitus.observed_at_source": "ingest_fallback",
+          "heraclitus.risk_level": "Low"
+        },
+        "provenance": {
+          "forge_source_id": "5f3c9d2b7a1e48606f9d0c3b2a1e4860e5f3c9d2b7a1e48606f9d0c3b2a1e4860",
+          "forge_lsn": 2,
+          "source_event_id": "linux_sshd:1",
+          "raw_observation_hash": "eeef76a8015324090303c22bc25a9f68bd269acfd309a69d707ca0cd29b6d1fa",
+          "connector_id": "br.gov.heraclitus.pipelines.linux_sshd-v1.1.0",
+          "connector_version": "1.1.0",
+          "connector_digest": "9acd2f261c9f56d00c4602c7e09a2aa42d1827d87d385858ec7d5790ed829cc6",
+          "parser_signature": "format=hcx-v3\nalg=ed25519\nkey=5254bdb1261e7920294193841cc0f0a2cd0fe030f1c6840ce32b27c531d1fe1c\ndigest=9acd2f261c9f56d00c4602c7e09a2aa42d1827d87d385858ec7d5790ed829cc6\nsig=85887469bbe9104344f363809b6323ea52a0f14da3360e71ec8794ceb65e1c3727727130cdcc1e75a536363c562bf315838028693ec8e9bb1ede0d0ddaea1e05",
+          "matched_rule": "ssh_auth_success",
+          "transformation_steps": [
+            "parse",
+            "normalize",
+            "behavior",
+            "emit"
+          ]
+        }
+      }
+    },
+    {
+      "input": "Aug  6 10:00:22 srv01 sshd[2200]: Invalid user oracle from 198.51.100.7 port 42000",
+      "expect_action": "authentication.invalid_user",
+      "canonical_digest": "6b2bc56704cecf1856be88079521d87c6b9add610f41c6b321c4861de6e5f100",
+      "event": {
+        "schema_version": "heraclitus-security-event/1.0",
+        "category": "authentication",
+        "event_type": "authentication.invalid_user",
+        "outcome": "failure",
+        "severity": 4,
+        "observed_at_micros": 1782782405000000,
+        "ingested_at_micros": 1782782405000000,
+        "normalized_at_micros": 1782782405001000,
+        "tenant_id": "tenant-demo",
+        "datasource_id": "fixture://linux_sshd",
+        "sensor_id": "forge-golden-fixture",
+        "source_sequence": "2",
+        "actor": {
+          "kind": "user",
+          "id": "oracle",
+          "name": "oracle",
+          "domain": null
+        },
+        "target": {
+          "kind": "host",
+          "id": "srv01",
+          "name": null,
+          "domain": null
+        },
+        "source": {
+          "address": "198.51.100.7",
+          "port": null,
+          "hostname": null
+        },
+        "destination": null,
+        "extensions": {
+          "heraclitus.behavior_class": "reconnaissance",
+          "heraclitus.confidence_permille": 984,
+          "heraclitus.observed_at_source": "ingest_fallback",
+          "heraclitus.risk_level": "Medium"
+        },
+        "provenance": {
+          "forge_source_id": "5f3c9d2b7a1e48606f9d0c3b2a1e4860e5f3c9d2b7a1e48606f9d0c3b2a1e4860",
+          "forge_lsn": 3,
+          "source_event_id": "linux_sshd:2",
+          "raw_observation_hash": "adacc056c181498289d1d7efa9c89660dfa527f78eca2a21fc1c405f919fd380",
+          "connector_id": "br.gov.heraclitus.pipelines.linux_sshd-v1.1.0",
+          "connector_version": "1.1.0",
+          "connector_digest": "9acd2f261c9f56d00c4602c7e09a2aa42d1827d87d385858ec7d5790ed829cc6",
+          "parser_signature": "format=hcx-v3\nalg=ed25519\nkey=5254bdb1261e7920294193841cc0f0a2cd0fe030f1c6840ce32b27c531d1fe1c\ndigest=9acd2f261c9f56d00c4602c7e09a2aa42d1827d87d385858ec7d5790ed829cc6\nsig=85887469bbe9104344f363809b6323ea52a0f14da3360e71ec8794ceb65e1c3727727130cdcc1e75a536363c562bf315838028693ec8e9bb1ede0d0ddaea1e05",
+          "matched_rule": "ssh_invalid_user",
+          "transformation_steps": [
+            "parse",
+            "normalize",
+            "behavior",
+            "emit"
+          ]
+        }
+      }
+    }
+  ]
+}

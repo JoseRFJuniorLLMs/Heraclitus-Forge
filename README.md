@@ -1,6 +1,6 @@
 # Heraclitus-Forge
 
-O Heraclitus-Forge 1.0 transforma logs em **Fatos Operacionais** determinísticos,
+O Heraclitus-Forge 2.0 transforma logs em **Fatos Operacionais** determinísticos,
 assina a cadeia de custódia na borda e envia os fatos ao HeraclitusDB sem
 duplicação. O runtime de ingestão é Rust; compilação de conectores, CKE e a ponte
 gRPC são ferramentas Python fora do caminho crítico.
@@ -10,9 +10,16 @@ gRPC são ferramentas Python fora do caminho crítico.
 - O Forge recebe observações por arquivo/conector ou pelo `gateway /ingest`.
   Um coletor do órgão ainda é necessário para acompanhar journald, Event Log,
   PostgreSQL ou outra fonte em tempo real.
-- O `.hdb` da borda usa blocos `HERA`/`FACT`, CRC-32C, cadeia BLAKE3 e âncora
-  Ed25519. O HeraclitusDB em rede usa segmentos `HRKL`/`HFTR`. Os formatos não
-  são intercambiáveis; `export_facts` + `bridge.py` é a fronteira oficial.
+- O `.hdb` da borda está na geração **HDB2**: blocos `FCT2` com registos
+  canónicos `HFB2`, CRC-32C na camada física e folha BLAKE3 com separação de
+  domínio + âncora Ed25519 na camada criptográfica. Ficheiros da geração
+  anterior (HDB1) são **recusados por nome**, sem migração automática — ver
+  [md/HDB2-HFB2.md](md/HDB2-HFB2.md). O HeraclitusDB em rede usa segmentos
+  `HRKL`/`HFTR`; os formatos não são intercambiáveis e `export_facts` +
+  `bridge.py` é a fronteira oficial.
+- `tenant_id`, `datasource_id` e `sensor_id` são campos autenticados de todo o
+  registo, não metadados opcionais: alterá-los muda a folha e a raiz Merkle. Não
+  existe valor por omissão para eles, e o ingestor recusa arrancar sem os três.
 - O log bruto não é copiado para o banco central. Fatos fora do schema vão para
   quarentena XChaCha20-Poly1305 autenticada.
 
@@ -28,7 +35,7 @@ fonte/collector -> Runner Rust -> .hdb assinado -> export_facts
 
 O contrato está em [INTEGRATION_CONTRACT.md](INTEGRATION_CONTRACT.md):
 
-- Forge `1.0.x`;
+- Forge `2.0.x`;
 - HeraclitusDB/SDK `1.0.5`;
 - envelope `forge-heraclitusdb/1`;
 - Fato `operational-fact/1.0`;
@@ -49,8 +56,93 @@ python forge_sign.py verify-all
 python forge_sign.py verify registry\postgresql\v1.2.0.hcx
 ```
 
-Conectores atualmente homologados no registry: PostgreSQL `1.0.0`–`1.2.0` e
-Linux SSHD `1.0.0`–`1.1.0`.
+O Runner Rust repete essa verificação antes de interpretar YAML ou compilar
+regex. Por padrão ele encontra `publisher.pub` no registry ancestral; pacotes
+instalados noutro layout devem fixar a trust root explicitamente:
+
+```powershell
+$env:HERACLITUS_PUBLISHER_PUB = "C:\ProgramData\Heraclitus\trust\publisher.pub"
+```
+
+Assinatura ausente, chave diferente, digest divergente, selo legado ou link
+simbólico dentro do pacote impedem o datasource de iniciar.
+
+Conectores atualmente homologados no registry: PostgreSQL `1.0.0`–`1.2.0`,
+Linux SSHD `1.0.0`–`1.1.0`, nginx/Apache `1.0.0` e Windows Security `1.0.0`.
+
+O inventário executável do baseline lista todos os binários, adapters e `.hcx`,
+vinculados aos commits do Forge e do HeraclitusDB:
+
+```powershell
+python tools\forge_inventory.py --check
+```
+
+## Modelo canónico de segurança
+
+Um Fato Operacional diz o que aconteceu naquela fonte. Correlacionar quatro
+fontes exige que "falha de autenticação" signifique a mesma coisa nas quatro —
+é isso o `heraclitus-security-event/1.0` (SPEC-0071 §4), definido em
+[rust/crates/heraclitus-security-schema](rust/crates/heraclitus-security-schema).
+
+O crate tem tipos, validação, canonicalização e os **mappings versionados**.
+Não tem rede, armazenamento, IA nem parsing de vendor: pode ser auditado
+isolado. O contrato para quem não é Rust é o
+[`security_event.proto`](rust/crates/heraclitus-security-schema/schema/security_event.proto),
+mantido alinhado com o modelo por um teste de paridade.
+
+O `.hcx` declara a que modelo pertence e qual mapping o traduz:
+
+```yaml
+security:
+  security_schema: heraclitus-security-event/1.0
+  category: identity            # categoria PRIMÁRIA; as ações sobrepõem-na
+  mapping_version: windows-security/1.0.0
+  required_fields:
+  - observed_at_micros
+  - datasource_id
+  - sensor_id
+```
+
+**Compatibilidade.** `operational-fact/1.0` não mudou. Um `.hcx` sem bloco
+`security:` é um conector legado: produz Fatos válidos e não produz eventos
+canónicos — e a ausência nunca autoriza inventar campos canónicos na leitura.
+`postgresql/v1.1.0` continua publicado exatamente assim, de propósito.
+
+**Não inventar.** Campo que a fonte não observou sai `null`. O `-` do log
+combinado e o `IpAddress=-` do Windows são ausência, não identidade. Ação que o
+mapping não declara é erro, não um valor por omissão. `log.info` e `log.unknown`
+são ruído operacional: continuam a ser Fatos e não viram evento de segurança.
+
+**Limite conhecido.** O Fato `1.0` ainda só carrega o instante de *ingestão*: o
+parser extrai o carimbo da linha e não o emite. Por isso `observed_at_micros` é
+hoje uma aproximação, e diz-o em `extensions["heraclitus.observed_at_source"] =
+"ingest_fallback"`. Emitir o carimbo da fonte é trabalho do Fabric (Marco 2) —
+até lá, a deteção de clock skew não tem base para funcionar, e o evento não
+finge que tem.
+
+Os golden fixtures em [rust/tests/golden](rust/tests/golden) gravam o evento
+canónico de cada caso da `test_matrix.json` dos quatro conectores, produzido
+pelo Runner real sobre o artefato assinado. Republicar um conector muda o
+`connector_digest` e, portanto, o golden:
+
+```powershell
+cd rust
+$env:UPDATE_GOLDEN = "1"; cargo test --test canonical_golden   # e REVER o diff
+```
+
+**Ligado ao caminho quente.** O Runner resolve o mapping no load do `.hcx` — um
+artefato que declare um mapping inexistente, de outro conector, ou com categoria
+ou `required_fields` divergentes, **impede o datasource de iniciar** — e emite
+`fact.security` junto com o Fato. O registo HFB2 autentica-o: alterar o evento
+muda a folha BLAKE3. `ingest`, `probe` e `gateway` são os emissores.
+
+A identidade (`tenant_id`, `datasource_id`, `sensor_id`) vem do supervisor, não
+do conteúdo do log, e o `forge_lsn` do evento é confirmado contra o LSN que a
+escrita devolveu: se divergirem, o ingestor pára em vez de gravar uma cadeia de
+custódia que não se sustenta.
+
+A ponte valida o evento e recusa um que descreva outra observação, outra regra
+ou outro conector.
 
 ## Instalação reproduzível
 
@@ -91,7 +183,8 @@ cd windows
 .orge-ingest-service.ps1 install `
     -Source   C:\logs
 ginxccess.log `
-    -Artifact D:\DEV\Heraclitus-Forgeegistry
+    -Artifact D:\DEV\Heraclitus-Forge
+egistry
 ginx_access
 
 .orge-ingest-service.ps1 status    # estado, conta, fonte, destino
@@ -123,12 +216,21 @@ $env:FORGE_QUARANTINE_KEY = "<64 caracteres hex>"
 
 # segue o ficheiro ao vivo, como um tail -f
 cargo run --release --bin ingest -- C:\logs\postgresql.log `
+    --tenant gov.br/orgao-a --datasource "postgresql://db-01/postgresql.log" `
+    --sensor forge-edge-01 `
     --artifact ..\registry\postgresql --db producao.hdb --follow
 
 # ou processa o que houver e sai (bom para agendar)
 cargo run --release --bin ingest -- amostra.log `
+    --tenant gov.br/orgao-a --datasource "sshd://bastion-01/auth.log" `
+    --sensor forge-edge-01 `
     --artifact ..\registry\linux_sshd --db producao.hdb --from-start --once
 ```
+
+`--tenant`, `--datasource` e `--sensor` são **obrigatórios** e não têm valor por
+omissão: viajam autenticados em cada registo, e um deles adivinhado seria uma
+falha de isolamento gravada de forma indelével na cadeia de custódia. O
+`--datasource` identifica a fonte — não é o caminho do ficheiro.
 
 O `ingest` **abre** o `.hdb` existente (recupera LSN e cadeia Merkle), nunca
 apaga e nunca adultera. Retoma de onde ficou por um sidecar `<db>.ingest-state`,

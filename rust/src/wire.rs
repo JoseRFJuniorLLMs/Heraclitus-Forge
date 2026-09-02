@@ -160,7 +160,8 @@ mod tests {
             "fact.identity": {"actor.id":"a","actor.name":"a","target.id":"t","source.ip":null},
             "fact.time": {"system_timestamp": 1_782_467_794_979_937i64, "log_sequence_number": 0u64},
             "fact.behavior": {"class":"c","action":action,"risk_level":"Medium"},
-            "fact.evidence": {"raw_observation_hash":"b3:abcd","carimbo_tempo_legal":"icp"},
+            "fact.datasource": {"tenant_id":"tenant-teste","datasource_id":"teste://fixture","sensor_id":"sensor-teste"},
+            "fact.evidence": {"raw_observation_hash":"b3:abababababababababababababababababababababababababababababababab","carimbo_tempo_legal":"icp"},
             "fact.lineage": {"transformation_steps":["parse"],"input_source":"pg","matched_rule":"r"},
             "fact.confidence": 0.9,
             "fact.knowledge_version":"k","fact.reasoning_version":"r","fact.ontology_version":"v9"

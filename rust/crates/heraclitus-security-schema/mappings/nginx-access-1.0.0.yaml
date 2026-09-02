@@ -1,0 +1,39 @@
+# nginx / Apache (log de acesso combinado) -> heraclitus-security-event/1.0
+mapping_version: nginx-access/1.0.0
+security_schema: heraclitus-security-event/1.0
+connector: nginx_access
+primary_category: http
+required_fields:
+  - observed_at_micros
+  - datasource_id
+  - sensor_id
+observed_at:
+  source: ingest_fallback
+identity:
+  actor_kind: user
+  target_kind: resource
+  # No formato combinado, "-" significa campo AUSENTE. Emitir um ator chamado
+  # "-" seria inventar uma identidade que a fonte nunca observou.
+  absent_markers:
+    - "-"
+severity_by_risk:
+  Low: 2
+  Medium: 4
+  High: 7
+  Critical: 9
+actions:
+  authentication.failure:
+    category: authentication
+    outcome: failure
+  authorization.failure:
+    category: privilege
+    outcome: failure
+  resource.missing:
+    outcome: failure
+  service.error:
+    outcome: failure
+  data.access:
+    outcome: success
+  log.unknown:
+    # 3xx e tudo o que as regras nao cobrem.
+    security_relevant: false

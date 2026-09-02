@@ -31,6 +31,16 @@ CONNECTOR_PROFILES = {
         "vendor": "PostgreSQL Global Development Group",
         "domain": "database_security",
         "confidence": 0.972,
+        # SPEC-0071 §4.4 — declaracao do modelo canonico. `category` e a
+        # categoria PRIMARIA do conector: as acoes que pertencem a outra (uma
+        # falha de autenticacao, uma violacao de privilegio) sobrepoem-na no
+        # mapping versionado, que vive em rust/crates/heraclitus-security-schema.
+        "security": {
+            "security_schema": "heraclitus-security-event/1.0",
+            "category": "data_access",
+            "mapping_version": "postgresql/1.0.0",
+            "required_fields": ["observed_at_micros", "datasource_id", "sensor_id"],
+        },
         "parse": {
             "engine": "regex",
             # log_line_prefix padrao Debian/Ubuntu: '%m [%p] %q%u@%d '
@@ -151,6 +161,12 @@ CONNECTOR_PROFILES = {
         "vendor": "Linux OS (OpenSSH)",
         "domain": "identity_access",
         "confidence": 0.984,
+        "security": {
+            "security_schema": "heraclitus-security-event/1.0",
+            "category": "authentication",
+            "mapping_version": "linux-sshd/1.0.0",
+            "required_fields": ["observed_at_micros", "datasource_id", "sensor_id"],
+        },
         "parse": {
             "engine": "regex",
             # Formato REAL do syslog do OpenSSH (/var/log/auth.log):
@@ -383,6 +399,13 @@ class HeraclitusForgeCompiler:
             "domain": profile["domain"],
             "compiled_at": "2026-06-26T02:10:00Z",
         }
+        # SPEC-0071 §4.4: o artefato declara a que modelo canonico de seguranca
+        # pertence e qual o mapping versionado o traduz. Um perfil sem esta
+        # declaracao compila na mesma — fica um conector LEGADO, que continua a
+        # produzir Fatos Operacionais validos e nao produz eventos canonicos.
+        # A ausencia nunca autoriza inventar campos canonicos na leitura (§4.1).
+        if profile.get("security"):
+            manifest["security"] = profile["security"]
         self._dump_yaml(package_path, "manifest.yaml", manifest)
 
         # --- 2. architecture.yaml (DAG declarativa com depends_on) -----------

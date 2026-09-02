@@ -9,12 +9,12 @@ cai e vê-se aqui.
     python compilar_sementes.py            # compila todas
     python compilar_sementes.py nginx_access
 """
-from __future__ import annotations
 
-import _console  # noqa: F401  (consola UTF-8 no Windows)
+from __future__ import annotations
 
 import sys
 
+import _console  # noqa: F401  (consola UTF-8 no Windows)
 import forge_compiler
 import forge_seeds
 
@@ -41,7 +41,9 @@ def main() -> int:
                 artifact_id=nome, vendor=perfil["vendor"], sample_log=amostra[:300]
             )
             print(f"[OK] {caminho}")
-        except Exception as exc:
+        # Compilar em lote: uma semente que rebente nao pode levar as outras
+        # atras dela, e o relatorio no fim diz exatamente quais falharam.
+        except Exception as exc:  # noqa: BLE001
             print(f"[FALHOU] {nome}: {type(exc).__name__}: {exc}")
             falhas.append(nome)
 

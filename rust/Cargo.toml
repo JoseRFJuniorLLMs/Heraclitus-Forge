@@ -1,8 +1,16 @@
+# O crate do modelo canonico (SPEC-0071 Marco 1) vive ao lado do runtime, nao
+# dentro dele: nao tem rede, armazenamento nem parsing de vendor, e por isso
+# pode ser auditado isoladamente. `default-members` inclui ambos para que um
+# `cargo test`/`cargo clippy` sem argumentos (o que a CI corre) cubra os dois.
+[workspace]
+members = ["crates/heraclitus-security-schema"]
+default-members = [".", "crates/heraclitus-security-schema"]
+
 [package]
 name = "heraclitus-forge"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
-description = "Heraclitus Runner + HeraclitusDB — runtime nativo line-rate (port Rust)"
+description = "Heraclitus Runner + FactStore HDB2 — runtime nativo line-rate (port Rust)"
 publish = false
 license-file = "../LICENSE"
 
@@ -56,16 +64,27 @@ path = "src/bin/ingest.rs"
 name = "quarantine"
 path = "src/bin/quarantine.rs"
 
+# Harness de fuzzing do descodificador HFB2. Compila em estavel: um fuzzer que
+# so corre em nightly e um fuzzer que ninguem corre.
+[[bin]]
+name = "hfb2_fuzz"
+path = "src/bin/hfb2_fuzz.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 regex = "1"
 blake3 = "1"
+sha2 = "0.10"       # digest canonico hcx-v3 (compativel com forge_sign.py)
 ed25519-dalek = "2"   # Marco B: assinatura real da âncora (não mais mock)
 getrandom = "0.2"     # geração da seed da chave (CSPRNG do SO)
 chacha20poly1305 = "0.10" # quarentena cifrada XChaCha20-Poly1305
 uuid = { version = "1", features = ["v7"] }
+# Modelo canonico de evento de seguranca. Passou de dev-dependency a dependencia
+# real quando o Runner comecou a EMITIR `fact.security` no caminho quente: o
+# artefato declara o mapping e quem o resolve e o load do `.hcx`.
+heraclitus-security-schema = { path = "crates/heraclitus-security-schema" }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -76,12 +95,19 @@ tracing-appender = "0.2"
 
 # O ingestor corre como servico do Windows (mesmo padrao do heraclitus-service):
 # aparece em services.msc, arranca no boot e o SCM aplica a recuperacao.
-[target.'cfg(windows)'.dependencies]
-windows-service = "0.7"
-# Gateway de ingestao (backend do dashboard) — stack Rust recomendada
+# Gateway de ingestao (backend do dashboard) — stack Rust recomendada.
+# Estiveram declarados em `cfg(windows)` por engano: o `gateway`, o `wire` e os
+# testes da biblioteca usam-nos em qualquer plataforma, e a CI (Linux) so o
+# revelou quando a biblioteca passou a usar `tempfile` tambem.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 axum = "0.7"
 tempfile = "3"
+
+# O ingestor corre como servico do Windows e a substituicao atomica duravel usa
+# a API nativa: estes sim sao especificos da plataforma.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
 
 [profile.release]
 opt-level = 3

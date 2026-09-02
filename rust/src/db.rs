@@ -1,45 +1,80 @@
-//! `FactStore` — armazenamento append-only `.hdb` com integridade BLAKE3 + CRC-32C.
+//! `FactStore` — armazenamento append-only `.hdb`, geracao **HDB2**.
 //!
-//! > **Não confundir com o [HeraclitusDB](https://github.com/JoseRFJuniorLLMs/HeraclitusDB).**
-//! > Este tipo chamou-se `HeraclitusDB` até 2026-08-15 e colidia com o nome de um
-//! > projeto **separado**: um banco event-sourced em rede (gRPC :7474, segmentos
-//! > `HRKL`/`HFTR`, grafo + vetor + texto). Este aqui é o store **embebido** do
-//! > runtime de borda: blocos `HERA`/`FACT`, âncora ed25519 externa, feito para
-//! > line-rate no sítio onde o log nasce. Os formatos são incompatíveis e nenhum
-//! > lê o ficheiro do outro — por isso existe uma ponte (`export_facts` +
-//! > `bridge.py`), e não uma migração. Ver `INTEGRATION_CONTRACT.md`.
+//! > **Nao confundir com o [HeraclitusDB](https://github.com/JoseRFJuniorLLMs/HeraclitusDB).**
+//! > Este e o store **embebido** do runtime de borda; aquele e um banco
+//! > event-sourced em rede (gRPC :7474, segmentos `HRKL`/`HFTR`). Os formatos
+//! > sao incompativeis de proposito — por isso existe uma ponte
+//! > (`export_facts` + `bridge.py`), e nao uma migracao. Ver
+//! > `INTEGRATION_CONTRACT.md`.
 //!
-//! ## Arquitetura de integridade em duas camadas
+//! ## O que mudou do HDB1 para o HDB2
 //!
-//! | Camada | Mecanismo | Detecta |
-//! |--------|-----------|---------|
-//! | **Física** | CRC-32C Castagnoli (CPM-200) | Bit-rot, falha de disco, truncamento |
-//! | **Criptográfica** | Cadeia Merkle rolante BLAKE3 | Adulteração intencional, reordenação |
+//! No HDB1 a folha criptografica era calculada **reserializando** o Fato:
+//! `decode -> Value -> encode_core -> BLAKE3`. Isso fazia da integridade uma
+//! funcao do codigo do descodificador em vez dos bytes gravados — qualquer
+//! campo novo invalidava ficheiros intactos — e permitia que um campo que o
+//! codec nao entendesse desaparecesse em silencio.
 //!
-//! ### Layout do bloco em disco
+//! No HDB2 a folha e calculada sobre os **bytes canonicos persistidos**
+//! ([`crate::hfb2`]). Verificar deixou de exigir compreender: um leitor que nao
+//! conheca uma extensao nova ainda afirma que o registo e integro.
 //!
 //! ```text
-//! +--------+--------+--------+---------+-------------------------------+
-//! | FACT   | LSN    | TS     | Conf    | EvidHash(32) | PayloadLen(4) |
-//! | 4B     | 8B     | 8B     | 4B      |              |               |
-//! +--------+--------+--------+---------+--------------+---------------+
-//! | Payload CRF v2 (CpmRecord::encode) — contém CRC-32C + fbfact body|
-//! +--------------------------------------------------------------------+
+//! bytes canonicos no disco  ->  folha BLAKE3  ->  cadeia Merkle  ->  ancora Ed25519
 //! ```
 //!
-//! O payload é agora um registro **CRF v2** (CPM-100/200) em vez de bytes fbfact
-//! puros. O `db.verify()` valida primeiro o CRC-32C (camada física), depois
-//! reconstrói a cadeia Merkle BLAKE3 (camada criptográfica). A ordem importa:
-//! corrupção física é detectada antes de qualquer lógica de negócio.
+//! ## Layout fisico
+//!
+//! ```text
+//! master:  "HDB2" (4) | generation u32 (4)
+//!
+//! bloco:   "FCT2" (4) | lsn u64 (8) | leaf [32] | chain_root [32]
+//!          | record_len u32 (4) | header_crc32c u32 (4)      = 84 bytes
+//!          | registo HFB2 (record_len bytes, com CRC proprio)
+//! ```
+//!
+//! `leaf` e `chain_root` sao valores DERIVADOS e por isso vivem no bloco, nunca
+//! dentro do registo: gravar dentro do registo um hash do proprio registo seria
+//! circular. O `verify()` recalcula ambos a partir dos bytes e compara.
+//!
+//! ## Duas camadas, duas responsabilidades
+//!
+//! | Camada | Mecanismo | Deteta |
+//! |---|---|---|
+//! | Fisica | CRC-32C Castagnoli | bit-rot, disco a falhar, escrita truncada |
+//! | Criptografica | BLAKE3 com dominio + Ed25519 | adulteracao intencional, reordenacao |
+//!
+//! O CRC nao e material criptografico e nao pretende ser: quem altera os bytes
+//! recalcula-o. Quem altera os bytes **nao** consegue reproduzir a assinatura da
+//! ancora sem a chave privada.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde_json::Value;
 
+use crate::crc32c::crc32c;
+use crate::hfb2::{self, Hfb2Error};
 use crate::raft::BASE_LSN;
-use crate::{cpm, fbfact};
+
+// ---------------------------------------------------------------------------
+// Constantes do formato fisico
+// ---------------------------------------------------------------------------
+
+/// Magic do cabecalho mestre desta geracao.
+pub const MASTER_MAGIC: &[u8; 4] = b"HDB2";
+/// Geracao do ficheiro. Um numero diferente e recusado, nao interpretado.
+pub const GENERATION: u32 = 2;
+/// Magic do cabecalho mestre da geracao legada (`HERA` + schema v7).
+pub const LEGACY_MASTER_MAGIC: &[u8; 4] = b"HERA";
+pub const MASTER_HEADER_SIZE: usize = 8;
+
+/// Magic de bloco. Distinto do `FACT` do HDB1 para que um ficheiro mal
+/// concatenado nunca seja lido meio numa geracao e meio noutra.
+pub const BLOCK_MAGIC: &[u8; 4] = b"FCT2";
+/// `magic(4) + lsn(8) + leaf(32) + root(32) + record_len(4) + crc(4)`.
+pub const BLOCK_HEADER_SIZE: usize = 84;
 
 fn from_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
@@ -56,10 +91,10 @@ fn to_hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Restringe as permissões de um ficheiro de chave a 0600 (só o dono). No
-/// Windows é no-op (a ACL default do perfil já isola o utilizador); a chave
-/// **tem** de ser protegida/movida para fora da máquina em produção — sem isso
-/// a assinatura da âncora não protege contra um atacante que a leia e re-assine.
+/// Restringe as permissoes de um ficheiro de chave a 0600 (so o dono). No
+/// Windows e no-op (a ACL default do perfil ja isola o utilizador); a chave
+/// **tem** de ser protegida/movida para fora da maquina em producao — sem isso
+/// a assinatura da ancora nao protege contra um atacante que a leia e re-assine.
 fn restrict_key_perms(path: &str) {
     #[cfg(unix)]
     {
@@ -73,8 +108,8 @@ fn restrict_key_perms(path: &str) {
 }
 
 /// Carrega a chave de assinatura de `key_path` ou gera uma nova (seed do CSPRNG
-/// do SO). Persiste a chave privada (0600) e a pública ao lado — a pública é o
-/// que o `verify()` usa para conferir a assinatura da âncora.
+/// do SO). Persiste a chave privada (0600) e a publica ao lado — a publica e o
+/// que o `verify()` usa para conferir a assinatura da ancora.
 fn load_or_create_key(key_path: &str, pub_path: &str) -> std::io::Result<SigningKey> {
     if let Ok(txt) = fs::read_to_string(key_path) {
         if let Some(bytes) = from_hex(&txt) {
@@ -82,11 +117,11 @@ fn load_or_create_key(key_path: &str, pub_path: &str) -> std::io::Result<Signing
                 return Ok(SigningKey::from_bytes(&seed));
             }
         }
-        // Ficheiro de chave ilegível: falha alto em vez de gerar outra chave em
-        // silêncio (isso invalidaria a assinatura de toda a âncora existente).
+        // Ficheiro de chave ilegivel: falha alto em vez de gerar outra chave em
+        // silencio (isso invalidaria a assinatura de toda a ancora existente).
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("chave de assinatura ilegível em {key_path}"),
+            format!("chave de assinatura ilegivel em {key_path}"),
         ));
     }
     let mut seed = [0u8; 32];
@@ -99,67 +134,71 @@ fn load_or_create_key(key_path: &str, pub_path: &str) -> std::io::Result<Signing
     Ok(sk)
 }
 
-/// Magic(4) + LSN(8) + Timestamp(8) + Confidence(4) + EvidenceHash(32) + PayloadLen(4)
-pub const HEADER_SIZE: usize = 60;
-
-fn b3_hex(data: &[u8]) -> String {
-    blake3::hash(data).to_hex().to_string()
-}
-
-/// Bytes canônicos do Fato SEM `fact.integrity` (folha BLAKE3). Codec binário
-/// determinístico FlatBuffers-style (zero JSON no caminho quente).
-fn core_bytes(fact: &Value) -> Vec<u8> {
-    fbfact::encode_core(fact)
-}
-
-/// Avança a cadeia Merkle rolante: root := BLAKE3(root_anterior || folha).
-fn fold_chain(prev_root: &str, leaf: &str) -> String {
-    b3_hex(format!("{prev_root}{leaf}").as_bytes())
-}
-
-/// Tag por-Fato NÃO-autoritativa (BLAKE3 da folha). A assinatura de verdade é a
-/// **ed25519 da âncora** (`<db>.anchor.sig`, conferida no `verify()`); assinar
-/// cada Fato com a chave real mataria a vazão (~87k EPS). Prefixo honesto
-/// `b3tag:` — não é uma assinatura criptográfica.
-fn leaf_tag(leaf: &str) -> String {
-    let mut data = b"HERA-LEAF:".to_vec();
-    data.extend_from_slice(leaf.as_bytes());
-    format!("b3tag:{}", &b3_hex(&data)[..48])
-}
-
-pub struct VerifyResult {
-    pub status: String,
-    pub facts: usize,
-    pub root: String,
-    pub message: String,
-}
-
-/// Desfecho de um [`scan_blocks`] (varredura estrutural em streaming).
-pub(crate) enum ScanOutcome {
-    /// Fim limpo (EOF) ou paragem antecipada pelo callback.
-    Done,
-    /// O ficheiro não existe / não abre.
-    NoFile,
-    /// Cabeçalho mestre `HERA` inválido.
-    BadMaster,
-    /// Magic `FACT` de um bloco corrompido.
-    BadBlockMagic,
-    /// `payload_len` declara mais bytes do que o ficheiro tem (cauda truncada).
-    Truncated { lsn: u64 },
-}
-
-/// Varre os blocos do `.hdb` em **streaming** (Marco A §2.5 do AUDIT.md): um
-/// bloco em RAM de cada vez via `BufReader`, nunca `read_to_end` do ficheiro
-/// inteiro — `verify()`/HQL passam a escalar com o tamanho do bloco, não do
-/// banco. O `payload_len` (não confiável, vem do disco) é LIMITADO pelos bytes
-/// restantes do ficheiro antes de qualquer alocação.
+/// Escrita atomica e duravel: tmp -> fsync -> rename -> fsync do diretorio.
 ///
-/// Chama `f(lsn, payload)` por bloco estruturalmente íntegro; devolver `false`
-/// interrompe (early-exit do LIMIT do HQL). A validação de CONTEÚDO
-/// (CRC/Merkle) é do callback — aqui é só o enquadramento físico.
+/// A ancora e o unico ficheiro que autentica o log. Escreve-la com um
+/// `fs::write` normal deixa duas janelas de corte de energia — uma com o
+/// ficheiro truncado, outra com o conteudo no cache do SO — e em ambas o banco
+/// reabre a acusar adulteracao onde so houve falta de luz.
+fn write_atomic(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    let tmp = format!("{path}.tmp");
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        // Sem fsync do diretorio o rename pode nao sobreviver ao corte. Falhar
+        // aqui nao e fatal em sistemas que nao o permitem (Windows).
+        if let Ok(handle) = File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Varredura fisica
+// ---------------------------------------------------------------------------
+
+/// Cabecalho de um bloco, ja validado estruturalmente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockHeader {
+    pub lsn: u64,
+    pub leaf: [u8; 32],
+    pub chain_root: [u8; 32],
+    pub record_len: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScanOutcome {
+    /// Chegou ao fim do ficheiro sem sobras.
+    Done,
+    /// O ficheiro nao existe / nao abre.
+    NoFile,
+    /// Cabecalho mestre irreconhecivel.
+    BadMaster,
+    /// Cabecalho mestre de uma geracao anterior — recusado, nunca reinterpretado.
+    LegacyGeneration,
+    /// Magic de bloco corrompido no deslocamento indicado.
+    BadBlockMagic { offset: u64 },
+    /// CRC do cabecalho do bloco nao bate.
+    BadBlockHeaderCrc { offset: u64 },
+    /// O bloco declara mais bytes do que o ficheiro tem (cauda truncada).
+    Truncated { lsn: u64, offset: u64 },
+}
+
+/// Varre os blocos em streaming — um bloco em RAM de cada vez. O `record_len`
+/// vem do disco e portanto nao e confiavel: e confrontado com os bytes que
+/// restam **antes** de qualquer alocacao.
+///
+/// Chama `f(header, record)` por bloco fisicamente integro; devolver `false`
+/// interrompe (early-exit do LIMIT do HQL). A validacao CRIPTOGRAFICA e do
+/// chamador — aqui e so enquadramento fisico.
 pub(crate) fn scan_blocks<F>(db_path: &str, mut f: F) -> std::io::Result<ScanOutcome>
 where
-    F: FnMut(u64, &[u8]) -> bool,
+    F: FnMut(&BlockHeader, &[u8]) -> bool,
 {
     use std::io::{BufReader, Read as _};
     let file = match File::open(db_path) {
@@ -169,141 +208,303 @@ where
     let file_size = file.metadata()?.len();
     let mut r = BufReader::new(file);
 
-    let mut master = [0u8; 8];
-    if r.read_exact(&mut master).is_err() || &master[..4] != b"HERA" {
+    let mut master = [0u8; MASTER_HEADER_SIZE];
+    if r.read_exact(&mut master).is_err() {
+        return Ok(ScanOutcome::BadMaster);
+    }
+    if &master[..4] == LEGACY_MASTER_MAGIC {
+        return Ok(ScanOutcome::LegacyGeneration);
+    }
+    if &master[..4] != MASTER_MAGIC {
+        return Ok(ScanOutcome::BadMaster);
+    }
+    if u32::from_be_bytes([master[4], master[5], master[6], master[7]]) != GENERATION {
         return Ok(ScanOutcome::BadMaster);
     }
 
-    let mut pos: u64 = 8;
-    let mut header = [0u8; HEADER_SIZE];
-    let mut payload = Vec::new();
+    let mut pos: u64 = MASTER_HEADER_SIZE as u64;
+    let mut header = [0u8; BLOCK_HEADER_SIZE];
+    let mut record = Vec::new();
     loop {
-        // Menos de um header restante = fim limpo (mesma semântica do scan
-        // antigo, que ignorava uma cauda menor que HEADER_SIZE).
-        if file_size - pos < HEADER_SIZE as u64 {
+        // Menos de um cabecalho restante = fim limpo.
+        if file_size - pos < BLOCK_HEADER_SIZE as u64 {
             return Ok(ScanOutcome::Done);
         }
         r.read_exact(&mut header)?;
-        pos += HEADER_SIZE as u64;
-        if &header[..4] != b"FACT" {
-            return Ok(ScanOutcome::BadBlockMagic);
+        let offset = pos;
+        pos += BLOCK_HEADER_SIZE as u64;
+        if &header[..4] != BLOCK_MAGIC {
+            return Ok(ScanOutcome::BadBlockMagic { offset });
         }
-        let lsn = u64::from_be_bytes(header[4..12].try_into().unwrap());
-        let payload_len = u32::from_be_bytes(header[56..60].try_into().unwrap()) as u64;
-        if payload_len > file_size - pos {
-            return Ok(ScanOutcome::Truncated { lsn });
+        let stored_crc = u32::from_be_bytes([header[80], header[81], header[82], header[83]]);
+        if crc32c(&header[..80]) != stored_crc {
+            return Ok(ScanOutcome::BadBlockHeaderCrc { offset });
         }
-        payload.clear();
-        payload.resize(payload_len as usize, 0);
-        r.read_exact(&mut payload)?;
-        pos += payload_len;
-        if !f(lsn, &payload) {
+        let mut lsn_bytes = [0u8; 8];
+        lsn_bytes.copy_from_slice(&header[4..12]);
+        let lsn = u64::from_be_bytes(lsn_bytes);
+        let mut leaf = [0u8; 32];
+        leaf.copy_from_slice(&header[12..44]);
+        let mut chain_root = [0u8; 32];
+        chain_root.copy_from_slice(&header[44..76]);
+        let record_len = u32::from_be_bytes([header[76], header[77], header[78], header[79]]);
+
+        if record_len as u64 > file_size - pos {
+            return Ok(ScanOutcome::Truncated { lsn, offset });
+        }
+        if record_len as usize > hfb2::MAX_RECORD_LEN {
+            return Ok(ScanOutcome::Truncated { lsn, offset });
+        }
+        record.clear();
+        record.resize(record_len as usize, 0);
+        r.read_exact(&mut record)?;
+        pos += record_len as u64;
+
+        let parsed = BlockHeader {
+            lsn,
+            leaf,
+            chain_root,
+            record_len,
+        };
+        if !f(&parsed, &record) {
             return Ok(ScanOutcome::Done);
         }
     }
 }
 
-/// Resultado de uma exportação (ver [`export_facts`]).
+/// Resultado de uma exportacao (ver [`export_facts`]).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ExportStats {
     /// Blocos varridos no ficheiro.
     pub scanned: u64,
-    /// Fatos entregues ao callback (passaram CRC + decode + `from_lsn`).
+    /// Fatos entregues ao callback.
     pub exported: u64,
-    /// Blocos saltados por CRC-32C inválido (`CpmDecoded::Torn`).
+    /// Blocos cujo registo falhou o CRC-32C interno.
     pub torn: u64,
-    /// Blocos cujo payload decodificou mal (fbfact corrompido).
+    /// Blocos cujo registo nao descodificou (estrutura ou semantica).
     pub undecodable: u64,
-    /// Último LSN entregue — ponto de retoma para a próxima exportação.
+    /// Registos integros de um tipo que este binario nao sabe interpretar.
+    /// Contados a parte: nao sao corrupcao, e engoli-los em silencio seria
+    /// perda invisivel.
+    pub skipped: u64,
+    /// Ultimo LSN entregue — ponto de retoma.
     pub last_lsn: u64,
 }
 
-/// Exporta os Fatos do `.hdb` em **streaming**, para fora do runtime do Forge.
+/// Um registo exportado. O log e partilhado por mais do que um tipo de registo;
+/// quem consome tem de saber o que recebeu em vez de assumir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportedRecord {
+    Fact(serde_json::Value),
+    TelemetryHealth {
+        identity: hfb2::SecurityIdentity,
+        /// Envelope `heraclitus-telemetry-health/1.0`, tal como foi gravado.
+        envelope: String,
+    },
+}
+
+impl ExportedRecord {
+    pub fn record_type(&self) -> &'static str {
+        match self {
+            ExportedRecord::Fact(_) => "OperationalFact",
+            ExportedRecord::TelemetryHealth { .. } => "TelemetryHealth",
+        }
+    }
+}
+
+/// Exporta todos os registos com LSN > `from_lsn`, em streaming.
 ///
-/// Esta é a superfície pública que a ponte Forge → HeraclitusDB consome: o
-/// `scan_blocks` é `pub(crate)` (enquadramento físico, não é contrato), aqui o
-/// que sai é o **Fato Operacional** já validado e desserializado.
-///
-/// Por bloco: valida o CRC-32C (camada física CPM-200), decodifica o corpo
-/// `fbfact` e chama `f(lsn, fact)`. Blocos com CRC partido são **saltados e
-/// contados** — nunca silenciados; quem julga a integridade da cadeia é o
-/// [`FactStore::verify`], não o exportador.
-///
-/// `from_lsn` retoma uma exportação anterior (entrega apenas `lsn > from_lsn`);
-/// devolver `false` no callback interrompe (limite de lote).
-pub fn export_facts<F>(db_path: &str, from_lsn: u64, mut f: F) -> std::io::Result<ExportStats>
+/// Nenhum campo persistido desaparece aqui: o Fato devolvido traz identidade de
+/// seguranca, identidade de schema, extensoes conhecidas nos seus lugares
+/// semanticos e as desconhecidas em `fact.extensions`.
+pub fn export_records<F>(db_path: &str, from_lsn: u64, mut f: F) -> std::io::Result<ExportStats>
 where
-    F: FnMut(u64, serde_json::Value) -> bool,
+    F: FnMut(u64, ExportedRecord) -> bool,
 {
     let mut st = ExportStats::default();
-    scan_blocks(db_path, |lsn, raw_payload| {
+    scan_blocks(db_path, |header, record| {
         st.scanned += 1;
-        if lsn <= from_lsn {
+        if header.lsn <= from_lsn {
             return true;
         }
-        let rec = match crate::cpm::decode_record(raw_payload) {
-            crate::cpm::CpmDecoded::Record(rec, _) => rec,
-            crate::cpm::CpmDecoded::Torn => {
+        let view = match hfb2::RecordView::parse(record) {
+            Ok(view) => view,
+            Err(Hfb2Error::Crc { .. }) => {
                 st.torn += 1;
                 return true;
             }
-        };
-        let fact = match crate::cpm::record_to_fact(&rec) {
-            Ok(v) => v,
             Err(_) => {
                 st.undecodable += 1;
                 return true;
             }
         };
+        let exported = match view.record_type {
+            hfb2::RECORD_TYPE_OPERATIONAL_FACT => match hfb2::decode_fact(record) {
+                Ok(mut fact) => {
+                    fact["fact.integrity"] = serde_json::json!({
+                        "leaf_hash": to_hex(&header.leaf),
+                        "merkle_root_anchor": to_hex(&header.chain_root),
+                    });
+                    ExportedRecord::Fact(fact)
+                }
+                Err(_) => {
+                    st.undecodable += 1;
+                    return true;
+                }
+            },
+            hfb2::RECORD_TYPE_TELEMETRY_HEALTH => match hfb2::decode_health_event(record) {
+                Ok((identity, envelope)) => ExportedRecord::TelemetryHealth { identity, envelope },
+                Err(_) => {
+                    st.undecodable += 1;
+                    return true;
+                }
+            },
+            // Tipo de registo que este binario nao conhece: NAO e ilegivel — a
+            // estrutura e a integridade ja foram afirmadas. So nao e exportavel
+            // por quem nao lhe sabe a semantica.
+            _ => {
+                st.skipped += 1;
+                return true;
+            }
+        };
         st.exported += 1;
-        st.last_lsn = lsn;
-        f(lsn, fact)
+        st.last_lsn = header.lsn;
+        f(header.lsn, exported)
     })?;
     Ok(st)
 }
 
+/// Exporta apenas os Fatos Operacionais — a superficie que a ponte consome.
+pub fn export_facts<F>(db_path: &str, from_lsn: u64, mut f: F) -> std::io::Result<ExportStats>
+where
+    F: FnMut(u64, serde_json::Value) -> bool,
+{
+    export_records(db_path, from_lsn, |lsn, record| match record {
+        ExportedRecord::Fact(fact) => f(lsn, fact),
+        _ => true,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// FactStore
+// ---------------------------------------------------------------------------
+
 pub struct FactStore {
-    pub db_path: String,
+    pub(crate) db_path: String,
     anchor_path: String,
-    /// `<db>.anchor.sig` — assinatura ed25519 (hex) sobre a raiz da âncora.
-    anchor_sig_path: String,
-    /// `<db>.pub` — chave pública ed25519 (hex) para o `verify()` conferir.
     pub_path: String,
+    /// Ultimo LSN **durave**l. So avanca depois do fsync.
     pub current_lsn: u64,
-    /// Raiz da cadeia Merkle rolante (âncora de confiança corrente).
-    pub trusted_root: String,
-    /// Chave de assinatura ed25519 (privada — nunca sai daqui; persiste em
-    /// `<db>.key` com 0600). Marco B: assina a âncora ao persisti-la.
+    /// Raiz da cadeia Merkle correspondente a `current_lsn`.
+    trusted_root: [u8; 32],
     signing_key: SigningKey,
 }
 
-/// Verifica um `.hdb` sem abrir/criar a chave privada. Esta é a superfície
-/// correta para exportadores, auditores e pipelines read-only: `FactStore::new`
-/// pode criar sidecars ausentes, o que seria uma mutação inaceitável durante
-/// uma verificação de cadeia de custódia.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyResult {
+    pub status: String,
+    pub facts: usize,
+    pub root: String,
+    pub message: String,
+}
+
+/// Resultado de uma escrita em lote. O supervisor precisa de saber quantos
+/// Fatos ficaram DURAVEIS para poder avancar o checkpoint da fonte sem
+/// arriscar perder o que nao chegou ao disco.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchOutcome {
+    pub first_lsn: u64,
+    pub last_lsn: u64,
+    pub persisted: usize,
+}
+
+/// Verifica um `.hdb` sem construir um `FactStore` (nao toca na chave privada).
 pub fn verify_file(db_path: &str) -> VerifyResult {
     let verifier = FactStore {
         db_path: db_path.to_string(),
         anchor_path: format!("{db_path}.anchor"),
-        anchor_sig_path: format!("{db_path}.anchor.sig"),
         pub_path: format!("{db_path}.pub"),
         current_lsn: BASE_LSN,
-        trusted_root: String::new(),
-        // Nunca usada por `verify`; existe apenas porque o writer mantém a
-        // chave no mesmo tipo. Uma seed fixa aqui não toca o disco nem assina.
+        trusted_root: hfb2::EMPTY_ROOT,
         signing_key: SigningKey::from_bytes(&[0u8; 32]),
     };
     verifier.verify()
 }
 
+/// Conteudo do ficheiro de ancora. Raiz, LSN e assinatura vivem no MESMO
+/// ficheiro: com dois ficheiros existia um estado intermedio em que a raiz era
+/// nova e a assinatura velha, e o banco reabria a acusar adulteracao.
+struct Anchor {
+    root: [u8; 32],
+    lsn: u64,
+    signature: [u8; 64],
+}
+
+impl Anchor {
+    fn encode(&self) -> Vec<u8> {
+        format!(
+            "generation={GENERATION}\nroot={}\nlsn={}\nsig={}\n",
+            to_hex(&self.root),
+            self.lsn,
+            to_hex(&self.signature)
+        )
+        .into_bytes()
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let mut fields = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            if let Some((key, value)) = line.split_once('=') {
+                fields.insert(key.trim().to_string(), value.trim().to_string());
+            }
+        }
+        if fields.get("generation")? != &GENERATION.to_string() {
+            return None;
+        }
+        let root = <[u8; 32]>::try_from(from_hex(fields.get("root")?)?.as_slice()).ok()?;
+        let lsn = fields.get("lsn")?.parse().ok()?;
+        let signature = <[u8; 64]>::try_from(from_hex(fields.get("sig")?)?.as_slice()).ok()?;
+        Some(Anchor {
+            root,
+            lsn,
+            signature,
+        })
+    }
+}
+
+/// Bloco pronto a gravar, com os valores derivados que o descrevem. E o
+/// resultado de uma funcao PURA: montar o bloco nao toca no estado do store,
+/// para que um erro de I/O nao deixe o `FactStore` a descrever um bloco que
+/// nunca chegou ao disco.
+struct EncodedBlock {
+    bytes: Vec<u8>,
+    leaf: [u8; 32],
+    root: [u8; 32],
+}
+
+/// Mensagem que a ancora assina. Inclui o LSN para que uma ancora antiga nao
+/// possa ser reapresentada como valida para um log mais curto.
+fn anchor_message(root: &[u8; 32], lsn: u64) -> Vec<u8> {
+    let mut message = Vec::with_capacity(hfb2::domain::ANCHOR.len() + 41);
+    message.extend_from_slice(hfb2::domain::ANCHOR);
+    message.push(0x00);
+    message.extend_from_slice(root);
+    message.extend_from_slice(&lsn.to_be_bytes());
+    message
+}
+
 impl FactStore {
     pub fn new(db_path: &str) -> std::io::Result<Self> {
         let existed = std::path::Path::new(db_path).exists();
-        if !existed {
+        if existed {
+            // Recusa explicita antes de qualquer outra coisa: a geracao antiga
+            // nao e interpretada "com cuidado", e simplesmente recusada.
+            Self::require_supported_generation(db_path)?;
+        } else {
             let mut f = File::create(db_path)?;
-            // PAGE 0: FILE HEADER ('HERA' + versão do formato v2 = CPM-enabled)
-            f.write_all(b"HERA")?;
-            f.write_all(&7u32.to_be_bytes())?; // schema v7 = CPM payload
+            f.write_all(MASTER_MAGIC)?;
+            f.write_all(&GENERATION.to_be_bytes())?;
+            f.sync_all()?;
         }
         let key_path = format!("{db_path}.key");
         let pub_path = format!("{db_path}.pub");
@@ -311,20 +512,11 @@ impl FactStore {
         let mut db = Self {
             db_path: db_path.to_string(),
             anchor_path: format!("{db_path}.anchor"),
-            anchor_sig_path: format!("{db_path}.anchor.sig"),
             pub_path,
             current_lsn: BASE_LSN,
-            trusted_root: String::new(),
+            trusted_root: hfb2::EMPTY_ROOT,
             signing_key,
         };
-        // RECUPERAÇÃO no reabrir: sem isto, `new()` de um `.hdb` EXISTENTE
-        // repunha `current_lsn = BASE_LSN` e `trusted_root = ""`. O próximo
-        // `write_fact` então: (a) atribuía um LSN já usado, e (b) dobrava a
-        // cadeia Merkle a partir do vazio em vez de continuar a raiz on-disk —
-        // o `merkle_root_anchor` embutido no bloco novo divergia do que o
-        // `verify()` recalcula sobre TODO o ficheiro ⇒ um append legítimo
-        // pós-restart marcava o banco como VIOLATED. Reconstrói o estado do
-        // disco (mesma filosofia replay-from-log do HeraclitusDB de produção).
         if existed {
             db.recover()?;
             let verified = db.verify();
@@ -332,300 +524,412 @@ impl FactStore {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "recusa abrir .hdb não íntegro ({}): {}",
+                        "recusa abrir .hdb nao integro ({}): {}",
                         verified.status, verified.message
                     ),
                 ));
             }
         } else {
-            // Um banco vazio também possui âncora assinada. Sem isto, fechar
-            // antes do primeiro Fato e reabrir pareceria adulteração por
-            // ausência de `.anchor.sig`.
+            // Um banco vazio tambem tem ancora assinada: sem isso, fechar antes
+            // do primeiro Fato e reabrir pareceria adulteracao por ausencia.
             db.persist_anchor()?;
         }
         Ok(db)
     }
 
-    /// Reconstrói `current_lsn` + `trusted_root` percorrendo o log em disco.
-    /// A raiz recuperada é a cadeia Merkle rolante sobre todos os blocos; o LSN
-    /// é o do último bloco íntegro. Blocos truncados/corrompidos na cauda param
-    /// o replay (a verificação criptográfica fica a cargo do `verify()`).
+    /// Le so o cabecalho mestre e decide se este runtime pode abrir o ficheiro.
+    fn require_supported_generation(db_path: &str) -> std::io::Result<()> {
+        use std::io::Read as _;
+        let mut master = [0u8; MASTER_HEADER_SIZE];
+        let mut file = File::open(db_path)?;
+        let read = file.read(&mut master)?;
+        if read < MASTER_HEADER_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{db_path}: cabecalho mestre incompleto ({read} bytes)"),
+            ));
+        }
+        if &master[..4] == LEGACY_MASTER_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Unsupported database generation: HDB1\nExpected: HDB2\n\
+                     ({db_path}) — nao ha migracao automatica; ver md/HDB2-HFB2.md"
+                ),
+            ));
+        }
+        if &master[..4] != MASTER_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{db_path}: cabecalho mestre desconhecido"),
+            ));
+        }
+        let generation = u32::from_be_bytes([master[4], master[5], master[6], master[7]]);
+        if generation != GENERATION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Unsupported database generation: HDB{generation}\nExpected: HDB{GENERATION}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reconstroi `current_lsn` + `trusted_root` a partir do disco.
+    ///
+    /// A folha e **recalculada** dos bytes gravados, nunca lida do cabecalho do
+    /// bloco: confiar no valor gravado seria deixar o atacante escolher a folha.
     fn recover(&mut self) -> std::io::Result<()> {
-        let mut chain = String::new();
+        let mut chain = hfb2::EMPTY_ROOT;
         let mut last_lsn = BASE_LSN;
-        // Streaming (nunca o ficheiro inteiro em RAM). Replay leniente: o
-        // primeiro bloco ilegível para a recuperação (o verify() é quem julga).
-        let _ = scan_blocks(&self.db_path, |lsn, payload| {
-            let fact = match cpm::decode_record(payload) {
-                cpm::CpmDecoded::Record(rec, _) => match cpm::record_to_fact(&rec) {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                },
-                cpm::CpmDecoded::Torn => return false,
+        let mut stop = None;
+        let outcome = scan_blocks(&self.db_path, |header, record| {
+            let leaf = match hfb2::record_leaf(record) {
+                Ok(leaf) => leaf,
+                Err(error) => {
+                    stop = Some(format!("LSN {}: {error}", header.lsn));
+                    return false;
+                }
             };
-            chain = fold_chain(&chain, &b3_hex(&core_bytes(&fact)));
-            last_lsn = lsn;
+            chain = hfb2::fold_chain(&chain, &leaf);
+            last_lsn = header.lsn;
             true
         })?;
+        // O resultado da varredura NAO e descartado: uma cauda truncada ou um
+        // magic partido tem de chegar a quem abre o banco, senao o store abre
+        // com um LSN atrasado e volta a usar LSNs ja gravados.
+        match outcome {
+            ScanOutcome::Done | ScanOutcome::NoFile => {}
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("varredura interrompida: {other:?}"),
+                ))
+            }
+        }
+        if let Some(message) = stop {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("registo ilegivel durante a recuperacao — {message}"),
+            ));
+        }
         self.current_lsn = last_lsn;
         self.trusted_root = chain;
         Ok(())
     }
 
-    /// Persiste a âncora (raiz da cadeia) E a sua assinatura ed25519. O atacante
-    /// que reescreva o `.hdb` + `.anchor` não consegue produzir um `.anchor.sig`
-    /// válido sem a chave privada — o `verify()` deteta. (Segurança condicionada
-    /// à proteção da chave; ver `restrict_key_perms`.)
     fn persist_anchor(&self) -> std::io::Result<()> {
-        fs::write(&self.anchor_path, &self.trusted_root)?;
-        let sig = self.signing_key.sign(self.trusted_root.as_bytes());
-        fs::write(&self.anchor_sig_path, to_hex(&sig.to_bytes()))?;
-        Ok(())
+        let signature = self
+            .signing_key
+            .sign(&anchor_message(&self.trusted_root, self.current_lsn));
+        let anchor = Anchor {
+            root: self.trusted_root,
+            lsn: self.current_lsn,
+            signature: signature.to_bytes(),
+        };
+        write_atomic(&self.anchor_path, &anchor.encode())
     }
 
-    /// Monta o bloco binário completo (header + payload CRF v2) e avança a cadeia em O(1).
-    /// Não escreve em disco — reutilizado por `write_fact` e pelo benchmark.
-    pub fn build_block(&mut self, fact: &mut Value) -> Vec<u8> {
-        self.current_lsn += 1;
-        fact["fact.time"]["log_sequence_number"] = Value::from(self.current_lsn);
+    /// Raiz atual em hexadecimal.
+    pub fn trusted_root_hex(&self) -> String {
+        to_hex(&self.trusted_root)
+    }
 
-        // --- Camada criptográfica (BLAKE3) ---
-        let core = core_bytes(fact);
-        let leaf = b3_hex(&core);
-        self.trusted_root = fold_chain(&self.trusted_root, &leaf);
+    /// Caminho da chave publica — a ponte deriva dela a identidade da origem.
+    pub fn pub_path(&self) -> &str {
+        &self.pub_path
+    }
 
+    /// Monta um bloco completo para `lsn`, a partir da raiz `previous_root`.
+    ///
+    /// **Nao muta estado.** No HDB1 o LSN e a raiz avancavam antes de qualquer
+    /// I/O e nao havia rollback: um unico ENOSPC transitorio deixava o store a
+    /// descrever um bloco que nunca chegou ao disco, e o banco ficava
+    /// permanentemente irrecuperavel. Aqui o estado so avanca depois do fsync.
+    fn encode_block(
+        fact: &Value,
+        lsn: u64,
+        previous_root: &[u8; 32],
+    ) -> Result<EncodedBlock, Hfb2Error> {
+        Self::encode_block_from_record(hfb2::encode_fact(fact, lsn)?, lsn, previous_root)
+    }
+
+    /// Mesma coisa para um registo ja codificado (Fato ou saude do sensor).
+    ///
+    /// A folha vem da vista do PROPRIO registo — nunca de um schema assumido:
+    /// calcula-la com uma identidade de schema fixa produziria, para um tipo de
+    /// registo novo, uma folha que o `verify()` jamais reproduziria.
+    fn encode_block_from_record(
+        record: Vec<u8>,
+        lsn: u64,
+        previous_root: &[u8; 32],
+    ) -> Result<EncodedBlock, Hfb2Error> {
+        let leaf = hfb2::RecordView::parse(&record)?.leaf();
+        let root = hfb2::fold_chain(previous_root, &leaf);
+
+        let mut block = Vec::with_capacity(BLOCK_HEADER_SIZE + record.len());
+        block.extend_from_slice(BLOCK_MAGIC);
+        block.extend_from_slice(&lsn.to_be_bytes());
+        block.extend_from_slice(&leaf);
+        block.extend_from_slice(&root);
+        block.extend_from_slice(&(record.len() as u32).to_be_bytes());
+        let header_crc = crc32c(&block);
+        block.extend_from_slice(&header_crc.to_be_bytes());
+        debug_assert_eq!(block.len(), BLOCK_HEADER_SIZE);
+        block.extend_from_slice(&record);
+        Ok(EncodedBlock {
+            bytes: block,
+            leaf,
+            root,
+        })
+    }
+
+    /// Anota no Fato o que so se sabe depois de gravar.
+    fn stamp(fact: &mut Value, lsn: u64, leaf: &[u8; 32], root: &[u8; 32]) {
+        fact["fact.time"]["log_sequence_number"] = Value::from(lsn);
         fact["fact.integrity"] = serde_json::json!({
-            "leaf_hash": leaf,
-            "merkle_root_anchor": self.trusted_root,
-            "signature": leaf_tag(&leaf),
+            "leaf_hash": to_hex(leaf),
+            "merkle_root_anchor": to_hex(root),
         });
-
-        // --- Camada física (CRC-32C via CPM) ---
-        // O payload gravado em disco é um CRF v2 completo (inclui CRC-32C +
-        // metadados fixos + corpo fbfact como pristine payload).
-        let cpm_record = cpm::fact_to_record(fact);
-        let payload = cpm_record.encode(); // CRF v2 bytes com CRC-32C embutido
-
-        let ev_hex = fact["fact.evidence"]["raw_observation_hash"]
-            .as_str()
-            .unwrap_or("")
-            .rsplit(':')
-            .next()
-            .unwrap_or("");
-        let mut evidence = [0u8; 32];
-        let bytes = ev_hex.as_bytes();
-        let n = bytes.len().min(32);
-        evidence[..n].copy_from_slice(&bytes[..n]);
-
-        let ts = fact["fact.time"]["system_timestamp"].as_i64().unwrap_or(0) as u64;
-        let conf = fact["fact.confidence"].as_f64().unwrap_or(0.9) as f32;
-
-        let mut block = Vec::with_capacity(HEADER_SIZE + payload.len());
-        block.extend_from_slice(b"FACT");
-        block.extend_from_slice(&self.current_lsn.to_be_bytes());
-        block.extend_from_slice(&ts.to_be_bytes());
-        block.extend_from_slice(&conf.to_be_bytes());
-        block.extend_from_slice(&evidence);
-        block.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        block.extend_from_slice(&payload);
-        block
     }
 
-    /// Grava um Fato (append-only) e ancora a raiz de confiança.
+    /// Grava um Fato e ancora a raiz. Durave l antes de devolver.
     pub fn write_fact(&mut self, fact: &mut Value) -> std::io::Result<u64> {
-        let block = self.build_block(fact);
-        let mut f = OpenOptions::new().append(true).open(&self.db_path)?;
-        f.write_all(&block)?;
-        f.sync_all()?; // fsync ANTES do ack — durabilidade real (o bloco não pode
-                       // ser dado como gravado se um corte de energia o perde).
-        self.persist_anchor()?;
-        Ok(self.current_lsn)
+        let outcome = self.write_batch(std::slice::from_mut(fact))?;
+        Ok(outcome.last_lsn)
     }
 
-    /// Escreve um lote com um único `BufWriter` (caminho de alta vazão do benchmark).
-    pub fn write_stream<'a, I>(&mut self, facts: I) -> std::io::Result<u64>
-    where
-        I: IntoIterator<Item = &'a mut Value>,
-    {
-        let f = OpenOptions::new().append(true).open(&self.db_path)?;
-        let mut w = BufWriter::new(f);
-        for fact in facts {
-            let block = self.build_block(fact);
-            w.write_all(&block)?;
+    /// Grava um lote com um unico `write_all` e um unico fsync.
+    ///
+    /// O lote inteiro e montado em memoria antes de tocar no disco: assim nunca
+    /// se escreve meio bloco por causa do enchimento de um buffer. O estado so
+    /// avanca depois do fsync, portanto um erro a meio nao deixa o store a
+    /// descrever Fatos que nao existem.
+    pub fn write_batch(&mut self, facts: &mut [Value]) -> std::io::Result<BatchOutcome> {
+        if facts.is_empty() {
+            return Ok(BatchOutcome {
+                first_lsn: self.current_lsn,
+                last_lsn: self.current_lsn,
+                persisted: 0,
+            });
         }
-        w.flush()?;
-        // fsync do lote inteiro antes de ancorar (o `flush` do BufWriter só
-        // empurra para o SO; sem `sync_all` a durabilidade não é garantida).
-        w.get_ref().sync_all()?;
+        let mut buffer = Vec::new();
+        let mut root = self.trusted_root;
+        let mut stamps = Vec::with_capacity(facts.len());
+        let first_lsn = self.current_lsn + 1;
+        for (index, fact) in facts.iter().enumerate() {
+            let lsn = first_lsn + index as u64;
+            let encoded = Self::encode_block(fact, lsn, &root).map_err(std::io::Error::other)?;
+            buffer.extend_from_slice(&encoded.bytes);
+            stamps.push((lsn, encoded.leaf, encoded.root));
+            root = encoded.root;
+        }
+
+        let mut file = OpenOptions::new().append(true).open(&self.db_path)?;
+        file.write_all(&buffer)?;
+        file.sync_all()?;
+
+        // Ponto de nao retorno: a partir daqui os Fatos existem no disco.
+        let last_lsn = first_lsn + facts.len() as u64 - 1;
+        self.current_lsn = last_lsn;
+        self.trusted_root = root;
         self.persist_anchor()?;
-        Ok(self.current_lsn)
+        for (fact, (lsn, leaf, new_root)) in facts.iter_mut().zip(stamps.iter()) {
+            Self::stamp(fact, *lsn, leaf, new_root);
+        }
+        Ok(BatchOutcome {
+            first_lsn,
+            last_lsn,
+            persisted: facts.len(),
+        })
     }
 
-    /// Grava localmente (líder Raft) e devolve `(lsn, raiz, bytes do bloco)` para
-    /// que o bloco seja replicado byte-a-byte aos followers.
+    /// Grava um evento de Telemetry Health no MESMO log dos Fatos.
+    ///
+    /// Partilhar o log e o ponto: a saude do sensor entra na mesma cadeia
+    /// Merkle e na mesma ancora Ed25519 que a evidencia. Um sensor que queira
+    /// esconder que esteve cego teria de partir a cadeia para o fazer.
+    pub fn write_health_event(
+        &mut self,
+        identity: &hfb2::SecurityIdentity,
+        emitted_at_micros: i64,
+        envelope_json: &str,
+    ) -> std::io::Result<u64> {
+        let lsn = self.current_lsn + 1;
+        let event_id = uuid::Uuid::now_v7().into_bytes();
+        let record =
+            hfb2::encode_health_event(identity, event_id, emitted_at_micros, lsn, envelope_json)
+                .map_err(std::io::Error::other)?;
+        let encoded = Self::encode_block_from_record(record, lsn, &self.trusted_root)
+            .map_err(std::io::Error::other)?;
+
+        let mut file = OpenOptions::new().append(true).open(&self.db_path)?;
+        file.write_all(&encoded.bytes)?;
+        file.sync_all()?;
+        self.current_lsn = lsn;
+        self.trusted_root = encoded.root;
+        self.persist_anchor()?;
+        Ok(lsn)
+    }
+
+    /// Grava localmente (lider Raft) e devolve `(lsn, raiz, bytes do bloco)`
+    /// para que o bloco seja replicado byte a byte aos followers.
     pub fn commit_local(&mut self, fact: &mut Value) -> std::io::Result<(u64, String, Vec<u8>)> {
-        let block = self.build_block(fact);
-        let mut f = OpenOptions::new().append(true).open(&self.db_path)?;
-        f.write_all(&block)?;
-        f.sync_all()?; // líder Raft: durável ANTES de replicar/ackar aos followers.
+        let lsn = self.current_lsn + 1;
+        let encoded =
+            Self::encode_block(fact, lsn, &self.trusted_root).map_err(std::io::Error::other)?;
+        let mut file = OpenOptions::new().append(true).open(&self.db_path)?;
+        file.write_all(&encoded.bytes)?;
+        file.sync_all()?; // lider Raft: duravel ANTES de replicar/ackar.
+        self.current_lsn = lsn;
+        self.trusted_root = encoded.root;
         self.persist_anchor()?;
-        Ok((self.current_lsn, self.trusted_root.clone(), block))
+        Self::stamp(fact, lsn, &encoded.leaf, &encoded.root);
+        Ok((lsn, to_hex(&encoded.root), encoded.bytes))
     }
 
-    /// Follower Raft (spec seção 11): valida um bloco replicado e o aplica.
-    /// Ordem de validação:
-    ///   1. Estrutura do header (magic FACT + tamanhos)
-    ///   2. **CRC-32C do payload CRF v2** (camada física — CPM-200)
-    ///   3. LSN sequencial
-    ///   4. Folha BLAKE3 e cadeia Merkle (camada criptográfica)
+    /// Follower Raft: valida um bloco replicado e aplica-o.
+    ///
+    /// Ordem: estrutura do bloco -> CRC do cabecalho -> registo HFB2 (estrutura
+    /// + CRC) -> LSN sequencial -> folha recalculada -> cadeia Merkle.
     pub fn append_replicated_block(
         &mut self,
         block: &[u8],
     ) -> Result<u64, crate::error::HeraclitusError> {
-        if block.len() < HEADER_SIZE || &block[..4] != b"FACT" {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption(
-                "bloco inválido".into(),
+        use crate::error::HeraclitusError::DatabaseCorruption;
+        if block.len() < BLOCK_HEADER_SIZE || &block[..4] != BLOCK_MAGIC {
+            return Err(DatabaseCorruption("bloco invalido".into()));
+        }
+        let stored_crc = u32::from_be_bytes([block[80], block[81], block[82], block[83]]);
+        if crc32c(&block[..80]) != stored_crc {
+            return Err(DatabaseCorruption(
+                "CRC-32C do cabecalho do bloco falhou".into(),
             ));
         }
-        let lsn_bytes = block[4..12].try_into().map_err(|_| {
-            crate::error::HeraclitusError::DatabaseCorruption("lsn inválido".into())
-        })?;
+        let mut lsn_bytes = [0u8; 8];
+        lsn_bytes.copy_from_slice(&block[4..12]);
         let lsn = u64::from_be_bytes(lsn_bytes);
-        let payload_len_bytes = block[56..60].try_into().map_err(|_| {
-            crate::error::HeraclitusError::DatabaseCorruption("payload_len inválido".into())
-        })?;
-        let payload_len = u32::from_be_bytes(payload_len_bytes) as usize;
-        if HEADER_SIZE + payload_len != block.len() {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption(
-                "tamanho de bloco inconsistente".into(),
-            ));
+        let record_len = u32::from_be_bytes([block[76], block[77], block[78], block[79]]) as usize;
+        if BLOCK_HEADER_SIZE + record_len != block.len() {
+            return Err(DatabaseCorruption("tamanho de bloco inconsistente".into()));
         }
+        let record = &block[BLOCK_HEADER_SIZE..];
 
-        let payload = &block[HEADER_SIZE..];
-
-        // --- Validação física: CRC-32C (CPM-200) ---
-        let fact = match cpm::decode_record(payload) {
-            cpm::CpmDecoded::Record(rec, _) => cpm::record_to_fact(&rec).map_err(|_| {
-                crate::error::HeraclitusError::DatabaseCorruption(format!(
-                    "payload CRF v2 inválido no LSN {lsn}"
-                ))
-            })?,
-            cpm::CpmDecoded::Torn => {
-                return Err(crate::error::HeraclitusError::DatabaseCorruption(format!(
-                    "CRC-32C físico falhou no LSN {lsn} — possível corrupção de disco"
-                )));
-            }
-        };
-
-        // --- Validação de ordem do LSN ---
+        let view = hfb2::RecordView::parse(record).map_err(|error| {
+            DatabaseCorruption(format!("registo invalido no LSN {lsn}: {error}"))
+        })?;
+        if view.lsn != lsn {
+            return Err(DatabaseCorruption(format!(
+                "LSN do bloco ({lsn}) diverge do registo ({})",
+                view.lsn
+            )));
+        }
         if lsn != self.current_lsn + 1 {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption(format!(
+            return Err(DatabaseCorruption(format!(
                 "LSN fora de ordem: esperado {}, recebido {lsn}",
                 self.current_lsn + 1
             )));
         }
 
-        // --- Validação criptográfica: folha + cadeia Merkle BLAKE3 ---
-        let leaf = b3_hex(&core_bytes(&fact));
-        let integ = fact.get("fact.integrity");
-        let emb_leaf = integ
-            .and_then(|i| i.get("leaf_hash"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if emb_leaf != leaf {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption(format!(
-                "folha BLAKE3 divergente no LSN {lsn}"
-            )));
+        let leaf = view.leaf();
+        if leaf != block[12..44] {
+            return Err(DatabaseCorruption(format!("folha divergente no LSN {lsn}")));
         }
-        let new_root = fold_chain(&self.trusted_root, &leaf);
-        let emb_root = integ
-            .and_then(|i| i.get("merkle_root_anchor"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if emb_root != new_root {
-            return Err(crate::error::HeraclitusError::DatabaseCorruption(format!(
+        let root = hfb2::fold_chain(&self.trusted_root, &leaf);
+        if root != block[44..76] {
+            return Err(DatabaseCorruption(format!(
                 "cadeia Merkle divergente no LSN {lsn}"
             )));
         }
 
-        let mut f = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .append(true)
             .open(&self.db_path)
             .map_err(crate::error::HeraclitusError::Io)?;
-        f.write_all(block)
+        file.write_all(block)
             .map_err(crate::error::HeraclitusError::Io)?;
-        f.sync_all().map_err(crate::error::HeraclitusError::Io)?; // follower durável antes do ack
+        file.sync_all().map_err(crate::error::HeraclitusError::Io)?;
         self.current_lsn = lsn;
-        self.trusted_root = new_root;
-        self.persist_anchor().ok();
+        self.trusted_root = root;
+        // A ancora e o que autentica o log: um follower que falhe a grava-la
+        // nao pode ackar como se estivesse tudo bem.
+        self.persist_anchor()
+            .map_err(crate::error::HeraclitusError::Io)?;
         Ok(lsn)
     }
 
-    /// `db.verify()` — reconstrói a cadeia Merkle do disco e detecta adulteração.
+    /// Reconstroi a cadeia a partir do disco e deteta adulteracao.
     ///
-    /// Percorre cada bloco na ordem de gravação e aplica as duas camadas:
-    /// 1. CRC-32C (físico): detecta bit-rot ou truncamento acidental.
-    /// 2. BLAKE3 Merkle chain (criptográfico): detecta adulteração intencional.
+    /// Nao desserializa o Fato para verificar: a folha e calculada sobre os
+    /// bytes canonicos gravados. Um registo com uma extensao que este binario
+    /// nao conhece continua a verificar.
     pub fn verify(&self) -> VerifyResult {
-        let trusted_root = fs::read_to_string(&self.anchor_path)
+        let anchor = fs::read_to_string(&self.anchor_path)
             .ok()
-            .map(|s| s.trim().to_string());
+            .as_deref()
+            .and_then(Anchor::parse);
 
-        // Streaming (Marco A): um bloco em RAM de cada vez — verify() escala
-        // com o tamanho do BLOCO, não do banco. Semântica de status idêntica.
-        let mut chain = String::new();
+        let mut chain = hfb2::EMPTY_ROOT;
         let mut count = 0usize;
+        let mut last_lsn = BASE_LSN;
         let mut violation: Option<String> = None;
-        let outcome = scan_blocks(&self.db_path, |lsn, payload| {
-            // --- Camada 1: física CRC-32C (CPM-200) ---
-            let fact = match cpm::decode_record(payload) {
-                cpm::CpmDecoded::Record(rec, _) => match cpm::record_to_fact(&rec) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        violation = Some(format!("Payload CRF v2 corrompido no LSN {lsn}"));
-                        return false;
-                    }
-                },
-                cpm::CpmDecoded::Torn => {
-                    violation = Some(format!(
-                        "CRC-32C físico falhou no LSN {lsn} — bit-rot detectado"
-                    ));
+        // Raiz no ponto que a ancora diz ter assinado — permite distinguir
+        // "ancora atrasada sobre um log intacto" de "log adulterado".
+        let anchor_lsn = anchor.as_ref().map(|a| a.lsn);
+        let mut chain_at_anchor: Option<[u8; 32]> = None;
+
+        let outcome = scan_blocks(&self.db_path, |header, record| {
+            // --- Camada fisica: estrutura + CRC-32C do registo ---
+            let view = match hfb2::RecordView::parse(record) {
+                Ok(view) => view,
+                Err(error) => {
+                    violation = Some(format!("LSN {}: {error}", header.lsn));
                     return false;
                 }
             };
-
-            // --- Camada 2: criptográfica BLAKE3 Merkle ---
-            let leaf = b3_hex(&core_bytes(&fact));
-            let integ = fact.get("fact.integrity");
-            if let Some(stored) = integ
-                .and_then(|i| i.get("leaf_hash"))
-                .and_then(|v| v.as_str())
-            {
-                if stored != leaf {
-                    violation = Some(format!("Folha BLAKE3 adulterada no LSN {lsn}"));
-                    return false;
-                }
+            if view.lsn != header.lsn {
+                violation = Some(format!(
+                    "LSN {}: o registo declara LSN {}",
+                    header.lsn, view.lsn
+                ));
+                return false;
             }
-            chain = fold_chain(&chain, &leaf);
-            if let Some(stored) = integ
-                .and_then(|i| i.get("merkle_root_anchor"))
-                .and_then(|v| v.as_str())
-            {
-                if stored != chain {
-                    violation = Some(format!("Cadeia Merkle quebrada no LSN {lsn}"));
-                    return false;
-                }
+            if header.lsn != last_lsn + 1 {
+                violation = Some(format!(
+                    "LSN fora de sequencia: esperado {}, encontrado {}",
+                    last_lsn + 1,
+                    header.lsn
+                ));
+                return false;
+            }
+
+            // --- Camada criptografica: folha recalculada + cadeia ---
+            let leaf = view.leaf();
+            if leaf != header.leaf {
+                violation = Some(format!("folha BLAKE3 adulterada no LSN {}", header.lsn));
+                return false;
+            }
+            chain = hfb2::fold_chain(&chain, &leaf);
+            if chain != header.chain_root {
+                violation = Some(format!("cadeia Merkle quebrada no LSN {}", header.lsn));
+                return false;
+            }
+            last_lsn = header.lsn;
+            if anchor_lsn == Some(header.lsn) {
+                chain_at_anchor = Some(chain);
             }
             count += 1;
             true
         });
 
-        if let Some(msg) = violation {
+        let root_hex = to_hex(&chain);
+        if let Some(message) = violation {
             return VerifyResult {
                 status: "VIOLATED".into(),
                 facts: count,
                 root: String::new(),
-                message: msg,
+                message,
             };
         }
         match outcome {
@@ -639,119 +943,159 @@ impl FactStore {
                 status: "ERROR".into(),
                 facts: 0,
                 root: String::new(),
-                message: "Arquivo de banco não encontrado.".into(),
+                message: "Arquivo de banco nao encontrado.".into(),
+            },
+            Ok(ScanOutcome::LegacyGeneration) => VerifyResult {
+                status: "UNSUPPORTED".into(),
+                facts: 0,
+                root: String::new(),
+                message: "Unsupported database generation: HDB1\nExpected: HDB2".into(),
             },
             Ok(ScanOutcome::BadMaster) => VerifyResult {
                 status: "CORRUPTED".into(),
                 facts: 0,
                 root: String::new(),
-                message: "Cabeçalho mestre inválido.".into(),
+                message: "Cabecalho mestre invalido.".into(),
             },
-            Ok(ScanOutcome::BadBlockMagic) => VerifyResult {
+            Ok(ScanOutcome::BadBlockMagic { offset }) => VerifyResult {
                 status: "VIOLATED".into(),
                 facts: count,
                 root: String::new(),
-                message: "Assinatura de bloco corrompida.".into(),
+                message: format!("Assinatura de bloco corrompida no byte {offset}"),
             },
-            Ok(ScanOutcome::Truncated { lsn }) => VerifyResult {
+            Ok(ScanOutcome::BadBlockHeaderCrc { offset }) => VerifyResult {
                 status: "VIOLATED".into(),
                 facts: count,
                 root: String::new(),
-                message: format!("Payload truncado no LSN {lsn}"),
+                message: format!("CRC-32C do cabecalho falhou no byte {offset}"),
+            },
+            Ok(ScanOutcome::Truncated { lsn, offset }) => VerifyResult {
+                status: "VIOLATED".into(),
+                facts: count,
+                root: String::new(),
+                message: format!("Registo truncado no LSN {lsn} (byte {offset})"),
             },
             Ok(ScanOutcome::Done) => {
-                if let Some(anchor) = &trusted_root {
-                    if &chain != anchor {
-                        return VerifyResult {
-                            status: "VIOLATED".into(),
-                            facts: count,
-                            root: chain,
-                            message: "Raiz divergente da âncora.".into(),
-                        };
-                    }
-                }
-                // --- Camada 3: assinatura ed25519 da âncora (Marco B) ---
-                // Fecha o buraco "atacante reescreve .hdb + .anchor consistentes":
-                // sem a chave privada não há `.anchor.sig` válido. Se a chave
-                // pública existe, a assinatura é OBRIGATÓRIA.
-                if let Some(msg) = self.verify_anchor_signature(&chain) {
+                // A assinatura prova o que a ancora DIZ; a comparacao com a
+                // cadeia recalculada prova que o que ela diz continua a valer.
+                if let Some(message) = self.verify_anchor_signature(anchor.as_ref()) {
                     return VerifyResult {
                         status: "VIOLATED".into(),
                         facts: count,
-                        root: chain,
-                        message: msg,
+                        root: root_hex,
+                        message,
                     };
+                }
+                if let Some(anchor) = &anchor {
+                    match anchor.lsn.cmp(&last_lsn) {
+                        std::cmp::Ordering::Equal if anchor.root == chain => {}
+                        std::cmp::Ordering::Less if chain_at_anchor == Some(anchor.root) => {
+                            // O log tem blocos alem do ultimo ponto assinado.
+                            // Acontece num corte de energia entre o fsync do
+                            // bloco e a gravacao da ancora — e e tambem o que se
+                            // veria se alguem tivesse acrescentado blocos sem a
+                            // chave. As duas hipoteses sao indistinguiveis a
+                            // partir do ficheiro, portanto isto NAO se resolve
+                            // sozinho: precisa de uma decisao de quem opera.
+                            return VerifyResult {
+                                status: "ANCHOR_BEHIND".into(),
+                                facts: count,
+                                root: root_hex,
+                                message: format!(
+                                    "log intacto ate ao LSN {last_lsn}, ancora assinada no LSN {} \
+                                     ({} bloco(s) por assinar)",
+                                    anchor.lsn,
+                                    last_lsn - anchor.lsn
+                                ),
+                            };
+                        }
+                        std::cmp::Ordering::Greater => {
+                            return VerifyResult {
+                                status: "VIOLATED".into(),
+                                facts: count,
+                                root: root_hex,
+                                message: format!(
+                                    "Ancora descreve LSN {}, o log termina em {last_lsn}",
+                                    anchor.lsn
+                                ),
+                            }
+                        }
+                        _ => {
+                            return VerifyResult {
+                                status: "VIOLATED".into(),
+                                facts: count,
+                                root: root_hex,
+                                message: "Raiz divergente da ancora.".into(),
+                            }
+                        }
+                    }
                 }
                 VerifyResult {
                     status: "INTEG_OK".into(),
                     facts: count,
-                    root: chain,
+                    root: root_hex,
                     message: String::new(),
                 }
             }
         }
     }
 
-    /// Confere a assinatura ed25519 da âncora (`<db>.anchor.sig`) sobre a raiz
-    /// recalculada, usando a chave pública `<db>.pub`. Devolve `Some(msg)` se
-    /// houver violação, `None` se OK (ou se o banco é intencionalmente sem
-    /// chave pública — modo legado, sem assinatura). `root` é a raiz que o
-    /// `verify()` acabou de reconstruir do disco.
-    fn verify_anchor_signature(&self, root: &str) -> Option<String> {
+    /// Confere a assinatura Ed25519 sobre o par `(raiz, lsn)` que a propria
+    /// ancora declara. Devolve `Some(mensagem)` se houver violacao.
+    fn verify_anchor_signature(&self, anchor: Option<&Anchor>) -> Option<String> {
         let pub_hex = match fs::read_to_string(&self.pub_path) {
             Ok(s) => s,
             Err(_) => {
-                return Some("chave pública ed25519 ausente — cadeia Merkle não autenticada".into())
+                return Some("chave publica ed25519 ausente — cadeia Merkle nao autenticada".into())
             }
         };
-        let vk = from_hex(&pub_hex)
+        let key = from_hex(&pub_hex)
             .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
             .and_then(|b| VerifyingKey::from_bytes(&b).ok());
-        let vk = match vk {
-            Some(v) => v,
-            None => return Some("chave pública ed25519 ilegível".into()),
+        let key = match key {
+            Some(key) => key,
+            None => return Some("chave publica ed25519 ilegivel".into()),
         };
-        let sig = fs::read_to_string(&self.anchor_sig_path)
-            .ok()
-            .and_then(|s| from_hex(&s))
-            .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
-            .map(|b| Signature::from_bytes(&b));
-        let sig = match sig {
-            Some(s) => s,
-            None => return Some("assinatura da âncora ausente ou ilegível".into()),
+        let anchor = match anchor {
+            Some(anchor) => anchor,
+            None => return Some("ancora ausente ou ilegivel".into()),
         };
-        match vk.verify(root.as_bytes(), &sig) {
+        match key.verify(
+            &anchor_message(&anchor.root, anchor.lsn),
+            &Signature::from_bytes(&anchor.signature),
+        ) {
             Ok(()) => None,
-            Err(_) => Some("assinatura ed25519 da âncora inválida — adulteração".into()),
+            Err(_) => Some("assinatura ed25519 da ancora invalida — adulteracao".into()),
         }
     }
 
-    /// Simula atacante: flipa 1 char hex dentro do hash de evidência (mesmo tamanho).
-    /// Nota: com CPM, o tamper deve contornar o CRC-32C para simular adulteração
-    /// criptográfica. Este método flippa um byte dentro do payload CRF v2, o que
-    /// fará o CRC-32C falhar (VIOLATED pela camada física) — comportamento correto
-    /// para demonstrar que a camada física detecta qualquer modificação.
+    /// Simula um atacante a alterar um byte do registo do LSN indicado.
+    /// Usado pelos testes e pela demo para provar que a deteccao funciona.
     pub fn inject_malicious_tamper(&self, target_lsn: u64) -> std::io::Result<bool> {
         let mut data = fs::read(&self.db_path)?;
-        let mut pos = 8usize;
-        while pos + HEADER_SIZE <= data.len() {
-            let header = &data[pos..pos + HEADER_SIZE];
-            let lsn_bytes = header[4..12].try_into().unwrap_or([0; 8]);
+        let mut pos = MASTER_HEADER_SIZE;
+        while pos + BLOCK_HEADER_SIZE <= data.len() {
+            let header = &data[pos..pos + BLOCK_HEADER_SIZE];
+            let mut lsn_bytes = [0u8; 8];
+            lsn_bytes.copy_from_slice(&header[4..12]);
             let lsn = u64::from_be_bytes(lsn_bytes);
-            let payload_len_bytes = header[56..60].try_into().unwrap_or([0; 4]);
-            let payload_len = u32::from_be_bytes(payload_len_bytes) as usize;
-            let start = pos + HEADER_SIZE;
-            if lsn == target_lsn && start + payload_len <= data.len() {
-                // Flipa um byte dentro do payload CRF v2 (após o CRC-32C dos primeiros 4B).
-                // Isso corrompe a camada física: o verify() detecta via CRC-32C.
-                let tamper_off = start + cpm::FIXED_PREFIX_LEN + 8; // dentro dos dados variáveis
-                if tamper_off < start + payload_len {
-                    data[tamper_off] ^= 0x01;
+            let record_len =
+                u32::from_be_bytes([header[76], header[77], header[78], header[79]]) as usize;
+            let start = pos + BLOCK_HEADER_SIZE;
+            if start + record_len > data.len() {
+                return Ok(false);
+            }
+            if lsn == target_lsn {
+                // Dentro do core do registo: o CRC do registo passa a falhar e
+                // a folha recalculada deixa de bater. As duas camadas acusam.
+                let offset = start + hfb2::FIXED_HEADER_LEN;
+                if offset < start + record_len {
+                    data[offset] ^= 0x01;
                     fs::write(&self.db_path, &data)?;
                     return Ok(true);
                 }
             }
-            pos = start + payload_len;
+            pos = start + record_len;
         }
         Ok(false)
     }
@@ -770,7 +1114,7 @@ mod tests {
         let p =
             std::env::temp_dir().join(format!("forge_{}_{}_{}.hdb", tag, std::process::id(), n));
         let s = p.to_str().unwrap().to_string();
-        for ext in ["", ".anchor", ".anchor.sig", ".key", ".pub"] {
+        for ext in ["", ".anchor", ".anchor.tmp", ".key", ".pub"] {
             let _ = fs::remove_file(format!("{s}{ext}"));
         }
         s
@@ -779,243 +1123,537 @@ mod tests {
     fn fact(action: &str) -> Value {
         json!({
             "fact_id": "019f035c-1823-7fe9-8c54-02b2d1acc30c",
+            "fact.datasource": {
+                "tenant_id": "gov.br/orgao-a",
+                "datasource_id": "teste://fixture",
+                "sensor_id": "forge-teste"
+            },
             "fact.identity": {"actor.id":"a","actor.name":"a","target.id":"t","source.ip":null},
             "fact.time": {"system_timestamp": 1_782_467_794_979_937i64, "log_sequence_number": 0u64},
             "fact.behavior": {"class":"c","action":action,"risk_level":"Medium"},
-            "fact.evidence": {"raw_observation_hash":"b3:abcd","carimbo_tempo_legal":"icp"},
+            "fact.evidence": {
+                "raw_observation_hash": "b3:9611cd00aabbccddeeff00112233445566778899aabbccddeeff001122334455",
+                "carimbo_tempo_legal": "icp"
+            },
             "fact.lineage": {"transformation_steps":["parse"],"input_source":"pg","matched_rule":"r"},
             "fact.confidence": 0.9,
             "fact.knowledge_version":"k-v1","fact.reasoning_version":"r-v6","fact.ontology_version":"v9"
         })
     }
 
-    // -- export_facts: a superfície que a ponte Forge -> FactStore consome --
+    // -- geracao do ficheiro -------------------------------------------------
 
-    /// O exportador tem de devolver os Fatos ÍNTEGROS e por ordem de LSN, e o
-    /// `last_lsn` tem de ser o ponto de retoma correto.
     #[test]
-    fn export_facts_yields_every_written_fact() {
-        let p = tmp_path("export_all");
-        let mut db = FactStore::new(&p).unwrap();
-        for i in 0..5 {
-            let mut f = fact(&format!("action{i}"));
-            db.write_fact(&mut f).unwrap();
-        }
+    fn a_new_store_declares_the_hdb2_generation() {
+        let path = tmp_path("gen");
+        let db = FactStore::new(&path).unwrap();
+        assert_eq!(db.verify().status, "INTEG_OK");
+        let master = fs::read(&path).unwrap();
+        assert_eq!(&master[..4], MASTER_MAGIC);
+        assert_eq!(
+            u32::from_be_bytes([master[4], master[5], master[6], master[7]]),
+            GENERATION
+        );
+    }
 
+    #[test]
+    fn a_legacy_hdb1_file_is_refused_by_name() {
+        // Nao ha migracao automatica e nao ha reinterpretacao silenciosa: o
+        // formato antigo e nomeado e recusado.
+        let path = tmp_path("legacy");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(LEGACY_MASTER_MAGIC).unwrap();
+        file.write_all(&7u32.to_be_bytes()).unwrap();
+        drop(file);
+
+        let error = FactStore::new(&path)
+            .err()
+            .expect("HDB1 tem de ser recusado");
+        let message = error.to_string();
+        assert!(
+            message.contains("Unsupported database generation: HDB1"),
+            "{message}"
+        );
+        assert!(message.contains("Expected: HDB2"), "{message}");
+        assert_eq!(verify_file(&path).status, "UNSUPPORTED");
+    }
+
+    #[test]
+    fn an_unknown_generation_number_is_refused() {
+        let path = tmp_path("gen99");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(MASTER_MAGIC).unwrap();
+        file.write_all(&99u32.to_be_bytes()).unwrap();
+        drop(file);
+        let message = FactStore::new(&path).err().expect("recusa").to_string();
+        assert!(message.contains("HDB99"), "{message}");
+    }
+
+    // -- round-trip sem perda ------------------------------------------------
+
+    #[test]
+    fn every_persisted_field_comes_back_out_of_the_store() {
+        let path = tmp_path("roundtrip");
+        let mut db = FactStore::new(&path).unwrap();
+        let mut written = fact("authentication.failure");
+        written["fact.security"] = json!({"category": "authentication", "severity": 7});
+        written["fact.extensions"] = json!([{"tag": "0xffff0003", "value_hex": "0badc0de"}]);
+        db.write_fact(&mut written).unwrap();
+
+        let mut read = Vec::new();
+        export_facts(&path, 0, |_, fact| {
+            read.push(fact);
+            true
+        })
+        .unwrap();
+        assert_eq!(read.len(), 1);
+        let out = &read[0];
+
+        assert_eq!(out["fact_id"], written["fact_id"]);
+        assert_eq!(out["fact.datasource"], written["fact.datasource"]);
+        assert_eq!(out["fact.behavior"], written["fact.behavior"]);
+        assert_eq!(out["fact.security"], written["fact.security"]);
+        assert_eq!(out["fact.extensions"][0]["tag"], "0xffff0003");
+        assert_eq!(out["fact.extensions"][0]["value_hex"], "0badc0de");
+        assert_eq!(out["fact.evidence"]["carimbo_tempo_legal"], "icp");
+        assert_eq!(out["fact.confidence"], 0.9);
+        assert_eq!(out["fact.schema"]["label"], "operational-fact/1.0");
+        // A integridade vem do BLOCO, nao do registo — nao ha circularidade.
+        assert_eq!(
+            out["fact.integrity"]["leaf_hash"],
+            written["fact.integrity"]["leaf_hash"]
+        );
+    }
+
+    #[test]
+    fn export_facts_yields_every_written_fact_in_lsn_order() {
+        let path = tmp_path("export_all");
+        let mut db = FactStore::new(&path).unwrap();
+        for i in 0..5 {
+            db.write_fact(&mut fact(&format!("a{i}"))).unwrap();
+        }
         let mut seen = Vec::new();
-        let st = export_facts(&p, 0, |lsn, f| {
+        let stats = export_facts(&path, 0, |lsn, fact| {
             seen.push((
                 lsn,
-                f["fact.behavior"]["action"].as_str().unwrap().to_string(),
+                fact["fact.behavior"]["action"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
             ));
             true
         })
         .unwrap();
-
-        assert_eq!(st.exported, 5, "todos os fatos escritos têm de sair");
-        assert_eq!(st.torn, 0);
-        assert_eq!(st.undecodable, 0);
-        assert_eq!(seen.len(), 5);
-        // Ordem de LSN estritamente crescente — a ponte depende disto para retomar.
-        assert!(
-            seen.windows(2).all(|w| w[0].0 < w[1].0),
-            "LSN tem de crescer"
+        assert_eq!(stats.exported, 5);
+        assert_eq!(stats.last_lsn, BASE_LSN + 5);
+        assert_eq!(
+            seen.iter().map(|(lsn, _)| *lsn).collect::<Vec<_>>(),
+            (1..=5).map(|i| BASE_LSN + i).collect::<Vec<_>>()
         );
-        assert_eq!(seen[0].1, "action0");
-        assert_eq!(seen[4].1, "action4");
-        assert_eq!(st.last_lsn, seen[4].0);
+        assert_eq!(seen[4].1, "a4");
     }
 
-    /// `from_lsn` é o contrato de retoma: exportar duas vezes seguidas não pode
-    /// entregar o mesmo Fato duas vezes — senão a ponte duplica no HeraclitusDB.
     #[test]
     fn export_facts_from_lsn_resumes_without_duplicates() {
-        let p = tmp_path("export_resume");
-        let mut db = FactStore::new(&p).unwrap();
-        for i in 0..6 {
-            let mut f = fact(&format!("a{i}"));
-            db.write_fact(&mut f).unwrap();
+        let path = tmp_path("export_resume");
+        let mut db = FactStore::new(&path).unwrap();
+        for i in 0..4 {
+            db.write_fact(&mut fact(&format!("a{i}"))).unwrap();
         }
-
-        // Primeiro lote: 4 Fatos (limite via early-exit do callback).
-        let mut first = Vec::new();
-        let st1 = export_facts(&p, 0, |lsn, _| {
-            first.push(lsn);
-            first.len() < 4
-        })
-        .unwrap();
-        assert_eq!(first.len(), 4);
-
-        // Segundo lote: retoma do último entregue.
-        let mut second = Vec::new();
-        let st2 = export_facts(&p, st1.last_lsn, |lsn, _| {
-            second.push(lsn);
+        let mut seen = Vec::new();
+        export_facts(&path, BASE_LSN + 2, |lsn, _| {
+            seen.push(lsn);
             true
         })
         .unwrap();
-
-        assert_eq!(second.len(), 2, "sobram exatamente os 2 que faltavam");
-        assert!(
-            first.iter().all(|l| !second.contains(l)),
-            "nenhum LSN pode aparecer nos dois lotes"
-        );
-        assert_eq!(st2.exported, 2);
+        assert_eq!(seen, vec![BASE_LSN + 3, BASE_LSN + 4]);
     }
 
-    /// Um bloco com CRC-32C partido é SALTADO e CONTADO — nunca silenciado nem
-    /// entregue como Fato válido. É isto que impede a ponte de propagar dados
-    /// corrompidos para o HeraclitusDB.
+    // -- lote e estado -------------------------------------------------------
+
     #[test]
-    fn export_facts_counts_tampered_blocks_instead_of_yielding_them() {
-        let p = tmp_path("export_tamper");
-        let mut db = FactStore::new(&p).unwrap();
-        let mut lsns = Vec::new();
-        for i in 0..3 {
-            let mut f = fact(&format!("a{i}"));
-            lsns.push(db.write_fact(&mut f).unwrap());
-        }
-
-        let clean = export_facts(&p, 0, |_, _| true).unwrap();
-        assert_eq!(clean.exported, 3);
-        assert_eq!(clean.torn, 0);
-
-        // Corrompe fisicamente o bloco do meio.
-        assert!(db.inject_malicious_tamper(lsns[1]).unwrap());
-
-        let after = export_facts(&p, 0, |_, _| true).unwrap();
-        assert_eq!(after.scanned, 3, "os 3 blocos continuam a ser varridos");
+    fn a_batch_gets_consecutive_lsns_and_one_anchor() {
+        let path = tmp_path("batch");
+        let mut db = FactStore::new(&path).unwrap();
+        let mut lote: Vec<Value> = (0..3).map(|i| fact(&format!("b{i}"))).collect();
+        let outcome = db.write_batch(&mut lote).unwrap();
         assert_eq!(
-            after.exported + after.torn + after.undecodable,
-            3,
-            "cada bloco é exportado OU contado como partido — nada desaparece"
+            (outcome.first_lsn, outcome.last_lsn, outcome.persisted),
+            (BASE_LSN + 1, BASE_LSN + 3, 3)
         );
-        assert!(
-            after.torn + after.undecodable >= 1,
-            "o bloco adulterado tem de ser apanhado"
-        );
-        assert!(
-            after.exported < 3,
-            "um bloco adulterado não pode sair como Fato válido"
-        );
+        for (index, item) in lote.iter().enumerate() {
+            assert_eq!(
+                item["fact.time"]["log_sequence_number"],
+                BASE_LSN + index as u64 + 1
+            );
+            assert!(item["fact.integrity"]["leaf_hash"].is_string());
+        }
+        assert_eq!(db.verify().status, "INTEG_OK");
     }
 
-    /// Um `.hdb` que não existe não é um panic nem um sucesso vazio ambíguo.
     #[test]
-    fn export_facts_on_missing_file_is_empty_not_panic() {
-        let st = export_facts("nao_existe_de_todo.hdb", 0, |_, _| true).unwrap();
-        assert_eq!(st.exported, 0);
-        assert_eq!(st.scanned, 0);
+    fn a_failed_write_does_not_advance_the_chain() {
+        // No HDB1 o LSN e a raiz avancavam ANTES do I/O e nao havia rollback:
+        // um unico erro transitorio deixava o banco irrecuperavel para sempre.
+        let path = tmp_path("rollback");
+        let mut db = FactStore::new(&path).unwrap();
+        db.write_fact(&mut fact("antes")).unwrap();
+        let lsn_before = db.current_lsn;
+        let root_before = db.trusted_root_hex();
+
+        fs::remove_file(&path).unwrap(); // o append passa a falhar
+        assert!(db.write_fact(&mut fact("durante")).is_err());
+
+        assert_eq!(db.current_lsn, lsn_before);
+        assert_eq!(db.trusted_root_hex(), root_before);
     }
 
-    /// Regressão do bug-chave: reabrir um `.hdb` existente TEM de recuperar
-    /// `current_lsn` + `trusted_root` do disco. Sem `recover()`, o append da
-    /// segunda sessão dobrava a cadeia Merkle a partir do vazio e o `verify()`
-    /// marcava um banco íntegro como VIOLATED.
+    #[test]
+    fn an_empty_batch_changes_nothing() {
+        let path = tmp_path("batch_vazio");
+        let mut db = FactStore::new(&path).unwrap();
+        let outcome = db.write_batch(&mut []).unwrap();
+        assert_eq!(outcome.persisted, 0);
+        assert_eq!(db.current_lsn, BASE_LSN);
+    }
+
+    #[test]
+    fn a_fact_without_identity_is_refused_before_touching_the_disk() {
+        let path = tmp_path("sem_identidade");
+        let mut db = FactStore::new(&path).unwrap();
+        let mut orphan = fact("x");
+        orphan.as_object_mut().unwrap().remove("fact.datasource");
+        assert!(db.write_fact(&mut orphan).is_err());
+        assert_eq!(db.current_lsn, BASE_LSN);
+        assert_eq!(db.verify().facts, 0);
+    }
+
+    // -- reabertura e integridade -------------------------------------------
+
     #[test]
     fn reopen_preserves_chain_and_verifies() {
-        let base = std::env::temp_dir().join(format!("forge_reopen_{}.hdb", std::process::id()));
-        let p = base.to_str().unwrap();
-        let _ = fs::remove_file(p);
-        let _ = fs::remove_file(format!("{p}.anchor"));
-
-        // Sessão 1: cria e escreve 3 fatos.
-        {
-            let mut db = FactStore::new(p).unwrap();
+        let path = tmp_path("reopen");
+        let root = {
+            let mut db = FactStore::new(&path).unwrap();
             for i in 0..3 {
-                let mut f = fact(&format!("a{i}"));
-                db.write_fact(&mut f).unwrap();
-            }
-            assert_eq!(db.verify().status, "INTEG_OK");
-        }
-        // Sessão 2: REABRE e escreve mais 2.
-        {
-            let mut db = FactStore::new(p).unwrap();
-            assert_eq!(
-                db.current_lsn,
-                BASE_LSN + 3,
-                "LSN não recuperado no reabrir"
-            );
-            for i in 3..5 {
-                let mut f = fact(&format!("a{i}"));
-                db.write_fact(&mut f).unwrap();
-            }
-            let r = db.verify();
-            assert_eq!(
-                r.status, "INTEG_OK",
-                "reabrir+append quebrou a cadeia: {}",
-                r.message
-            );
-            assert_eq!(r.facts, 5);
-        }
-        let _ = fs::remove_file(p);
-        let _ = fs::remove_file(format!("{p}.anchor"));
-    }
-
-    /// Marco B: uma assinatura de âncora corrompida é rejeitada — a integridade
-    /// cripto (camada 3) é imposta, não decorativa.
-    #[test]
-    fn tampered_anchor_signature_is_rejected() {
-        let p = tmp_path("sigtamper");
-        {
-            let mut db = FactStore::new(&p).unwrap();
-            for i in 0..2 {
                 db.write_fact(&mut fact(&format!("a{i}"))).unwrap();
             }
-            assert_eq!(db.verify().status, "INTEG_OK");
+            db.trusted_root_hex()
+        };
+        let reopened = FactStore::new(&path).unwrap();
+        assert_eq!(reopened.current_lsn, BASE_LSN + 3);
+        assert_eq!(reopened.trusted_root_hex(), root);
+        assert_eq!(reopened.verify().status, "INTEG_OK");
+    }
+
+    #[test]
+    fn tampering_with_a_record_is_detected() {
+        let path = tmp_path("tamper");
+        let mut db = FactStore::new(&path).unwrap();
+        for i in 0..3 {
+            db.write_fact(&mut fact(&format!("a{i}"))).unwrap();
         }
-        // Sobrescreve a assinatura com uma de tamanho válido mas errada.
-        fs::write(format!("{p}.anchor.sig"), "0".repeat(128)).unwrap();
-        let r = verify_file(&p);
-        assert_eq!(r.status, "VIOLATED", "sig corrompida devia falhar");
+        assert!(db.inject_malicious_tamper(BASE_LSN + 2).unwrap());
+        let verified = db.verify();
+        assert_eq!(verified.status, "VIOLATED");
         assert!(
-            FactStore::new(&p).is_err(),
-            "writer tem de recusar origem violada"
+            verified.message.contains(&format!("LSN {}", BASE_LSN + 2)),
+            "{}",
+            verified.message
         );
     }
 
-    /// Marco B — a propriedade central: um atacante com acesso de ESCRITA aos
-    /// ficheiros de dados (mas SEM a chave privada) reescreve `.hdb` + `.anchor`
-    /// + `.anchor.sig` de forma internamente consistente, assinando com a SUA
-    ///
-    /// chave. A chave pública fixada da vítima (`.pub`) rejeita a assinatura
-    /// estranha — o buraco "reescreve tudo consistente" fica fechado.
     #[test]
-    fn foreign_key_signature_is_rejected() {
-        let victim = tmp_path("victim");
-        {
-            let mut db = FactStore::new(&victim).unwrap();
-            for i in 0..2 {
-                db.write_fact(&mut fact(&format!("v{i}"))).unwrap();
-            }
-            assert_eq!(db.verify().status, "INTEG_OK");
-        }
-        // Atacante: banco próprio (⇒ chave própria) com Fatos diferentes.
-        let attacker = tmp_path("attacker");
-        {
-            let mut db = FactStore::new(&attacker).unwrap();
-            for i in 0..3 {
-                db.write_fact(&mut fact(&format!("x{i}"))).unwrap();
-            }
-        }
-        // Substitui os dados da vítima pelos do atacante — MENOS a `.pub`, que
-        // continua a fixar a chave original da vítima.
-        fs::copy(&attacker, &victim).unwrap();
-        fs::copy(format!("{attacker}.anchor"), format!("{victim}.anchor")).unwrap();
-        fs::copy(
-            format!("{attacker}.anchor.sig"),
-            format!("{victim}.anchor.sig"),
+    fn rewriting_the_tenant_on_disk_breaks_the_leaf() {
+        // O teste que justifica pôr a identidade no cabecalho autenticado em
+        // vez de numa extensao protegida so por CRC. Aqui o atacante corrige
+        // os DOIS CRC (registo e cabecalho do bloco) e mesmo assim e apanhado.
+        let path = tmp_path("tenant");
+        let mut db = FactStore::new(&path).unwrap();
+        db.write_fact(&mut fact("a")).unwrap();
+        drop(db);
+
+        let mut data = fs::read(&path).unwrap();
+        let record_start = MASTER_HEADER_SIZE + BLOCK_HEADER_SIZE;
+        let record_len = u32::from_be_bytes([
+            data[MASTER_HEADER_SIZE + 76],
+            data[MASTER_HEADER_SIZE + 77],
+            data[MASTER_HEADER_SIZE + 78],
+            data[MASTER_HEADER_SIZE + 79],
+        ]) as usize;
+        let identity_at = record_start + crate::hfb2::FIXED_HEADER_LEN;
+        let original = String::from_utf8(data[identity_at..identity_at + 14].to_vec()).unwrap();
+        assert_eq!(original, "gov.br/orgao-a");
+        data[identity_at..identity_at + 14].copy_from_slice(b"gov.br/orgao-b");
+
+        // Reparar o CRC do registo...
+        let record_end = record_start + record_len;
+        let crc = crc32c(&data[record_start..record_end - crate::hfb2::CRC_LEN]);
+        data[record_end - crate::hfb2::CRC_LEN..record_end].copy_from_slice(&crc.to_be_bytes());
+        // ...e o CRC do cabecalho do bloco.
+        let header_crc = crc32c(&data[MASTER_HEADER_SIZE..MASTER_HEADER_SIZE + 80]);
+        data[MASTER_HEADER_SIZE + 80..MASTER_HEADER_SIZE + 84]
+            .copy_from_slice(&header_crc.to_be_bytes());
+        fs::write(&path, &data).unwrap();
+
+        let verified = verify_file(&path);
+        assert_eq!(verified.status, "VIOLATED");
+        assert!(verified.message.contains("folha"), "{}", verified.message);
+        // E o banco recusa-se a abrir.
+        assert!(FactStore::new(&path).is_err());
+    }
+
+    #[test]
+    fn a_truncated_tail_fails_deterministically() {
+        let path = tmp_path("truncado");
+        let mut db = FactStore::new(&path).unwrap();
+        db.write_fact(&mut fact("a")).unwrap();
+        db.write_fact(&mut fact("b")).unwrap();
+        drop(db);
+
+        let mut data = fs::read(&path).unwrap();
+        data.truncate(data.len() - 20);
+        fs::write(&path, &data).unwrap();
+
+        let verified = verify_file(&path);
+        assert_eq!(verified.status, "VIOLATED");
+        assert!(
+            verified.message.contains("truncado"),
+            "{}",
+            verified.message
+        );
+        assert_eq!(verified, verify_file(&path)); // deterministico
+        assert!(FactStore::new(&path).is_err());
+    }
+
+    #[test]
+    fn an_anchor_behind_the_log_is_named_not_called_tampering() {
+        // Corte de energia entre o fsync do bloco e a gravacao da ancora. O
+        // HDB1 chamava a isto "adulteracao" e transformava uma falta de luz
+        // numa perda de servico permanente sem explicacao.
+        let path = tmp_path("ancora_atrasada");
+        let mut db = FactStore::new(&path).unwrap();
+        db.write_fact(&mut fact("a")).unwrap();
+        let anchor_after_first = fs::read(format!("{path}.anchor")).unwrap();
+        db.write_fact(&mut fact("b")).unwrap();
+        drop(db);
+        fs::write(format!("{path}.anchor"), &anchor_after_first).unwrap();
+
+        let verified = verify_file(&path);
+        assert_eq!(verified.status, "ANCHOR_BEHIND");
+        assert!(
+            verified.message.contains(&format!("LSN {}", BASE_LSN + 1)),
+            "{}",
+            verified.message
+        );
+        // Continua a NAO abrir: as duas hipoteses (corte de energia ou blocos
+        // acrescentados por outrem) sao indistinguiveis a partir do ficheiro.
+        assert!(FactStore::new(&path).is_err());
+    }
+
+    #[test]
+    fn an_anchor_ahead_of_the_log_is_a_violation() {
+        let path = tmp_path("ancora_adiantada");
+        let mut db = FactStore::new(&path).unwrap();
+        db.write_fact(&mut fact("a")).unwrap();
+        db.write_fact(&mut fact("b")).unwrap();
+        let anchor = fs::read(format!("{path}.anchor")).unwrap();
+        drop(db);
+
+        // Remove o ultimo bloco mas mantem a ancora que o cobria.
+        let data = fs::read(&path).unwrap();
+        let record_len = u32::from_be_bytes([
+            data[MASTER_HEADER_SIZE + 76],
+            data[MASTER_HEADER_SIZE + 77],
+            data[MASTER_HEADER_SIZE + 78],
+            data[MASTER_HEADER_SIZE + 79],
+        ]) as usize;
+        fs::write(
+            &path,
+            &data[..MASTER_HEADER_SIZE + BLOCK_HEADER_SIZE + record_len],
+        )
+        .unwrap();
+        fs::write(format!("{path}.anchor"), &anchor).unwrap();
+
+        let verified = verify_file(&path);
+        assert_eq!(verified.status, "VIOLATED");
+    }
+
+    #[test]
+    fn tampered_anchor_signature_is_rejected() {
+        let path = tmp_path("ancora_sig");
+        let mut db = FactStore::new(&path).unwrap();
+        db.write_fact(&mut fact("a")).unwrap();
+        drop(db);
+
+        let anchor = fs::read_to_string(format!("{path}.anchor")).unwrap();
+        let forged: String = anchor
+            .lines()
+            .map(|line| {
+                if let Some(sig) = line.strip_prefix("sig=") {
+                    let mut bytes: Vec<char> = sig.chars().collect();
+                    bytes[0] = if bytes[0] == 'a' { 'b' } else { 'a' };
+                    format!("sig={}", bytes.into_iter().collect::<String>())
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(format!("{path}.anchor"), forged).unwrap();
+
+        let verified = verify_file(&path);
+        assert_eq!(verified.status, "VIOLATED");
+        assert!(
+            verified.message.contains("assinatura"),
+            "{}",
+            verified.message
+        );
+    }
+
+    #[test]
+    fn a_foreign_public_key_is_rejected() {
+        let path = tmp_path("chave_alheia");
+        let mut db = FactStore::new(&path).unwrap();
+        db.write_fact(&mut fact("a")).unwrap();
+        drop(db);
+
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed).unwrap();
+        let outra = SigningKey::from_bytes(&seed);
+        fs::write(
+            format!("{path}.pub"),
+            to_hex(outra.verifying_key().as_bytes()),
         )
         .unwrap();
 
-        let r = verify_file(&victim);
+        assert_eq!(verify_file(&path).status, "VIOLATED");
+    }
+
+    #[test]
+    fn a_record_whose_block_lsn_disagrees_is_a_violation() {
+        let path = tmp_path("lsn_divergente");
+        let mut db = FactStore::new(&path).unwrap();
+        db.write_fact(&mut fact("a")).unwrap();
+        drop(db);
+
+        let mut data = fs::read(&path).unwrap();
+        data[MASTER_HEADER_SIZE + 4..MASTER_HEADER_SIZE + 12].copy_from_slice(&99u64.to_be_bytes());
+        let header_crc = crc32c(&data[MASTER_HEADER_SIZE..MASTER_HEADER_SIZE + 80]);
+        data[MASTER_HEADER_SIZE + 80..MASTER_HEADER_SIZE + 84]
+            .copy_from_slice(&header_crc.to_be_bytes());
+        fs::write(&path, &data).unwrap();
+
+        assert_eq!(verify_file(&path).status, "VIOLATED");
+    }
+
+    // -- replicacao ----------------------------------------------------------
+
+    #[test]
+    fn a_replicated_block_is_accepted_and_its_tampering_is_not() {
+        let leader_path = tmp_path("lider");
+        let follower_path = tmp_path("seguidor");
+        let mut leader = FactStore::new(&leader_path).unwrap();
+        let mut follower = FactStore::new(&follower_path).unwrap();
+
+        let (lsn, _, block) = leader.commit_local(&mut fact("a")).unwrap();
+        assert_eq!(follower.append_replicated_block(&block).unwrap(), lsn);
+        assert_eq!(follower.verify().status, "INTEG_OK");
+
+        let (_, _, mut second) = leader.commit_local(&mut fact("b")).unwrap();
+        let at = BLOCK_HEADER_SIZE + crate::hfb2::FIXED_HEADER_LEN;
+        second[at] ^= 0x01;
+        assert!(follower.append_replicated_block(&second).is_err());
+        assert_eq!(follower.current_lsn, BASE_LSN + 1);
+    }
+
+    // -- verificacao sem semantica ------------------------------------------
+
+    #[test]
+    fn health_events_share_the_log_and_the_chain_with_facts() {
+        // A saude do sensor entra na MESMA cadeia Merkle que a evidencia. E
+        // esse o ponto: um sensor nao consegue esconder que esteve cego sem
+        // partir a cadeia que assina os Fatos.
+        let path = tmp_path("saude");
+        let mut db = FactStore::new(&path).unwrap();
+        let identity =
+            hfb2::SecurityIdentity::new("gov.br/orgao-a", "teste://fixture", "forge-teste")
+                .unwrap();
+
+        db.write_fact(&mut fact("a")).unwrap();
+        let health_lsn = db
+            .write_health_event(&identity, 1_782_467_794_979_937, r#"{"schema":"x"}"#)
+            .unwrap();
+        db.write_fact(&mut fact("b")).unwrap();
+        assert_eq!(db.verify().status, "INTEG_OK");
+
+        let mut tipos = Vec::new();
+        export_records(&path, 0, |lsn, record| {
+            tipos.push((lsn, record.record_type()));
+            if let ExportedRecord::TelemetryHealth { identity, envelope } = &record {
+                assert_eq!(identity.tenant_id, "gov.br/orgao-a");
+                assert_eq!(envelope, r#"{"schema":"x"}"#);
+            }
+            true
+        })
+        .unwrap();
         assert_eq!(
-            r.status, "VIOLATED",
-            "assinatura de chave estranha devia ser rejeitada: {}",
-            r.message
+            tipos,
+            vec![
+                (BASE_LSN + 1, "OperationalFact"),
+                (BASE_LSN + 2, "TelemetryHealth"),
+                (BASE_LSN + 3, "OperationalFact"),
+            ]
         );
-        assert!(
-            FactStore::new(&victim).is_err(),
-            "writer tem de recusar chave estranha"
+        assert_eq!(health_lsn, BASE_LSN + 2);
+
+        // E o exportador de Fatos continua a devolver so Fatos.
+        let mut fatos = 0;
+        export_facts(&path, 0, |_, _| {
+            fatos += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(fatos, 2);
+    }
+
+    #[test]
+    fn tampering_with_a_health_event_is_detected_like_any_other_record() {
+        let path = tmp_path("saude_adulterada");
+        let mut db = FactStore::new(&path).unwrap();
+        let identity =
+            hfb2::SecurityIdentity::new("gov.br/orgao-a", "teste://fixture", "forge-teste")
+                .unwrap();
+        db.write_health_event(&identity, 1_782_467_794_979_937, r#"{"schema":"x"}"#)
+            .unwrap();
+        assert!(db.inject_malicious_tamper(BASE_LSN + 1).unwrap());
+        assert_eq!(db.verify().status, "VIOLATED");
+    }
+
+    #[test]
+    fn verification_does_not_depend_on_understanding_the_record() {
+        // Um registo com uma extensao que este binario nao sabe interpretar
+        // continua a verificar: a folha e sobre os BYTES, nao sobre o que o
+        // descodificador conseguiu reconstruir.
+        let path = tmp_path("opaco");
+        let mut db = FactStore::new(&path).unwrap();
+        let mut opaque = fact("a");
+        opaque["fact.extensions"] = json!([
+            {"tag": "0x00070042", "value_hex": "deadbeefdeadbeef"}
+        ]);
+        db.write_fact(&mut opaque).unwrap();
+        assert_eq!(db.verify().status, "INTEG_OK");
+
+        let mut exported = Vec::new();
+        export_facts(&path, 0, |_, fact| {
+            exported.push(fact);
+            true
+        })
+        .unwrap();
+        assert_eq!(exported[0]["fact.extensions"][0]["namespace"], "case");
+        assert_eq!(
+            exported[0]["fact.extensions"][0]["value_hex"],
+            "deadbeefdeadbeef"
         );
     }
 }

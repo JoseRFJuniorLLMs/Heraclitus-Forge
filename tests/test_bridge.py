@@ -270,6 +270,11 @@ def test_gateway_quarantines_drift_without_echoing_pii(exporter, tmp_path):
 def _sample_fact() -> dict:
     return {
         "fact_id": "019fd7f9-03a1-76d3-8421-67199b5fb0a8",
+        "fact.datasource": {
+            "tenant_id": "gov.br/orgao-a",
+            "datasource_id": "sshd://srv01/var/log/auth.log",
+            "sensor_id": "forge-edge-01",
+        },
         "fact.identity": {
             "actor.id": "deploy",
             "actor.name": "deploy",
@@ -470,6 +475,137 @@ def test_fato_completamente_vazio_nao_rebenta():
 
 
 # ---------------------------------------------------------------------------
+# Modelo canónico de segurança (SPEC-0071 §4) — extensão compatível
+# ---------------------------------------------------------------------------
+
+
+def _canonical_fact() -> dict:
+    """Fato atestado + evento canónico coerente com ele.
+
+    A forma é a que o crate `heraclitus-security-schema` produz; o produtor no
+    caminho quente entra no Marco 2. O que se testa aqui é a fronteira: o que a
+    ponte aceita, o que recusa, e o que grava no HeraclitusDB.
+    """
+    fact = _attested_fact()
+    fact["fact.security"] = {
+        "schema_version": bridge.SECURITY_SCHEMA_VERSION,
+        "category": "authentication",
+        "event_type": "authentication.failure",
+        "outcome": "failure",
+        "severity": 7,
+        "observed_at_micros": 1786034848673708,
+        "ingested_at_micros": 1786034848673708,
+        "normalized_at_micros": 1786034848674000,
+        "tenant_id": "tenant-demo",
+        "datasource_id": "sshd://srv01/var/log/auth.log",
+        "sensor_id": "forge-edge-01",
+        "source_sequence": "4210",
+        "provenance": {
+            "forge_source_id": "b" * 64,
+            "forge_lsn": 1,
+            "raw_observation_hash": "9611cd00",
+            "connector_id": "pipelines.linux_sshd-v1.1.0",
+            "connector_version": "1.1.0",
+            "connector_digest": "e" * 64,
+            "matched_rule": "ssh_auth_failure",
+        },
+    }
+    return fact
+
+
+def test_conector_legado_sem_bloco_canonico_continua_a_passar():
+    """Gate CM2: `operational-fact/1.0` sozinho é um contrato completo."""
+    fact = _attested_fact()
+    assert "fact.security" not in fact
+    assert bridge.validate_fact(1, fact) == []
+    attrs = bridge.map_fact(1, fact)["attrs"]
+    assert not [k for k in attrs if k.startswith("security_")]
+    # E o Fato continua a chegar inteiro ao destino.
+    assert attrs["schema_version"] == bridge.SCHEMA_VERSION
+
+
+def test_evento_canonico_sobe_como_attrs_consultaveis():
+    attrs = bridge.map_fact(1, _canonical_fact())["attrs"]
+    assert bridge.validate_fact(1, _canonical_fact()) == []
+    assert attrs["security_schema"] == bridge.SECURITY_SCHEMA_VERSION
+    assert attrs["security_category"] == "authentication"
+    assert attrs["security_event_type"] == "authentication.failure"
+    assert attrs["security_outcome"] == "failure"
+    assert attrs["security_severity"] == 7
+    # Liga o evento ao artefato exato que o produziu (gate CM1).
+    assert attrs["security_connector_digest"] == "e" * 64
+    # E o Fato Operacional não foi tocado.
+    assert attrs["evidence_hash"] == "b3:9611cd00"
+    assert attrs["matched_rule"] == "ssh_auth_failure"
+
+
+def test_desfecho_desconhecido_nao_vira_atributo():
+    """Gate CM3: `null` é desconhecido; não se grava um desfecho inventado."""
+    fact = _canonical_fact()
+    fact["fact.security"]["outcome"] = None
+    assert bridge.validate_fact(1, fact) == []
+    assert "security_outcome" not in bridge.map_fact(1, fact)["attrs"]
+
+
+def test_categoria_fora_do_vocabulario_e_recusada():
+    fact = _canonical_fact()
+    fact["fact.security"]["category"] = "ransomware"
+    erros = bridge.validate_fact(7, fact)
+    assert erros and "vocabulário" in erros[0]
+    assert erros[0].startswith("LSN 7:")
+
+
+def test_desfecho_invalido_e_recusado():
+    fact = _canonical_fact()
+    fact["fact.security"]["outcome"] = "unknown"
+    assert any("desfecho" in e for e in bridge.validate_fact(1, fact))
+
+
+def test_severidade_fora_da_escala_e_recusada():
+    fact = _canonical_fact()
+    fact["fact.security"]["severity"] = 11
+    assert any("escala" in e for e in bridge.validate_fact(1, fact))
+
+
+def test_evento_canonico_de_outra_observacao_e_recusado():
+    """A cadeia de custódia tem de descrever a MESMA linha que o Fato."""
+    fact = _canonical_fact()
+    fact["fact.security"]["provenance"]["raw_observation_hash"] = "deadbeef"
+    assert any("outra observação" in e for e in bridge.validate_fact(1, fact))
+
+
+def test_evento_canonico_de_outra_regra_e_recusado():
+    fact = _canonical_fact()
+    fact["fact.security"]["provenance"]["matched_rule"] = "ssh_auth_success"
+    assert any("regra divergente" in e for e in bridge.validate_fact(1, fact))
+
+
+def test_evento_canonico_de_outro_conector_e_recusado():
+    fact = _canonical_fact()
+    fact["fact.security"]["provenance"]["connector_id"] = "pipelines.postgresql-v1.2.0"
+    assert any("outro conector" in e for e in bridge.validate_fact(1, fact))
+
+
+def test_bloco_canonico_sem_proveniencia_e_recusado():
+    fact = _canonical_fact()
+    del fact["fact.security"]["provenance"]
+    assert any("provenance ausente" in e for e in bridge.validate_fact(1, fact))
+
+
+def test_bloco_canonico_de_outro_schema_e_recusado():
+    fact = _canonical_fact()
+    fact["fact.security"]["schema_version"] = "heraclitus-security-event/2.0"
+    assert any("schema canónico incompatível" in e for e in bridge.validate_fact(1, fact))
+
+
+def test_bloco_canonico_malformado_nao_rebenta():
+    fact = _canonical_fact()
+    fact["fact.security"] = "authentication.failure"
+    erros = bridge.validate_fact(1, fact)
+    assert any("não é um objeto" in e for e in erros)
+
+
+# ---------------------------------------------------------------------------
 # O exportador Rust, contra o `.hdb` real
 # ---------------------------------------------------------------------------
 
@@ -500,7 +636,10 @@ def test_exportador_emite_jsonl_estrito(exporter, signed_hdb):
     assert len(linhas) == 3
     for line in linhas:
         rec = json.loads(line)  # rebenta se não for JSON estrito
-        assert set(rec) == {"contract_version", "lsn", "fact", "attestation"}
+        # `record_type` entrou na v2 do envelope: uma linha deixou de ser
+        # sempre um Fato.
+        assert set(rec) == {"contract_version", "lsn", "record_type", "fact", "attestation"}
+        assert rec["record_type"] == "OperationalFact"
         assert rec["contract_version"] == bridge.BRIDGE_CONTRACT_VERSION
         assert rec["attestation"]["status"] == "INTEG_OK"
         assert rec["attestation"]["fact_schema"] == bridge.SCHEMA_VERSION
@@ -653,8 +792,8 @@ def test_retry_apos_crash_e_exatamente_uma_vez(tmp_path, monkeypatch):
     monkeypatch.setenv(bridge.QUARANTINE_KEY_ENV, bytes(range(32)).hex())
     monkeypatch.setattr(
         bridge,
-        "export_jsonl",
-        lambda *_args, **_kwargs: iter([(42, _attested_fact())]),
+        "export_all",
+        lambda *_args, **_kwargs: iter([(42, "OperationalFact", _attested_fact())]),
     )
 
     real_save = bridge.save_state
@@ -806,3 +945,158 @@ def test_a_ponte_em_dia_nao_escreve_nada(exporter, signed_hdb):
     assert r2["appended"] == 0, "uma ponte em dia não pode reescrever nada"
     assert db.head() == antes + r["appended"], "o banco só cresceu o que a ponte escreveu"
     db.close()
+
+
+# ---------------------------------------------------------------------------
+# Telemetry Health: do ingestor real até ao episódio que a ponte escreveria
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def ingested(exporter, tmp_path_factory) -> list[dict]:
+    """Corre o `ingest` REAL sobre uma amostra e devolve as linhas do JSONL."""
+    work = tmp_path_factory.mktemp("telemetry")
+    db_path = work / "telemetry.hdb"
+    env = os.environ.copy()
+    env[bridge.QUARANTINE_KEY_ENV] = "ef" * 32
+    run = subprocess.run(
+        [
+            str(_release_bin("ingest")),
+            str(ROOT / "samples" / "postgresql.log"),
+            "--tenant",
+            "gov.br/orgao-a",
+            "--datasource",
+            "postgresql://db-01/postgresql.log",
+            "--sensor",
+            "forge-edge-01",
+            "--artifact",
+            str(ROOT / "registry" / "postgresql"),
+            "--db",
+            str(db_path),
+            "--quarantine",
+            str(work / "telemetry.hq"),
+            "--from-start",
+            "--once",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+
+    export = subprocess.run([exporter, str(db_path)], capture_output=True, text=True, timeout=120)
+    assert export.returncode == 0, export.stderr
+    return [json.loads(line) for line in export.stdout.splitlines() if line.strip()]
+
+
+def _telemetria(linhas: list[dict], tipo: str) -> list[dict]:
+    saida = []
+    for linha in linhas:
+        if linha.get("record_type") != "TelemetryHealth":
+            continue
+        envelope = json.loads(linha["telemetry"]["envelope"])
+        if envelope["event"]["type"] == tipo:
+            saida.append(envelope)
+    return saida
+
+
+def test_o_ingestor_emite_saude_no_mesmo_log_dos_fatos(ingested):
+    """O produtor que faltava ao Telemetry Health do HeraclitusDB."""
+    tipos = {linha.get("record_type") for linha in ingested}
+    assert tipos == {"OperationalFact", "TelemetryHealth"}
+    emitidos = {
+        json.loads(linha["telemetry"]["envelope"])["event"]["type"]
+        for linha in ingested
+        if linha.get("record_type") == "TelemetryHealth"
+    }
+    assert {
+        "ExpectationConfigured",
+        "ConnectorActivated",
+        "SensorHeartbeat",
+        "IngestionWindowClosed",
+        "HealthEvaluationTick",
+    } <= emitidos
+
+
+def test_a_janela_respeita_o_invariante_do_consumidor(ingested):
+    """`normalized <= parsed <= received` é validado do outro lado."""
+    janelas = _telemetria(ingested, "IngestionWindowClosed")
+    assert janelas, "o ingestor tem de fechar a janela mesmo em --once"
+    for envelope in janelas:
+        janela = envelope["event"]["data"]
+        assert janela["normalized"] <= janela["parsed"] <= janela["received"]
+        assert janela["window_start_micros"] <= janela["window_end_micros"]
+        assert len(janela["connector_digest"]) == 64
+        # Sem carimbo da fonte não há atraso observável — e não se inventa um.
+        assert janela["max_observed_lateness_millis"] == 0
+
+
+def test_a_janela_e_o_conector_ativo_declaram_o_mesmo_digest(ingested):
+    """Digest divergente é classificado como adulteração pelo consumidor."""
+    ativados = _telemetria(ingested, "ConnectorActivated")
+    janelas = _telemetria(ingested, "IngestionWindowClosed")
+    assert len(ativados) == 1
+    digest = ativados[0]["event"]["data"]["connector_digest"]
+    assert ativados[0]["event"]["data"]["approved"] is True
+    for envelope in janelas:
+        assert envelope["event"]["data"]["connector_digest"] == digest
+
+
+def test_a_identidade_do_envelope_e_a_do_registo_autenticado(ingested):
+    for linha in ingested:
+        if linha.get("record_type") != "TelemetryHealth":
+            continue
+        envelope = json.loads(linha["telemetry"]["envelope"])
+        assert envelope["identity"] == linha["telemetry"]["identity"]
+        assert envelope["schema"] == bridge.TELEMETRY_SCHEMA_VERSION
+        assert envelope["identity"]["tenant_id"] == "gov.br/orgao-a"
+
+
+def test_o_checkpoint_so_e_anunciado_depois_de_durar(ingested):
+    checkpoints = _telemetria(ingested, "CheckpointAdvanced")
+    assert checkpoints, "processar linhas tem de avançar o checkpoint"
+    for envelope in checkpoints:
+        dados = envelope["event"]["data"]
+        assert dados["integrity"] == "Verified"
+        assert isinstance(dados["source_sequence"], int)
+
+
+def test_a_ponte_traduz_a_saude_em_episodio_do_heraclitusdb(ingested):
+    linhas = [linha for linha in ingested if linha.get("record_type") == "TelemetryHealth"]
+    assert linhas
+    for lsn, linha in enumerate(linhas, start=1):
+        assert bridge.validate_telemetry(lsn, linha) == []
+        episodio = bridge.telemetry_episode(lsn, linha)
+        assert episodio["kind"] == bridge.TELEMETRY_KIND
+        assert episodio["agent_id"] == bridge.TELEMETRY_AGENT_ID
+        # O envelope viaja como TEXTO, byte a byte como foi gravado.
+        assert episodio["content"] == linha["telemetry"]["envelope"]
+        attrs = episodio["attrs"]
+        assert attrs["telemetry.schema"] == bridge.TELEMETRY_SCHEMA_VERSION
+        assert attrs["tenant_id"] == "gov.br/orgao-a"
+        assert attrs["datasource_id"] == "postgresql://db-01/postgresql.log"
+        assert attrs["sensor_id"] == "forge-edge-01"
+        assert attrs["telemetry.event_type"]
+
+
+def test_a_ponte_recusa_um_envelope_de_outra_identidade(ingested):
+    """Envelope montado noutro sítio não passa a fronteira."""
+    linha = next(item for item in ingested if item.get("record_type") == "TelemetryHealth")
+    forjada = json.loads(json.dumps(linha))
+    forjada["telemetry"]["identity"]["tenant_id"] = "gov.br/orgao-b"
+    erros = bridge.validate_telemetry(7, forjada)
+    assert any("diverge" in erro for erro in erros), erros
+
+
+def test_os_fatos_continuam_a_sair_pelo_caminho_de_sempre(ingested):
+    """A ponte de Fatos não vê os eventos de saúde."""
+    fatos = [linha for linha in ingested if linha.get("record_type") == "OperationalFact"]
+    assert fatos
+    for linha in fatos:
+        assert (
+            bridge.validate_fact(
+                linha["lsn"], {**linha["fact"], "_forge_export_attestation": linha["attestation"]}
+            )
+            == []
+        )

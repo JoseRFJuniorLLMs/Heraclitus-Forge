@@ -64,10 +64,12 @@ fn main() -> Result<()> {
     let mut runner2 = ReconstitutiveRunner::load(&artifact).context("carregar artefato")?;
     let mut db = FactStore::new(&db_path).context("abrir db temporário")?;
 
+    let identity = heraclitus::hfb2::SecurityIdentity::demo("bench");
     let m = n.min(10_000);
     let t1 = Instant::now();
     for i in 0..m {
         if let Some(mut f) = runner2.process_observation(SAMPLES[i % SAMPLES.len()]) {
+            identity.apply(&mut f);
             db.write_fact(&mut f).context("falha no append durável")?;
         }
     }
@@ -79,37 +81,42 @@ fn main() -> Result<()> {
     let r = db.verify();
     info!("    verify(): {} (Fatos: {})", r.status, r.facts);
 
-    // --- 3. Zero-copy: ler 'action' do payload fbfact vs parsear JSON ---
-    if let Some(sample) = runner2.process_observation(SAMPLES[1]) {
-        let fb = heraclitus::fbfact::encode(&sample);
+    // --- 3. Codec HFB2: encode, decode, folha e leitura zero-copy ---------
+    if let Some(mut sample) = runner2.process_observation(SAMPLES[1]) {
+        identity.apply(&mut sample);
+        let record = heraclitus::hfb2::encode_fact(&sample, 1).context("encode HFB2")?;
         let js = serde_json::to_vec(&sample).context("to_vec")?;
         let reads = n;
+
         let t2 = Instant::now();
-        let mut a1 = 0usize;
+        let mut acc = 0usize;
         for _ in 0..reads {
-            a1 += heraclitus::fbfact::action(&fb)
-                .map(|s| s.len())
+            let view = heraclitus::hfb2::RecordView::parse(&record).context("parse")?;
+            acc += heraclitus::hfb2::core_action(view.core)
+                .map(str::len)
                 .unwrap_or(0);
         }
         let dt_fb = t2.elapsed().as_secs_f64().max(1e-9);
+
         let t3 = Instant::now();
-        let mut a2 = 0usize;
+        let mut acc_json = 0usize;
         for _ in 0..reads {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&js) {
-                a2 += v["fact.behavior"]["action"]
+                acc_json += v["fact.behavior"]["action"]
                     .as_str()
-                    .map(|s| s.len())
+                    .map(str::len)
                     .unwrap_or(0);
             }
         }
         let dt_js = t3.elapsed().as_secs_f64().max(1e-9);
+
         info!(
-            "[3] Ler campo 'action' ({reads} leituras) — payload fbfact {}B vs JSON {}B",
-            fb.len(),
+            "[3] Ler 'action' ({reads} leituras) — registo HFB2 {}B vs JSON {}B",
+            record.len(),
             js.len()
         );
         info!(
-            "    fbfact zero-copy: {:.3}s ({:.0}/s)",
+            "    HFB2 validar+ler: {:.3}s ({:.0}/s)",
             dt_fb,
             reads as f64 / dt_fb
         );
@@ -118,9 +125,63 @@ fn main() -> Result<()> {
             dt_js,
             reads as f64 / dt_js
         );
+        info!("    speedup: {:.0}x  (chk {acc}/{acc_json})", dt_js / dt_fb);
+
+        // --- 4. Custo de cada etapa do formato -----------------------------
+        let ops = n.min(200_000);
+        let t_enc = Instant::now();
+        for i in 0..ops {
+            let bytes = heraclitus::hfb2::encode_fact(&sample, i as u64).context("encode")?;
+            std::hint::black_box(bytes.len());
+        }
+        let dt_enc = t_enc.elapsed().as_secs_f64().max(1e-9);
+
+        let t_dec = Instant::now();
+        for _ in 0..ops {
+            std::hint::black_box(heraclitus::hfb2::decode_fact(&record).context("decode")?);
+        }
+        let dt_dec = t_dec.elapsed().as_secs_f64().max(1e-9);
+
+        let t_leaf = Instant::now();
+        for _ in 0..ops {
+            std::hint::black_box(heraclitus::hfb2::record_leaf(&record).context("leaf")?);
+        }
+        let dt_leaf = t_leaf.elapsed().as_secs_f64().max(1e-9);
+
+        // Passagem de extensao DESCONHECIDA: o custo de preservar o que nao se
+        // entende. Se isto fosse caro, alguem seria tentado a descartar.
+        let mut opaque = sample.clone();
+        opaque["fact.extensions"] = serde_json::json!([
+            {"tag": "0xffff0001", "value_hex": "de".repeat(64)}
+        ]);
+        let opaque_record = heraclitus::hfb2::encode_fact(&opaque, 1).context("encode opaco")?;
+        let t_opaque = Instant::now();
+        for _ in 0..ops {
+            let decoded = heraclitus::hfb2::decode_fact(&opaque_record).context("decode opaco")?;
+            std::hint::black_box(heraclitus::hfb2::encode_fact(&decoded, 1).context("reencode")?);
+        }
+        let dt_opaque = t_opaque.elapsed().as_secs_f64().max(1e-9);
+
+        info!("[4] Custo do formato ({ops} operacoes)");
+        for (nome, dt) in [
+            ("encode      ", dt_enc),
+            ("decode      ", dt_dec),
+            ("folha BLAKE3", dt_leaf),
+            ("round-trip de extensao desconhecida", dt_opaque),
+        ] {
+            info!("    {nome}: {:.3}s ({:.0}/s)", dt, ops as f64 / dt);
+        }
+
+        // --- 5. verify() sobre o banco inteiro -----------------------------
+        let t_verify = Instant::now();
+        let verified = db.verify();
+        let dt_verify = t_verify.elapsed().as_secs_f64().max(1e-9);
         info!(
-            "    speedup zero-copy: {:.0}x  (chk {a1}/{a2})",
-            dt_js / dt_fb
+            "[5] verify() {} Fatos: {:.3}s ({:.0} Fatos/s) — {}",
+            verified.facts,
+            dt_verify,
+            verified.facts as f64 / dt_verify,
+            verified.status
         );
     } else {
         warn!("Falha ao gerar o sample 1 para a etapa de zero-copy.");

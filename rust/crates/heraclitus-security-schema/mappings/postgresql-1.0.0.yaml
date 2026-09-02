@@ -1,0 +1,51 @@
+# PostgreSQL -> heraclitus-security-event/1.0
+#
+# O alvo de um evento de base de dados e o objeto acedido (a base, ou o nome do
+# servico quando a regra nao conhece a base) — nunca o utilizador.
+mapping_version: postgresql/1.0.0
+security_schema: heraclitus-security-event/1.0
+connector: postgresql
+primary_category: data_access
+required_fields:
+  - observed_at_micros
+  - datasource_id
+  - sensor_id
+observed_at:
+  # O Fato 1.0 ainda nao emite o carimbo da propria linha de log; ate la o
+  # instante observado e o de ingestao, marcado como aproximacao.
+  source: ingest_fallback
+identity:
+  actor_kind: user
+  target_kind: resource
+severity_by_risk:
+  Low: 2
+  Medium: 4
+  High: 7
+  Critical: 9
+actions:
+  authentication.failure:
+    category: authentication
+    outcome: failure
+  authentication.success:
+    category: authentication
+    outcome: success
+  authorization.failure:
+    # Utilizador autenticado que tentou o que nao podia: e privilegio, nao
+    # autenticacao.
+    category: privilege
+    outcome: failure
+  query.execute:
+    # O log de statement diz que a instrucao foi emitida, nao que completou.
+    # Sem desfecho observado, o desfecho fica nulo.
+    category: data_access
+    outcome: null
+  system.fault:
+    # FATAL/PANIC e a propria fonte a sinalizar uma condicao — categoria alert.
+    category: alert
+    outcome: failure
+  log.info:
+    # Ruido operacional do servico. Continua a existir como Fato Operacional;
+    # nao e evento de seguranca e nao ganha categoria nenhuma.
+    security_relevant: false
+  log.unknown:
+    security_relevant: false

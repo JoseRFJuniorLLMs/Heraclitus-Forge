@@ -125,6 +125,32 @@ fn main() -> Result<()> {
     let mut runner =
         ReconstitutiveRunner::load(&artifact_path).context("Falha ao carregar artefato .hcx")?;
     let mut db = FactStore::new(&db_path).context("Falha ao abrir db íntegro")?;
+
+    // Identidade de seguranca do datasource: viaja autenticada em cada registo
+    // HFB2, portanto nao pode ser adivinhada nem derivada do endereco de quem
+    // enviou o datagrama (SPEC-0071 secao 11 — nao derivar de conteudo livre).
+    let identity = if selftest {
+        heraclitus::hfb2::SecurityIdentity::demo("probe-selftest")
+    } else {
+        let obrigatoria = |chave: &str| -> Result<String> {
+            std::env::var(chave)
+                .with_context(|| format!("{chave} e obrigatoria: identifica a origem dos Fatos"))
+        };
+        heraclitus::hfb2::SecurityIdentity::new(
+            obrigatoria("FORGE_PROBE_TENANT")?,
+            obrigatoria("FORGE_PROBE_DATASOURCE")?,
+            obrigatoria("FORGE_PROBE_SENSOR")?,
+        )
+        .map_err(|erro| anyhow::anyhow!("identidade do datasource invalida: {erro}"))?
+    };
+    info!(
+        "[Probe] datasource {} (tenant {})",
+        identity.datasource_id, identity.tenant_id
+    );
+    // Identidade da origem, calculada como o `export_facts` a calcula.
+    let forge_source_id = blake3::hash(std::fs::read_to_string(db.pub_path())?.trim().as_bytes())
+        .to_hex()
+        .to_string();
     let quarantine_path = if selftest {
         std::env::temp_dir().join(format!(
             "forge_probe_selftest_{}.quarantine.hq",
@@ -287,20 +313,33 @@ fn main() -> Result<()> {
         match rx.recv_timeout(recv_timeout) {
             Ok((src, line)) => {
                 got_any = true;
-                match runner.process_observation(&line) {
-                    Some(mut f) => match db.write_fact(&mut f) {
-                        Err(e) => error!("Erro ao gravar fato: {e}"),
-                        Ok(lsn) => {
-                            sealed += 1;
-                            let b = &f["fact.behavior"];
-                            info!(
-                                "[{src}] LSN {lsn} | {:<22} | {:<18} | {}",
-                                b["action"].as_str().unwrap_or(""),
-                                b["class"].as_str().unwrap_or(""),
-                                b["risk_level"].as_str().unwrap_or("")
-                            );
+                // Syslog nao tem sequencia de origem: UDP nao a tem de todo e
+                // o TCP so tem ordem dentro de uma conexao. Um contador
+                // sintetico aqui seria invencao (gate CM3).
+                let contexto = heraclitus::runner::EmissionContext {
+                    identity: &identity,
+                    forge_source_id: &forge_source_id,
+                    forge_lsn: db.current_lsn + 1,
+                    source_sequence: None,
+                    source_event_id: None,
+                };
+                match runner.process_observation_with_context(&line, &contexto)? {
+                    Some(mut f) => {
+                        let written = db.write_fact(&mut f);
+                        match written {
+                            Err(e) => error!("Erro ao gravar fato: {e}"),
+                            Ok(lsn) => {
+                                sealed += 1;
+                                let b = &f["fact.behavior"];
+                                info!(
+                                    "[{src}] LSN {lsn} | {:<22} | {:<18} | {}",
+                                    b["action"].as_str().unwrap_or(""),
+                                    b["class"].as_str().unwrap_or(""),
+                                    b["risk_level"].as_str().unwrap_or("")
+                                );
+                            }
                         }
-                    },
+                    }
                     None => {
                         quarantine_writer
                             .append(&src, &line)
