@@ -28,6 +28,11 @@ param(
 
     [string]$Source,
     [string]$Artifact,
+    # Identidade de seguranca do datasource. Vai autenticada em cada registo
+    # HFB2 (ver md/HDB2-HFB2.md): nao ha valor por omissao para nenhuma delas.
+    [string]$Tenant,
+    [string]$Datasource,
+    [string]$Sensor = $env:COMPUTERNAME,
     [string]$DataDir = 'D:\HeraclitusForge\data',
     [string]$LogDir  = "$env:ProgramData\HeraclitusForge\logs",
     [string]$Exe,
@@ -82,7 +87,8 @@ function Set-MachineEnv([string]$Name, [AllowNull()][string]$Value) {
 
 $envNames = @(
     'FORGE_INGEST_SOURCE', 'FORGE_INGEST_ARTIFACT', 'FORGE_INGEST_DB',
-    'FORGE_INGEST_QUARANTINE', 'FORGE_INGEST_LOGDIR', 'FORGE_QUARANTINE_KEY'
+    'FORGE_INGEST_QUARANTINE', 'FORGE_INGEST_LOGDIR', 'FORGE_QUARANTINE_KEY',
+    'FORGE_INGEST_TENANT', 'FORGE_INGEST_DATASOURCE', 'FORGE_INGEST_SENSOR'
 )
 
 switch ($Action) {
@@ -115,6 +121,13 @@ switch ($Action) {
         Write-Host "  Sem ela a quarentena fica ilegivel para sempre." -ForegroundColor Yellow
     }
 
+    if (-not $Tenant -or -not $Datasource -or -not $Sensor) {
+        throw "-Tenant e -Datasource sao obrigatorios (e -Sensor nao pode ficar vazio): identificam a origem dos Fatos e viajam autenticados no registo HFB2"
+    }
+
+    Set-MachineEnv 'FORGE_INGEST_TENANT'     $Tenant
+    Set-MachineEnv 'FORGE_INGEST_DATASOURCE' $Datasource
+    Set-MachineEnv 'FORGE_INGEST_SENSOR'     $Sensor
     Set-MachineEnv 'FORGE_INGEST_SOURCE'     $Source
     Set-MachineEnv 'FORGE_INGEST_ARTIFACT'   $Artifact
     Set-MachineEnv 'FORGE_INGEST_DB'         (Join-Path $dataFull 'ingest.hdb')
@@ -187,6 +200,9 @@ switch ($Action) {
         Conta      = $info.StartName
         Arranque   = $info.StartMode
         Binario    = $info.PathName
+        Tenant     = [Environment]::GetEnvironmentVariable('FORGE_INGEST_TENANT', 'Machine')
+        Datasource = [Environment]::GetEnvironmentVariable('FORGE_INGEST_DATASOURCE', 'Machine')
+        Sensor     = [Environment]::GetEnvironmentVariable('FORGE_INGEST_SENSOR', 'Machine')
         Fonte      = [Environment]::GetEnvironmentVariable('FORGE_INGEST_SOURCE', 'Machine')
         Artefato   = [Environment]::GetEnvironmentVariable('FORGE_INGEST_ARTIFACT', 'Machine')
         Destino    = [Environment]::GetEnvironmentVariable('FORGE_INGEST_DB', 'Machine')

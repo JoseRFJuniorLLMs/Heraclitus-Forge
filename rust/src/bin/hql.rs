@@ -90,6 +90,7 @@ fn main() -> Result<()> {
         let mut sealed = 0usize;
         for s in SAMPLES {
             if let Some(mut f) = runner.process_observation(s) {
+                heraclitus::hfb2::SecurityIdentity::demo("hql-seed").apply(&mut f);
                 db.write_fact(&mut f).context("gravar")?;
                 sealed += 1;
             }

@@ -222,11 +222,21 @@ mod tests {
 
         let err = decrypt_each(&path, new, |_| Ok(())).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains(&key_id(&old)), "o erro tem de nomear a chave do registo: {msg}");
-        assert!(msg.contains("rodou"), "o erro tem de dizer que a chave rodou: {msg}");
+        assert!(
+            msg.contains(&key_id(&old)),
+            "o erro tem de nomear a chave do registo: {msg}"
+        );
+        assert!(
+            msg.contains("rodou"),
+            "o erro tem de dizer que a chave rodou: {msg}"
+        );
         // E a chave certa continua a ler.
         let mut n = 0;
-        decrypt_each(&path, old, |_| { n += 1; Ok(()) }).unwrap();
+        decrypt_each(&path, old, |_| {
+            n += 1;
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(n, 1);
     }
 
@@ -248,7 +258,11 @@ mod tests {
         std::fs::write(&path, format!("{env}\n")).unwrap();
 
         let mut n = 0;
-        decrypt_each(&path, key, |_| { n += 1; Ok(()) }).unwrap();
+        decrypt_each(&path, key, |_| {
+            n += 1;
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(n, 1, "um envelope v1 legado tem de continuar legível");
     }
 

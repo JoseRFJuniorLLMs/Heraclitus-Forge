@@ -1,0 +1,147 @@
+// heraclitus-security-event/1.0 — contrato de fio do modelo canonico.
+//
+// Porque e que este ficheiro existe
+// ---------------------------------
+// A forma canonica que o crate produz hoje e JSON (ver `canonical.rs`), que e
+// o que os golden fixtures fixam. Este `.proto` e o contrato para quem NAO e
+// Rust: o schema explicito, com numeros de campo estaveis, que um consumidor
+// noutra linguagem gera sem ler o codigo do Forge.
+//
+// Nao ha geracao de codigo a partir dele — seria uma dependencia de build para
+// nada, enquanto nada cruza o fio em protobuf. Em vez disso ha um TESTE
+// (`tests/proto_parity.rs`) que compara este ficheiro com os campos que o
+// modelo Rust serializa. Acrescentar um campo no Rust e esquecer este ficheiro
+// (ou o contrario) parte a build. Um `.proto` sem esse teste seria apenas
+// documentacao a apodrecer.
+//
+// Regras de evolucao
+// ------------------
+//   * numero de campo NUNCA e reutilizado nem alterado;
+//   * campo removido vira `reserved`;
+//   * campo novo e opcional e entra no fim;
+//   * mudanca incompativel exige `heraclitus-security-event/2.0` — a versao
+//     viaja dentro do proprio evento (`schema_version`).
+
+syntax = "proto3";
+
+package heraclitus.security.v1;
+
+// Categorias v1 (SPEC-0071 secao 4.2).
+//
+// O valor zero existe apenas porque proto3 o exige. No modelo canonico nao ha
+// categoria "nao especificada": um evento sem categoria e um evento invalido.
+enum SecurityCategory {
+  SECURITY_CATEGORY_UNSPECIFIED = 0;
+  SECURITY_CATEGORY_AUTHENTICATION = 1;
+  SECURITY_CATEGORY_NETWORK = 2;
+  SECURITY_CATEGORY_DNS = 3;
+  SECURITY_CATEGORY_HTTP = 4;
+  SECURITY_CATEGORY_PROCESS = 5;
+  SECURITY_CATEGORY_FILE = 6;
+  SECURITY_CATEGORY_REGISTRY = 7;
+  SECURITY_CATEGORY_ENDPOINT = 8;
+  SECURITY_CATEGORY_CLOUD = 9;
+  SECURITY_CATEGORY_IDENTITY = 10;
+  SECURITY_CATEGORY_THREAT_INTEL = 11;
+  SECURITY_CATEGORY_VULNERABILITY = 12;
+  SECURITY_CATEGORY_EMAIL = 13;
+  SECURITY_CATEGORY_DATA_ACCESS = 14;
+  SECURITY_CATEGORY_PRIVILEGE = 15;
+  SECURITY_CATEGORY_ALERT = 16;
+  SECURITY_CATEGORY_FINDING = 17;
+  SECURITY_CATEGORY_INCIDENT = 18;
+}
+
+// Desfecho observado. Ausente (campo `optional` nao definido) significa
+// DESCONHECIDO — nunca sucesso.
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  OUTCOME_SUCCESS = 1;
+  OUTCOME_FAILURE = 2;
+}
+
+// Especie da entidade referida.
+enum EntityKind {
+  ENTITY_KIND_UNSPECIFIED = 0;
+  ENTITY_KIND_USER = 1;
+  ENTITY_KIND_ACCOUNT = 2;
+  ENTITY_KIND_GROUP = 3;
+  ENTITY_KIND_SERVICE = 4;
+  ENTITY_KIND_HOST = 5;
+  ENTITY_KIND_PROCESS = 6;
+  ENTITY_KIND_RESOURCE = 7;
+}
+
+// Ator ou alvo.
+message EntityRef {
+  EntityKind kind = 1;
+  optional string id = 2;
+  optional string name = 3;
+  optional string domain = 4;
+}
+
+// Ponta de rede.
+message EndpointRef {
+  optional string address = 1;
+  optional uint32 port = 2;
+  optional string hostname = 3;
+}
+
+// Valor de extensao. Sem ponto flutuante de proposito: o evento e comparado
+// byte a byte e a representacao textual de um double varia entre
+// serializadores.
+message CanonicalValue {
+  message ValueList {
+    repeated CanonicalValue values = 1;
+  }
+  oneof value {
+    bool bool_value = 1;
+    int64 int_value = 2;
+    string text_value = 3;
+    ValueList list_value = 4;
+  }
+}
+
+// Proveniencia obrigatoria (SPEC-0071 secao 4.3).
+//
+// `forge_source_id` + `forge_lsn` localizam o registo no `.hdb` da borda;
+// `raw_observation_hash` (BLAKE3, 32 bytes) prova que a evidencia encontrada
+// la e a mesma. O raw nao viaja para o centro.
+message NormalizationProvenance {
+  string forge_source_id = 1;
+  uint64 forge_lsn = 2;
+  optional string source_event_id = 3;
+  bytes raw_observation_hash = 4;
+  string connector_id = 5;
+  string connector_version = 6;
+  bytes connector_digest = 7;
+  string parser_signature = 8;
+  string matched_rule = 9;
+  repeated string transformation_steps = 10;
+}
+
+// Evento canonico de seguranca (SPEC-0071 secao 4.2).
+message CanonicalSecurityEvent {
+  string schema_version = 1;
+  SecurityCategory category = 2;
+  string event_type = 3;
+  optional Outcome outcome = 4;
+  uint32 severity = 5;
+
+  int64 observed_at_micros = 6;
+  int64 ingested_at_micros = 7;
+  int64 normalized_at_micros = 8;
+
+  string tenant_id = 9;
+  string datasource_id = 10;
+  string sensor_id = 11;
+  optional string source_sequence = 12;
+
+  optional EntityRef actor = 13;
+  optional EntityRef target = 14;
+  optional EndpointRef source = 15;
+  optional EndpointRef destination = 16;
+
+  map<string, CanonicalValue> extensions = 17;
+  NormalizationProvenance provenance = 18;
+}

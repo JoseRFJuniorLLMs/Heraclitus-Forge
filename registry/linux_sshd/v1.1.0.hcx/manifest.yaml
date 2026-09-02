@@ -4,3 +4,11 @@ version: 1.1.0
 schema_version: v9
 domain: identity_access
 compiled_at: '2026-06-26T02:10:00Z'
+security:
+  security_schema: heraclitus-security-event/1.0
+  category: authentication
+  mapping_version: linux-sshd/1.0.0
+  required_fields:
+  - observed_at_micros
+  - datasource_id
+  - sensor_id

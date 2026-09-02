@@ -1,0 +1,46 @@
+# Windows Security Event Log -> heraclitus-security-event/1.0
+#
+# O ator e uma CONTA do dominio, nao uma pessoa: 4720/4726 tratam da conta em
+# si e o ciclo de vida da conta e categoria identity.
+mapping_version: windows-security/1.0.0
+security_schema: heraclitus-security-event/1.0
+connector: windows_security
+primary_category: identity
+required_fields:
+  - observed_at_micros
+  - datasource_id
+  - sensor_id
+observed_at:
+  source: ingest_fallback
+identity:
+  actor_kind: account
+  target_kind: host
+  # O Security Log escreve "-" em IpAddress quando o logon nao veio da rede
+  # (4672 num servico local, por exemplo). Isso e campo ausente, nao endereco.
+  absent_markers:
+    - "-"
+severity_by_risk:
+  Low: 2
+  Medium: 4
+  High: 7
+  Critical: 9
+actions:
+  authentication.failure:
+    category: authentication
+    outcome: failure
+  authentication.success:
+    category: authentication
+    outcome: success
+  privilege.granted:
+    # 4672: privilegio especial atribuido no logon.
+    category: privilege
+    outcome: success
+  account.created:
+    outcome: success
+  account.deleted:
+    outcome: success
+  session.end:
+    category: authentication
+    outcome: success
+  log.unknown:
+    security_relevant: false

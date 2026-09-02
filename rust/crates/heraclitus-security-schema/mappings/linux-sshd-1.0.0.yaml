@@ -1,0 +1,35 @@
+# OpenSSH -> heraclitus-security-event/1.0
+mapping_version: linux-sshd/1.0.0
+security_schema: heraclitus-security-event/1.0
+connector: linux_sshd
+primary_category: authentication
+required_fields:
+  - observed_at_micros
+  - datasource_id
+  - sensor_id
+observed_at:
+  source: ingest_fallback
+identity:
+  actor_kind: user
+  target_kind: host
+severity_by_risk:
+  Low: 2
+  Medium: 4
+  High: 7
+  Critical: 9
+actions:
+  authentication.failure:
+    outcome: failure
+  authentication.invalid_user:
+    # A conta nem existe: e tentativa falhada, e o risco Medium ja a distingue
+    # de uma password errada numa conta real.
+    outcome: failure
+  authentication.success:
+    outcome: success
+  session.open:
+    # Sessao aberta na sequencia de uma autenticacao aceite.
+    outcome: success
+  log.unknown:
+    # Este conector nao tem regra catch-all: linha que nenhuma regra reconhece
+    # sai como log.unknown e nao vira evento de seguranca.
+    security_relevant: false

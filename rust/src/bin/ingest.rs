@@ -51,12 +51,37 @@ const POLL: Duration = Duration::from_millis(400);
 /// Nome do serviço do Windows. O install script usa o mesmo.
 pub const SERVICE_NAME: &str = "HeraclitusForgeIngest";
 
+/// Janela de ingestão reportada ao Telemetry Health. Longa o suficiente para
+/// não encher o log com um evento por sondagem, curta o suficiente para que
+/// "esta fonte calou-se" seja uma afirmação recente.
+const DEFAULT_WINDOW_SECS: u64 = 60;
+/// Tolerância de atraso declarada. Faz parte do estado DESEJADO: é o que
+/// permite ao consumidor distinguir uma fonte atrasada de uma fonte morta.
+const DEFAULT_MAX_LATENESS_SECS: u64 = 300;
+
+fn numero_env(chave: &str, omissao: u64) -> Result<u64, String> {
+    match std::env::var(chave) {
+        Err(_) => Ok(omissao),
+        Ok(texto) => texto
+            .parse()
+            .map_err(|_| format!("{chave} tem de ser um inteiro, e {texto:?}")),
+    }
+}
+
 struct Args {
     source: PathBuf,
     artifact_dir: String,
     db_path: String,
     quarantine: PathBuf,
     state_path: PathBuf,
+    /// Identidade de seguranca do datasource. Nao tem valor por omissao: o
+    /// registo HFB2 autentica-a, e um tenant adivinhado e uma falha de
+    /// isolamento gravada de forma indelevel na cadeia de custodia.
+    identity: heraclitus::hfb2::SecurityIdentity,
+    /// Duracao da janela de ingestao reportada ao Telemetry Health.
+    window_secs: u64,
+    /// Tolerancia de atraso declarada (estado DESEJADO, SPEC-0071 5.3).
+    max_lateness_secs: u64,
     follow: bool,
     from_start: bool,
     once: bool,
@@ -74,12 +99,24 @@ impl Args {
             std::env::var(k).map_err(|_| format!("{k} e obrigatoria no modo servico"))
         };
         let source = PathBuf::from(obrigatoria("FORGE_INGEST_SOURCE")?);
+        let identity = heraclitus::hfb2::SecurityIdentity::new(
+            obrigatoria("FORGE_INGEST_TENANT")?,
+            obrigatoria("FORGE_INGEST_DATASOURCE")?,
+            obrigatoria("FORGE_INGEST_SENSOR")?,
+        )
+        .map_err(|erro| erro.to_string())?;
         let db_path = std::env::var("FORGE_INGEST_DB")
             .unwrap_or_else(|_| r"D:\HeraclitusForge\data\ingest.hdb".into());
         Ok(Self {
             state_path: PathBuf::from(format!("{db_path}.ingest-state")),
             source,
             artifact_dir: obrigatoria("FORGE_INGEST_ARTIFACT")?,
+            identity,
+            window_secs: numero_env("FORGE_INGEST_WINDOW_SECS", DEFAULT_WINDOW_SECS)?,
+            max_lateness_secs: numero_env(
+                "FORGE_INGEST_MAX_LATENESS_SECS",
+                DEFAULT_MAX_LATENESS_SECS,
+            )?,
             db_path,
             quarantine: PathBuf::from(
                 std::env::var("FORGE_INGEST_QUARANTINE")
@@ -100,6 +137,11 @@ fn usage() -> ! {
          Le um ficheiro de log real, produz Fatos Operacionais e persiste-os.\n\
          Abre o .hdb existente (nunca apaga) e nunca adultera nada.\n\
          \n\
+         --tenant <id>       OBRIGATORIO: tenant a que a fonte pertence\n\
+         --datasource <id>   OBRIGATORIO: identidade da fonte (nao e o caminho)\n\
+         --sensor <id>       OBRIGATORIO: identidade desta instancia do Forge\n\
+         --window-secs <n>   janela de saude reportada (default 60)\n\
+         --max-lateness-secs <n>  tolerancia de atraso declarada (default 300)\n\
          --artifact <dir>    pasta do conector no registry (default ../registry/postgresql)\n\
          --db <ficheiro>     .hdb de destino (default ingest.hdb)\n\
          --quarantine <f>    quarentena cifrada (default quarantine.hq)\n\
@@ -120,9 +162,16 @@ fn parse_args() -> Args {
         usage()
     }
     let source = PathBuf::from(&raw[0]);
+    let mut tenant = String::new();
+    let mut datasource = String::new();
+    let mut sensor = String::new();
     let mut a = Args {
         source,
         artifact_dir: "../registry/postgresql".into(),
+        // Substituida no fim de `parse_args`; nunca chega assim ao disco.
+        identity: heraclitus::hfb2::SecurityIdentity::demo("placeholder"),
+        window_secs: DEFAULT_WINDOW_SECS,
+        max_lateness_secs: DEFAULT_MAX_LATENESS_SECS,
         db_path: "ingest.hdb".into(),
         quarantine: PathBuf::from("quarantine.hq"),
         state_path: PathBuf::new(),
@@ -132,14 +181,44 @@ fn parse_args() -> Args {
     };
     let mut i = 1;
     while i < raw.len() {
-        let need = |i: usize| -> String {
-            raw.get(i + 1).cloned().unwrap_or_else(|| usage())
-        };
+        let need = |i: usize| -> String { raw.get(i + 1).cloned().unwrap_or_else(|| usage()) };
         match raw[i].as_str() {
-            "--artifact" => { a.artifact_dir = need(i); i += 1; }
-            "--db" => { a.db_path = need(i); i += 1; }
-            "--quarantine" => { a.quarantine = PathBuf::from(need(i)); i += 1; }
-            "--state" => { a.state_path = PathBuf::from(need(i)); i += 1; }
+            "--tenant" => {
+                tenant = need(i);
+                i += 1;
+            }
+            "--datasource" => {
+                datasource = need(i);
+                i += 1;
+            }
+            "--sensor" => {
+                sensor = need(i);
+                i += 1;
+            }
+            "--window-secs" => {
+                a.window_secs = need(i).parse().unwrap_or_else(|_| usage());
+                i += 1;
+            }
+            "--max-lateness-secs" => {
+                a.max_lateness_secs = need(i).parse().unwrap_or_else(|_| usage());
+                i += 1;
+            }
+            "--artifact" => {
+                a.artifact_dir = need(i);
+                i += 1;
+            }
+            "--db" => {
+                a.db_path = need(i);
+                i += 1;
+            }
+            "--quarantine" => {
+                a.quarantine = PathBuf::from(need(i));
+                i += 1;
+            }
+            "--state" => {
+                a.state_path = PathBuf::from(need(i));
+                i += 1;
+            }
             "--follow" => a.follow = true,
             "--from-start" => a.from_start = true,
             "--once" => a.once = true,
@@ -152,6 +231,16 @@ fn parse_args() -> Args {
     }
     if a.state_path.as_os_str().is_empty() {
         a.state_path = PathBuf::from(format!("{}.ingest-state", a.db_path));
+    }
+    match heraclitus::hfb2::SecurityIdentity::new(tenant, datasource, sensor) {
+        Ok(identity) => a.identity = identity,
+        Err(erro) => {
+            eprintln!(
+                "[ERRO] identidade do datasource incompleta: {erro}
+                 --tenant, --datasource e --sensor sao obrigatorios: o registo                  HFB2 autentica-os e nao ha valor por omissao para eles."
+            );
+            std::process::exit(2)
+        }
     }
     a
 }
@@ -206,9 +295,23 @@ fn save_state(path: &Path, offset: u64, fp: &str, source: &Path) -> std::io::Res
     });
     // Escrita atómica: um corte de energia a meio nunca deixa um estado
     // meio-escrito que faria a retoma saltar ou repetir um bloco inteiro.
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&body)?)?;
-    std::fs::rename(&tmp, path)
+    // `write` + `rename` protege contra torn-write mas NAO contra corte de
+    // energia: sem o fsync do temporario o rename pode chegar ao disco antes do
+    // conteudo. E este checkpoint que o `CheckpointAdvanced` diz estar
+    // verificado — se nao for duravel, o evento estaria a mentir.
+    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(&body)?)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -223,14 +326,18 @@ struct Stats {
 /// Lê de `offset` até ao fim, processando apenas linhas COMPLETAS. Devolve o
 /// deslocamento até onde consumiu — uma linha final sem `\n` fica por ler, para
 /// ser apanhada inteira na próxima passagem.
+#[allow(clippy::too_many_arguments)]
 fn drain(
     source: &Path,
     offset: u64,
     runner: &mut ReconstitutiveRunner,
     db: &mut FactStore,
     quarantine: &mut QuarantineWriter,
+    identity: &heraclitus::hfb2::SecurityIdentity,
+    forge_source_id: &str,
+    counters: &mut heraclitus::telemetry::WindowCounters,
     stats: &mut Stats,
-) -> std::io::Result<u64> {
+) -> anyhow::Result<u64> {
     let mut file = std::fs::File::open(source)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut reader = BufReader::new(file);
@@ -247,14 +354,37 @@ fn drain(
             // o deslocamento — na próxima passagem lê-se do princípio dela.
             break;
         }
+        // Deslocamento do INÍCIO da linha: é a sequência estável desta fonte e
+        // entra na chave de idempotência a jusante (SPEC-0071 §5.4).
+        let inicio = consumed;
         consumed += n as u64;
         let raw = line.trim_end_matches(['\n', '\r']);
         if raw.trim().is_empty() {
             continue;
         }
-        match runner.process_observation(raw) {
+        counters.observed();
+        let sequencia = inicio.to_string();
+        let evento = format!("{}:{inicio}", source.to_string_lossy());
+        let contexto = heraclitus::runner::EmissionContext {
+            identity,
+            forge_source_id,
+            // O LSN que este Fato VAI ocupar. Confirmado a seguir à escrita.
+            forge_lsn: db.current_lsn + 1,
+            source_sequence: Some(&sequencia),
+            source_event_id: Some(&evento),
+        };
+        match runner.process_observation_with_context(raw, &contexto)? {
             Some(mut fact) => {
-                db.write_fact(&mut fact)?;
+                let lsn = db.write_fact(&mut fact)?;
+                // Se o LSN previsto não for o gravado, a proveniência do evento
+                // canónico aponta para outro ponto do log. Falha fechado em vez
+                // de gravar uma cadeia de custódia que não se sustenta.
+                anyhow::ensure!(
+                    lsn == contexto.forge_lsn,
+                    "LSN previsto {} mas gravado {lsn}; proveniência canónica inválida",
+                    contexto.forge_lsn
+                );
+                counters.accepted(fact.get("fact.security").is_some());
                 stats.facts += 1;
             }
             None => {
@@ -262,11 +392,77 @@ fn drain(
                 // artefato. Vai cifrada para a quarentena — nunca para o ecrã
                 // nem para uma log em claro: pode conter dados pessoais.
                 quarantine.append(&source.to_string_lossy(), raw)?;
+                counters.drifted();
                 stats.drift += 1;
             }
         }
     }
     Ok(consumed)
+}
+
+/// Grava um evento de saude no MESMO log dos Fatos.
+///
+/// Partilhar o log e o ponto: a saude do sensor entra na mesma cadeia Merkle e
+/// na mesma ancora que a evidencia, portanto um sensor nao consegue esconder
+/// que esteve cego sem partir a cadeia.
+/// Fecha a janela: batimento, contadores, drift e a barreira de tempo de evento.
+///
+/// A ordem importa para quem le: o batimento prova vida, a janela diz o que
+/// aconteceu nela, e o tick e a barreira explicita que permite derivar silencio
+/// sem ninguem ler o relogio de parede.
+fn fechar_janela(
+    db: &mut FactStore,
+    identity: &heraclitus::hfb2::SecurityIdentity,
+    connector_digest: &str,
+    inicio: i64,
+    fim: i64,
+    counters: &heraclitus::telemetry::WindowCounters,
+) -> anyhow::Result<()> {
+    use heraclitus::telemetry as th;
+    emitir(
+        db,
+        identity,
+        th::Event::SensorHeartbeat(th::SensorHeartbeat {
+            observed_at_micros: fim.max(0) as u64,
+        }),
+    )?;
+    emitir(
+        db,
+        identity,
+        th::Event::IngestionWindowClosed(Box::new(counters.close(
+            inicio,
+            fim,
+            connector_digest.to_owned(),
+        ))),
+    )?;
+    if counters.quarantined > 0 {
+        emitir(
+            db,
+            identity,
+            th::Event::SchemaDriftObserved(th::SchemaDriftObserved {
+                count: counters.quarantined,
+                field: None,
+            }),
+        )?;
+    }
+    emitir(
+        db,
+        identity,
+        th::Event::HealthEvaluationTick(th::HealthEvaluationTick {
+            evaluated_at_micros: fim.max(0) as u64,
+        }),
+    )
+}
+
+fn emitir(
+    db: &mut FactStore,
+    identity: &heraclitus::hfb2::SecurityIdentity,
+    evento: heraclitus::telemetry::Event,
+) -> anyhow::Result<()> {
+    let agora = heraclitus::fact::now_micros()?;
+    let envelope = heraclitus::telemetry::Envelope::new(identity, agora, evento);
+    db.write_health_event(identity, agora, &envelope.to_json()?)?;
+    Ok(())
 }
 
 /// `parar` permite ao SCM interromper o laco entre passagens. Em modo consola
@@ -287,10 +483,29 @@ fn run(a: &Args, parar: Option<&std::sync::mpsc::Receiver<()>>) -> anyhow::Resul
     // Abre o .hdb EXISTENTE. O `new` recupera LSN e raiz Merkle do disco; um
     // ingestor que apagasse aqui perdia o histórico a cada reinício.
     let mut db = FactStore::new(&a.db_path)?;
-    eprintln!("[ingest] destino  : {} (LSN atual {})", a.db_path, db.current_lsn);
+    eprintln!(
+        "[ingest] destino  : {} (LSN atual {})",
+        a.db_path, db.current_lsn
+    );
 
     let mut quarantine = QuarantineWriter::open(&a.quarantine, key)?;
     eprintln!("[ingest] quarentena: {}", quarantine.path().display());
+
+    // Identidade da ORIGEM: BLAKE3 do texto da chave publica da ancora. Tem de
+    // ser calculada exatamente como o `export_facts` a calcula, senao a
+    // proveniencia do evento canonico e a atestacao da ponte apontam para
+    // origens diferentes.
+    let forge_source_id = blake3::hash(std::fs::read_to_string(db.pub_path())?.trim().as_bytes())
+        .to_hex()
+        .to_string();
+    eprintln!(
+        "[ingest] tenant   : {} · datasource {}",
+        a.identity.tenant_id, a.identity.datasource_id
+    );
+    match runner.mapping_version() {
+        Some(mapping) => eprintln!("[ingest] canonico : {mapping}"),
+        None => eprintln!("[ingest] canonico : conector legado (sem bloco security:)"),
+    }
 
     let size = std::fs::metadata(&a.source)?.len();
 
@@ -320,7 +535,33 @@ fn run(a: &Args, parar: Option<&std::sync::mpsc::Receiver<()>>) -> anyhow::Resul
         }
     };
 
+    // --- Telemetry Health: estado desejado e conector ativo ---------------
+    // Sem a expectativa declarada, o consumidor nao consegue distinguir "fonte
+    // calada porque morreu" de "fonte calada porque e assim que ela e".
+    use heraclitus::telemetry as th;
+    let connector_digest = heraclitus::hfb2::model_hex(&runner.connector_digest());
+    emitir(
+        &mut db,
+        &a.identity,
+        th::Event::ExpectationConfigured(th::ExpectationConfigured {
+            heartbeat_cadence_micros: Some(a.window_secs * 1_000_000),
+            max_lateness_micros: a.max_lateness_secs * 1_000_000,
+            minimum_events_per_window: None,
+            duplicate_storm_basis_points: 0,
+        }),
+    )?;
+    emitir(
+        &mut db,
+        &a.identity,
+        th::Event::ConnectorActivated(th::ConnectorActivated {
+            connector_digest: connector_digest.clone(),
+            approved: true,
+        }),
+    )?;
+
     let mut stats = Stats { facts: 0, drift: 0 };
+    let mut counters = th::WindowCounters::default();
+    let mut window_start = heraclitus::fact::now_micros()?;
     loop {
         let size = std::fs::metadata(&a.source)?.len();
         if size < offset {
@@ -328,20 +569,56 @@ fn run(a: &Args, parar: Option<&std::sync::mpsc::Receiver<()>>) -> anyhow::Resul
             offset = 0;
         }
         let before = (stats.facts, stats.drift);
-        offset = drain(&a.source, offset, &mut runner, &mut db, &mut quarantine, &mut stats)?;
+        offset = drain(
+            &a.source,
+            offset,
+            &mut runner,
+            &mut db,
+            &mut quarantine,
+            &a.identity,
+            &forge_source_id,
+            &mut counters,
+            &mut stats,
+        )?;
         if (stats.facts, stats.drift) != before {
             // Estado gravado DEPOIS dos Fatos: entrega pelo menos uma vez.
             // A impressão é recalculada sobre o NOVO offset: o estado guarda
             // sempre a identidade da região consumida até àquele ponto.
             let fp = fingerprint(&a.source, offset)?;
             save_state(&a.state_path, offset, &fp, &a.source)?;
+            // O checkpoint so e anunciado DEPOIS de os Fatos estarem no disco e
+            // de o proprio offset estar duravel — por isso `Verified`.
+            emitir(
+                &mut db,
+                &a.identity,
+                th::Event::CheckpointAdvanced(th::CheckpointAdvanced {
+                    source_sequence: Some(offset),
+                    source_watermark: None,
+                    integrity: th::CheckpointIntegrity::Verified,
+                }),
+            )?;
             eprintln!(
                 "[ingest] {} fato(s), {} drift(s) · offset {}",
                 stats.facts, stats.drift, offset
             );
             std::io::stderr().flush().ok();
         }
-        if !a.follow || a.once {
+
+        let agora = heraclitus::fact::now_micros()?;
+        let fim_de_ciclo = !a.follow || a.once;
+        if fim_de_ciclo || agora - window_start >= (a.window_secs * 1_000_000) as i64 {
+            fechar_janela(
+                &mut db,
+                &a.identity,
+                &connector_digest,
+                window_start,
+                agora,
+                &counters,
+            )?;
+            counters = th::WindowCounters::default();
+            window_start = agora;
+        }
+        if fim_de_ciclo {
             break;
         }
         // Dorme ate ao proximo ciclo OU ate o SCM mandar parar -- o que vier
@@ -500,11 +777,18 @@ fn main() -> ExitCode {
     }
     match run(&a, None) {
         Ok(s) => {
-            eprintln!("[ingest] fim: {} fato(s), {} em quarentena", s.facts, s.drift);
+            eprintln!(
+                "[ingest] fim: {} fato(s), {} em quarentena",
+                s.facts, s.drift
+            );
             // Drift é sinal, não erro: um conector desatualizado manifesta-se
             // assim. Código 3 deixa um agendador distinguir "correu e havia
             // linhas que nao casaram" de "correu limpo".
-            if s.drift > 0 { ExitCode::from(3) } else { ExitCode::SUCCESS }
+            if s.drift > 0 {
+                ExitCode::from(3)
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(e) => {
             eprintln!("[ERRO] {e:#}");
@@ -630,6 +914,9 @@ mod tests {
         let p = tmp("estado_atomico");
         save_state(&p, 1, "f", Path::new("x")).unwrap();
         assert!(p.exists());
-        assert!(!p.with_extension("tmp").exists(), "o ficheiro temporario tem de desaparecer");
+        assert!(
+            !p.with_extension("tmp").exists(),
+            "o ficheiro temporario tem de desaparecer"
+        );
     }
 }

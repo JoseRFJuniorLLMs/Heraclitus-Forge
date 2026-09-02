@@ -18,10 +18,10 @@
 //!
 //! ## Otimização zero-copy
 //!
-//! O filtro `EXECUTES action AGAINST target` usa os acessores [`crate::fbfact::action`]
-//! e [`crate::fbfact::target_id`] para inspecionar o payload CRF v2 **sem
+//! O filtro `EXECUTES action AGAINST target` usa os acessores [`crate::hfb2::core_action`]
+//! e [`crate::hfb2::core_target_id`] para inspecionar o registo HFB2 **sem
 //! desserializar** o Fato completo. Apenas os blocos que passam no filtro são
-//! decodificados via [`crate::fbfact::decode`] + [`crate::cpm::record_to_fact`].
+//! decodificados via [`crate::hfb2::decode_fact`].
 //! Em workloads onde >90% dos blocos são rejeitados pelo filtro, isso elimina
 //! a maioria das alocações.
 
@@ -29,8 +29,6 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 use serde_json::{Map, Value};
-
-use crate::cpm;
 
 // ---------------------------------------------------------------------------
 // Estrutura da query compilada
@@ -199,11 +197,11 @@ fn project_all(fact: &Value) -> Map<String, Value> {
 /// ## Estratégia zero-copy
 ///
 /// Para cada bloco no arquivo:
-/// 1. Decodifica o `CpmRecord` (valida CRC-32C, extrai o payload fbfact).
-/// 2. Usa `fbfact::action(payload)` — lê `&str` direto do buffer, sem alocar.
-/// 3. Usa `fbfact::target_id(payload)` — idem.
-/// 4. Só se os dois campos casam com o filtro, chama `cpm::record_to_fact`
-///    que desserializa o Fato completo para projeção e filtragem temporal.
+/// 1. Valida a estrutura do registo HFB2 (inclui o CRC-32C — camada física).
+/// 2. Usa `hfb2::core_action(core)` — lê `&str` direto do buffer, sem alocar.
+/// 3. Usa `hfb2::core_target_id(core)` — idem.
+/// 4. Só se os dois campos casam com o filtro, desserializa o Fato completo
+///    para projeção e filtragem temporal.
 pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, String> {
     let plan = parse_query(q)?;
 
@@ -224,30 +222,29 @@ pub fn execute_query(db_path: &str, q: &str) -> Result<Vec<Map<String, Value>>, 
     // do banco. Magic/truncagem param o scan (semântica do `break` antigo);
     // Torn é pulado (o verify() é quem julga a integridade).
     let mut out = Vec::new();
-    let outcome = crate::db::scan_blocks(db_path, |_lsn, raw_payload| {
-        // --- Etapa 1: decode CpmRecord (valida CRC-32C — camada física) ---
-        let cpm_rec = match cpm::decode_record(raw_payload) {
-            cpm::CpmDecoded::Record(rec, _) => rec,
-            cpm::CpmDecoded::Torn => return true, // pula bloco corrompido
+    let outcome = crate::db::scan_blocks(db_path, |_header, record| {
+        // --- Etapa 1: validação estrutural do registo (inclui CRC-32C) ---
+        let view = match crate::hfb2::RecordView::parse(record) {
+            Ok(view) => view,
+            Err(_) => return true, // bloco corrompido: o verify() é quem julga
         };
 
-        // --- Etapa 2: FILTRO ZERO-COPY — action + target_id direto no fbfact body ---
-        let fb = &cpm_rec.payload;
+        // --- Etapa 2: FILTRO ZERO-COPY — action + target_id direto no core ---
         if plan.action != "*" {
-            match crate::fbfact::action(fb) {
+            match crate::hfb2::core_action(view.core) {
                 Some(a) if a == plan.action => {}
                 _ => return true,
             }
         }
         if plan.target != "*" {
-            match crate::fbfact::target_id(fb) {
+            match crate::hfb2::core_target_id(view.core) {
                 Some(t) if t == plan.target => {}
                 _ => return true,
             }
         }
 
         // --- Etapa 3: decode completo apenas dos blocos que passaram no filtro ---
-        let fact = match cpm::record_to_fact(&cpm_rec) {
+        let fact = match crate::hfb2::decode_fact(record) {
             Ok(v) => v,
             Err(_) => return true,
         };
@@ -306,7 +303,8 @@ mod tests {
                 "fact.identity": {"actor.id":"a","actor.name":"a","target.id":target,"source.ip":null},
                 "fact.time": {"system_timestamp": 1_782_467_794_979_937i64, "log_sequence_number": 0u64},
                 "fact.behavior": {"class":"c","action":action,"risk_level":"Medium"},
-                "fact.evidence": {"raw_observation_hash":"b3:abcd","carimbo_tempo_legal":"icp"},
+                "fact.datasource": {"tenant_id":"tenant-teste","datasource_id":"teste://fixture","sensor_id":"sensor-teste"},
+                "fact.evidence": {"raw_observation_hash":"b3:abababababababababababababababababababababababababababababababab","carimbo_tempo_legal":"icp"},
                 "fact.lineage": {"transformation_steps":["parse"],"input_source":"pg","matched_rule":"r"},
                 "fact.confidence": 0.9,
                 "fact.knowledge_version":"k","fact.reasoning_version":"r","fact.ontology_version":"v9"

@@ -1,0 +1,352 @@
+{
+  "connector": "windows_security",
+  "artifact": "v1.0.0.hcx",
+  "connector_digest": "7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313",
+  "mapping_version": "windows-security/1.0.0",
+  "cases": [
+    {
+      "input": "2026-08-15 03:20:44 SecurityEvent EventID=4625 Computer=DESK-SIAPE-042 TargetUserName=administrador LogonType=3 IpAddress=203.0.113.90 Status=0xC000006D",
+      "expect_action": "authentication.failure",
+      "canonical_digest": "d9469577765729545aebe96b2610ab7bd29fab9b700d2409a563824411219f41",
+      "event": {
+        "schema_version": "heraclitus-security-event/1.0",
+        "category": "authentication",
+        "event_type": "authentication.failure",
+        "outcome": "failure",
+        "severity": 7,
+        "observed_at_micros": 1782782405000000,
+        "ingested_at_micros": 1782782405000000,
+        "normalized_at_micros": 1782782405001000,
+        "tenant_id": "tenant-demo",
+        "datasource_id": "fixture://windows_security",
+        "sensor_id": "forge-golden-fixture",
+        "source_sequence": "0",
+        "actor": {
+          "kind": "account",
+          "id": "administrador",
+          "name": "administrador",
+          "domain": null
+        },
+        "target": {
+          "kind": "host",
+          "id": "DESK-SIAPE-042",
+          "name": null,
+          "domain": null
+        },
+        "source": {
+          "address": "203.0.113.90",
+          "port": null,
+          "hostname": null
+        },
+        "destination": null,
+        "extensions": {
+          "heraclitus.behavior_class": "credential_attack",
+          "heraclitus.confidence_permille": 960,
+          "heraclitus.observed_at_source": "ingest_fallback",
+          "heraclitus.risk_level": "High"
+        },
+        "provenance": {
+          "forge_source_id": "5f3c9d2b7a1e48606f9d0c3b2a1e4860e5f3c9d2b7a1e48606f9d0c3b2a1e4860",
+          "forge_lsn": 1,
+          "source_event_id": "windows_security:0",
+          "raw_observation_hash": "cd04c1c2059caf633ab46791877292cfba46580215db3e0f016fd28fc013299e",
+          "connector_id": "br.gov.heraclitus.pipelines.windows_security-v1.0.0",
+          "connector_version": "1.0.0",
+          "connector_digest": "7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313",
+          "parser_signature": "format=hcx-v3\nalg=ed25519\nkey=5254bdb1261e7920294193841cc0f0a2cd0fe030f1c6840ce32b27c531d1fe1c\ndigest=7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313\nsig=53bc32452f7f46cf5ed35981654cafe190b5e164347e3aefec1301c529dca605697b2e0e78c962885cf73fd89bcc5690edd5ad9cd7b6e8e5b137375881dd4e02",
+          "matched_rule": "win_logon_failure",
+          "transformation_steps": [
+            "parse",
+            "normalize",
+            "behavior",
+            "emit"
+          ]
+        }
+      }
+    },
+    {
+      "input": "2026-08-15 03:20:01 SecurityEvent EventID=4624 Computer=DESK-SIAPE-042 TargetUserName=carlos.silva LogonType=2 IpAddress=10.2.3.44 Status=0x0",
+      "expect_action": "authentication.success",
+      "canonical_digest": "56c009fc081611069d556dfaf8150c629333f83656553321e2a9413bde2f18fb",
+      "event": {
+        "schema_version": "heraclitus-security-event/1.0",
+        "category": "authentication",
+        "event_type": "authentication.success",
+        "outcome": "success",
+        "severity": 2,
+        "observed_at_micros": 1782782405000000,
+        "ingested_at_micros": 1782782405000000,
+        "normalized_at_micros": 1782782405001000,
+        "tenant_id": "tenant-demo",
+        "datasource_id": "fixture://windows_security",
+        "sensor_id": "forge-golden-fixture",
+        "source_sequence": "1",
+        "actor": {
+          "kind": "account",
+          "id": "carlos.silva",
+          "name": "carlos.silva",
+          "domain": null
+        },
+        "target": {
+          "kind": "host",
+          "id": "DESK-SIAPE-042",
+          "name": null,
+          "domain": null
+        },
+        "source": {
+          "address": "10.2.3.44",
+          "port": null,
+          "hostname": null
+        },
+        "destination": null,
+        "extensions": {
+          "heraclitus.behavior_class": "session",
+          "heraclitus.confidence_permille": 960,
+          "heraclitus.observed_at_source": "ingest_fallback",
+          "heraclitus.risk_level": "Low"
+        },
+        "provenance": {
+          "forge_source_id": "5f3c9d2b7a1e48606f9d0c3b2a1e4860e5f3c9d2b7a1e48606f9d0c3b2a1e4860",
+          "forge_lsn": 2,
+          "source_event_id": "windows_security:1",
+          "raw_observation_hash": "5ccb2b3750c735c23c1a617fb8c5dfecce0bf4c5295ce055c6c5372a0fe02924",
+          "connector_id": "br.gov.heraclitus.pipelines.windows_security-v1.0.0",
+          "connector_version": "1.0.0",
+          "connector_digest": "7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313",
+          "parser_signature": "format=hcx-v3\nalg=ed25519\nkey=5254bdb1261e7920294193841cc0f0a2cd0fe030f1c6840ce32b27c531d1fe1c\ndigest=7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313\nsig=53bc32452f7f46cf5ed35981654cafe190b5e164347e3aefec1301c529dca605697b2e0e78c962885cf73fd89bcc5690edd5ad9cd7b6e8e5b137375881dd4e02",
+          "matched_rule": "win_logon_success",
+          "transformation_steps": [
+            "parse",
+            "normalize",
+            "behavior",
+            "emit"
+          ]
+        }
+      }
+    },
+    {
+      "input": "2026-08-15 03:21:10 SecurityEvent EventID=4672 Computer=SRV-RH-01 TargetUserName=svc-folha LogonType=5 IpAddress=- Status=0x0",
+      "expect_action": "privilege.granted",
+      "canonical_digest": "7b741835f77f747fa9b9cbd744f39117929def804db4bcd8d9a656533cbb6f36",
+      "event": {
+        "schema_version": "heraclitus-security-event/1.0",
+        "category": "privilege",
+        "event_type": "privilege.granted",
+        "outcome": "success",
+        "severity": 7,
+        "observed_at_micros": 1782782405000000,
+        "ingested_at_micros": 1782782405000000,
+        "normalized_at_micros": 1782782405001000,
+        "tenant_id": "tenant-demo",
+        "datasource_id": "fixture://windows_security",
+        "sensor_id": "forge-golden-fixture",
+        "source_sequence": "2",
+        "actor": {
+          "kind": "account",
+          "id": "svc-folha",
+          "name": "svc-folha",
+          "domain": null
+        },
+        "target": {
+          "kind": "host",
+          "id": "SRV-RH-01",
+          "name": null,
+          "domain": null
+        },
+        "source": null,
+        "destination": null,
+        "extensions": {
+          "heraclitus.behavior_class": "privilege_violation",
+          "heraclitus.confidence_permille": 960,
+          "heraclitus.observed_at_source": "ingest_fallback",
+          "heraclitus.risk_level": "High"
+        },
+        "provenance": {
+          "forge_source_id": "5f3c9d2b7a1e48606f9d0c3b2a1e4860e5f3c9d2b7a1e48606f9d0c3b2a1e4860",
+          "forge_lsn": 3,
+          "source_event_id": "windows_security:2",
+          "raw_observation_hash": "c20c519e022af37cea572bc8ba4a3748ec365e33a964d9751ebc74cbfc26be05",
+          "connector_id": "br.gov.heraclitus.pipelines.windows_security-v1.0.0",
+          "connector_version": "1.0.0",
+          "connector_digest": "7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313",
+          "parser_signature": "format=hcx-v3\nalg=ed25519\nkey=5254bdb1261e7920294193841cc0f0a2cd0fe030f1c6840ce32b27c531d1fe1c\ndigest=7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313\nsig=53bc32452f7f46cf5ed35981654cafe190b5e164347e3aefec1301c529dca605697b2e0e78c962885cf73fd89bcc5690edd5ad9cd7b6e8e5b137375881dd4e02",
+          "matched_rule": "win_privilege_assigned",
+          "transformation_steps": [
+            "parse",
+            "normalize",
+            "behavior",
+            "emit"
+          ]
+        }
+      }
+    },
+    {
+      "input": "2026-08-15 03:21:33 SecurityEvent EventID=4720 Computer=SRV-RH-01 TargetUserName=usuario.novo LogonType=0 IpAddress=10.2.3.9 Status=0x0",
+      "expect_action": "account.created",
+      "canonical_digest": "593e1ee75a6f85112afc9c204ce9941e329a959b734555e98daee31057ff6543",
+      "event": {
+        "schema_version": "heraclitus-security-event/1.0",
+        "category": "identity",
+        "event_type": "account.created",
+        "outcome": "success",
+        "severity": 7,
+        "observed_at_micros": 1782782405000000,
+        "ingested_at_micros": 1782782405000000,
+        "normalized_at_micros": 1782782405001000,
+        "tenant_id": "tenant-demo",
+        "datasource_id": "fixture://windows_security",
+        "sensor_id": "forge-golden-fixture",
+        "source_sequence": "3",
+        "actor": {
+          "kind": "account",
+          "id": "usuario.novo",
+          "name": "usuario.novo",
+          "domain": null
+        },
+        "target": {
+          "kind": "host",
+          "id": "SRV-RH-01",
+          "name": null,
+          "domain": null
+        },
+        "source": null,
+        "destination": null,
+        "extensions": {
+          "heraclitus.behavior_class": "identity_lifecycle",
+          "heraclitus.confidence_permille": 960,
+          "heraclitus.observed_at_source": "ingest_fallback",
+          "heraclitus.risk_level": "High"
+        },
+        "provenance": {
+          "forge_source_id": "5f3c9d2b7a1e48606f9d0c3b2a1e4860e5f3c9d2b7a1e48606f9d0c3b2a1e4860",
+          "forge_lsn": 4,
+          "source_event_id": "windows_security:3",
+          "raw_observation_hash": "3867b404b26328cd3769f9532549474bedf6be2645740bda7afc1eb18d54446a",
+          "connector_id": "br.gov.heraclitus.pipelines.windows_security-v1.0.0",
+          "connector_version": "1.0.0",
+          "connector_digest": "7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313",
+          "parser_signature": "format=hcx-v3\nalg=ed25519\nkey=5254bdb1261e7920294193841cc0f0a2cd0fe030f1c6840ce32b27c531d1fe1c\ndigest=7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313\nsig=53bc32452f7f46cf5ed35981654cafe190b5e164347e3aefec1301c529dca605697b2e0e78c962885cf73fd89bcc5690edd5ad9cd7b6e8e5b137375881dd4e02",
+          "matched_rule": "win_account_created",
+          "transformation_steps": [
+            "parse",
+            "normalize",
+            "behavior",
+            "emit"
+          ]
+        }
+      }
+    },
+    {
+      "input": "2026-08-15 03:22:02 SecurityEvent EventID=4726 Computer=SRV-RH-01 TargetUserName=ana.pereira LogonType=0 IpAddress=10.2.3.9 Status=0x0",
+      "expect_action": "account.deleted",
+      "canonical_digest": "6ce1700b933ae69a6cf0d65d6e2fbcba3f1755688907fdf122fdcdd9785b03ba",
+      "event": {
+        "schema_version": "heraclitus-security-event/1.0",
+        "category": "identity",
+        "event_type": "account.deleted",
+        "outcome": "success",
+        "severity": 9,
+        "observed_at_micros": 1782782405000000,
+        "ingested_at_micros": 1782782405000000,
+        "normalized_at_micros": 1782782405001000,
+        "tenant_id": "tenant-demo",
+        "datasource_id": "fixture://windows_security",
+        "sensor_id": "forge-golden-fixture",
+        "source_sequence": "4",
+        "actor": {
+          "kind": "account",
+          "id": "ana.pereira",
+          "name": "ana.pereira",
+          "domain": null
+        },
+        "target": {
+          "kind": "host",
+          "id": "SRV-RH-01",
+          "name": null,
+          "domain": null
+        },
+        "source": null,
+        "destination": null,
+        "extensions": {
+          "heraclitus.behavior_class": "identity_lifecycle",
+          "heraclitus.confidence_permille": 960,
+          "heraclitus.observed_at_source": "ingest_fallback",
+          "heraclitus.risk_level": "Critical"
+        },
+        "provenance": {
+          "forge_source_id": "5f3c9d2b7a1e48606f9d0c3b2a1e4860e5f3c9d2b7a1e48606f9d0c3b2a1e4860",
+          "forge_lsn": 5,
+          "source_event_id": "windows_security:4",
+          "raw_observation_hash": "091d62fb9e23b293004b5a7fa620ee04e9d300a5d041e96ab4786142c0df27f6",
+          "connector_id": "br.gov.heraclitus.pipelines.windows_security-v1.0.0",
+          "connector_version": "1.0.0",
+          "connector_digest": "7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313",
+          "parser_signature": "format=hcx-v3\nalg=ed25519\nkey=5254bdb1261e7920294193841cc0f0a2cd0fe030f1c6840ce32b27c531d1fe1c\ndigest=7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313\nsig=53bc32452f7f46cf5ed35981654cafe190b5e164347e3aefec1301c529dca605697b2e0e78c962885cf73fd89bcc5690edd5ad9cd7b6e8e5b137375881dd4e02",
+          "matched_rule": "win_account_deleted",
+          "transformation_steps": [
+            "parse",
+            "normalize",
+            "behavior",
+            "emit"
+          ]
+        }
+      }
+    },
+    {
+      "input": "2026-08-15 03:22:40 SecurityEvent EventID=4634 Computer=DESK-SIAPE-042 TargetUserName=carlos.silva LogonType=2 IpAddress=10.2.3.44 Status=0x0",
+      "expect_action": "session.end",
+      "canonical_digest": "f887f276780ef3bed122ea3c1a685fd8626f3a60b23f7998ec934d0ef0f65ada",
+      "event": {
+        "schema_version": "heraclitus-security-event/1.0",
+        "category": "authentication",
+        "event_type": "session.end",
+        "outcome": "success",
+        "severity": 2,
+        "observed_at_micros": 1782782405000000,
+        "ingested_at_micros": 1782782405000000,
+        "normalized_at_micros": 1782782405001000,
+        "tenant_id": "tenant-demo",
+        "datasource_id": "fixture://windows_security",
+        "sensor_id": "forge-golden-fixture",
+        "source_sequence": "5",
+        "actor": {
+          "kind": "account",
+          "id": "carlos.silva",
+          "name": "carlos.silva",
+          "domain": null
+        },
+        "target": {
+          "kind": "host",
+          "id": "DESK-SIAPE-042",
+          "name": null,
+          "domain": null
+        },
+        "source": null,
+        "destination": null,
+        "extensions": {
+          "heraclitus.behavior_class": "session",
+          "heraclitus.confidence_permille": 960,
+          "heraclitus.observed_at_source": "ingest_fallback",
+          "heraclitus.risk_level": "Low"
+        },
+        "provenance": {
+          "forge_source_id": "5f3c9d2b7a1e48606f9d0c3b2a1e4860e5f3c9d2b7a1e48606f9d0c3b2a1e4860",
+          "forge_lsn": 6,
+          "source_event_id": "windows_security:5",
+          "raw_observation_hash": "492a784e4fc0d76321a54509019ba81dfa5792d1c9698949e301f6120c0caec7",
+          "connector_id": "br.gov.heraclitus.pipelines.windows_security-v1.0.0",
+          "connector_version": "1.0.0",
+          "connector_digest": "7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313",
+          "parser_signature": "format=hcx-v3\nalg=ed25519\nkey=5254bdb1261e7920294193841cc0f0a2cd0fe030f1c6840ce32b27c531d1fe1c\ndigest=7b0f07ca678e747645c6594f6b9f5a4239f4191223b6c66922c61dc5c7625313\nsig=53bc32452f7f46cf5ed35981654cafe190b5e164347e3aefec1301c529dca605697b2e0e78c962885cf73fd89bcc5690edd5ad9cd7b6e8e5b137375881dd4e02",
+          "matched_rule": "win_logoff",
+          "transformation_steps": [
+            "parse",
+            "normalize",
+            "behavior",
+            "emit"
+          ]
+        }
+      }
+    }
+  ]
+}

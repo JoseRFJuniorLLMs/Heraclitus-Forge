@@ -90,8 +90,68 @@ def quarantine_key_id(key: bytes) -> str:
     import blake3
 
     return blake3.blake3(key).digest()[:8].hex()
+
+
 SCHEMA_VERSION = "operational-fact/1.0"
-BRIDGE_CONTRACT_VERSION = "forge-heraclitusdb/1"
+
+#: Modelo canónico de evento de segurança (SPEC-0071 §4). É uma **extensão
+#: compatível**: viaja em `fact.security`, ao lado do Fato Operacional, e nunca
+#: no lugar dele. Um `.hcx` sem `security:` no manifesto é um conector legado —
+#: produz Fatos `operational-fact/1.0` perfeitamente válidos e não produz evento
+#: canónico. Ausência do bloco NÃO autoriza inventar campos canónicos na leitura
+#: (§4.1); por isso a ponte só valida o que está lá, e passa adiante.
+#:
+#: A definição normativa é o crate `rust/crates/heraclitus-security-schema`.
+#: Aqui está apenas a verificação de fronteira: o que entra no HeraclitusDB tem
+#: de estar consistente com o Fato que o transporta.
+SECURITY_SCHEMA_VERSION = "heraclitus-security-event/1.0"
+
+#: Schema dos eventos de saúde do sensor. O contrato normativo é o crate
+#: `heraclitus-telemetry-health` do HeraclitusDB; aqui está a verificação de
+#: fronteira do que a ponte aceita escrever.
+TELEMETRY_SCHEMA_VERSION = "heraclitus-telemetry-health/1.0"
+
+#: Vocabulário fechado das categorias v1 (SPEC-0071 §4.2). Categoria fora desta
+#: lista é erro de contrato, não uma categoria nova.
+SECURITY_CATEGORIES = frozenset(
+    {
+        "authentication",
+        "network",
+        "dns",
+        "http",
+        "process",
+        "file",
+        "registry",
+        "endpoint",
+        "cloud",
+        "identity",
+        "threat_intel",
+        "vulnerability",
+        "email",
+        "data_access",
+        "privilege",
+        "alert",
+        "finding",
+        "incident",
+    }
+)
+
+#: Desfecho observado. `None` significa DESCONHECIDO — nunca sucesso.
+SECURITY_OUTCOMES = frozenset({"success", "failure"})
+MAX_SECURITY_SEVERITY = 10
+
+#: Versão 2: uma linha do JSONL deixou de ser sempre um Fato. O `.hdb` passou a
+#: carregar também eventos de Telemetry Health, e cada linha diz o que é em
+#: `record_type`. Mudar a forma do envelope sem mudar o número seria exatamente
+#: o que o número existe para impedir.
+BRIDGE_CONTRACT_VERSION = "forge-heraclitusdb/2"
+
+#: `kind` sob o qual os eventos de saúde vivem no HeraclitusDB. Tem de bater com
+#: `TELEMETRY_HEALTH_KIND` do crate consumidor: a view filtra por ele.
+TELEMETRY_KIND = "TelemetryHealth"
+#: O `agent_id` de um evento de saúde é o PRODUTOR, não um titular de dados —
+#: um heartbeat não é dado pessoal de ninguém e não entra no crypto-shredding.
+TELEMETRY_AGENT_ID = "heraclitus-forge"
 DESTINATION_API_VERSION = "heraclitus.v1"
 REQUIRED_HDB_SDK_VERSION = "1.0.5"
 
@@ -217,6 +277,14 @@ def map_fact(lsn: int, fact: dict, *, subject_secret=None) -> dict:
     """
     attestation = fact.get("_forge_export_attestation") or {}
     attrs = {
+        # --- identidade de segurança do datasource (autenticada no HFB2) ---
+        # Vem do cabeçalho autenticado do registo: alterá-la muda a folha
+        # BLAKE3 e a raiz Merkle. Sobe como attrs porque é por aqui que se
+        # isola tenant, se correlaciona por fonte e se responde "de que sensor
+        # veio isto".
+        "tenant_id": _flat(fact, "fact.datasource", "tenant_id"),
+        "datasource_id": _flat(fact, "fact.datasource", "datasource_id"),
+        "sensor_id": _flat(fact, "fact.datasource", "sensor_id"),
         # --- identidade e comportamento (compatível com inserir.py) ---
         "actor_id": _flat(fact, "fact.identity", "actor.id"),
         "actor_name": _flat(fact, "fact.identity", "actor.name"),
@@ -258,6 +326,34 @@ def map_fact(lsn: int, fact: dict, *, subject_secret=None) -> dict:
         "forge_anchor_signature": attestation.get("anchor_signature"),
         "forge_integrity_algorithm": attestation.get("algorithm"),
     }
+    # --- modelo canónico, quando o conector o declara (SPEC-0071 §4) ---
+    # Sobe como attrs planos porque é assim que se consulta o HeraclitusDB:
+    #   MATCH (n:OperationalFact) WHERE n.security_category = "authentication"
+    # O evento canónico completo continua a ser reconstituível a partir do
+    # Forge — aqui vai o que serve para filtrar e correlacionar.
+    security = fact.get("fact.security")
+    if isinstance(security, dict):
+        provenance = security.get("provenance") or {}
+        attrs.update(
+            {
+                "security_schema": security.get("schema_version"),
+                "security_category": security.get("category"),
+                "security_event_type": security.get("event_type"),
+                # Ausente = desconhecido. O filtro abaixo remove-o em vez de o
+                # gravar como "None" — uma chave a mentir é pior que chave
+                # nenhuma numa query.
+                "security_outcome": security.get("outcome"),
+                "security_severity": security.get("severity"),
+                "security_tenant_id": security.get("tenant_id"),
+                "security_datasource_id": security.get("datasource_id"),
+                "security_sensor_id": security.get("sensor_id"),
+                "security_observed_at": security.get("observed_at_micros"),
+                "security_source_sequence": security.get("source_sequence"),
+                # Liga o evento ao artefato exato que o produziu (gate CM1).
+                "security_connector_digest": provenance.get("connector_digest"),
+            }
+        )
+
     # Um attr ausente é ruído: o HeraclitusDB indexa chaves, e uma chave com
     # "None" é pior do que chave nenhuma numa query por atributo.
     attrs = {k: v for k, v in attrs.items() if v is not None and v != ""}
@@ -274,10 +370,95 @@ def map_fact(lsn: int, fact: dict, *, subject_secret=None) -> dict:
     }
 
 
+def validate_security(fact: dict) -> list[str]:
+    """
+    Valida o evento canónico **quando ele existe** (SPEC-0071 §4).
+
+    Ausência não é erro: é um conector legado (§4.1, gate CM2). O que não pode
+    passar é um bloco presente e meio preenchido — isso chegaria ao
+    HeraclitusDB com aparência de evento canónico sem o ser.
+
+    Além da forma, verifica-se a **coerência com o Fato que o transporta**: o
+    evento tem de descrever a MESMA observação. Sem isto, um bug a montante
+    podia colar a semântica de uma linha à evidência de outra, e a cadeia de
+    custódia deixava de provar o que diz provar.
+    """
+    security = fact.get("fact.security")
+    if security is None:
+        return []
+    if not isinstance(security, dict):
+        return ["fact.security presente mas não é um objeto"]
+
+    errors = []
+    if security.get("schema_version") != SECURITY_SCHEMA_VERSION:
+        errors.append(
+            f"schema canónico incompatível: {security.get('schema_version')!r}; "
+            f"esperado {SECURITY_SCHEMA_VERSION!r}"
+        )
+    if security.get("category") not in SECURITY_CATEGORIES:
+        errors.append(f"categoria fora do vocabulário v1: {security.get('category')!r}")
+    if not str(security.get("event_type") or "").strip():
+        errors.append("fact.security.event_type ausente")
+    outcome = security.get("outcome")
+    if outcome is not None and outcome not in SECURITY_OUTCOMES:
+        errors.append(f"desfecho inválido: {outcome!r} (desconhecido escreve-se null)")
+    severity = security.get("severity")
+    if not isinstance(severity, int) or isinstance(severity, bool):
+        errors.append(f"severidade não é inteira: {severity!r}")
+    elif not 0 <= severity <= MAX_SECURITY_SEVERITY:
+        errors.append(f"severidade fora da escala 0..{MAX_SECURITY_SEVERITY}: {severity}")
+    for name in ("tenant_id", "datasource_id", "sensor_id"):
+        if not str(security.get(name) or "").strip():
+            errors.append(f"fact.security.{name} ausente")
+    for name in ("observed_at_micros", "ingested_at_micros", "normalized_at_micros"):
+        value = security.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            errors.append(f"fact.security.{name} não é um instante válido: {value!r}")
+
+    provenance = security.get("provenance")
+    if not isinstance(provenance, dict):
+        return [*errors, "fact.security.provenance ausente"]
+    for name in (
+        "forge_source_id",
+        "connector_id",
+        "connector_version",
+        "connector_digest",
+        "raw_observation_hash",
+        "matched_rule",
+    ):
+        if not str(provenance.get(name) or "").strip():
+            errors.append(f"fact.security.provenance.{name} ausente")
+
+    # Coerência com o Fato: mesma evidência, mesma regra, mesmo artefato.
+    evidence = str(_flat(fact, "fact.evidence", "raw_observation_hash") or "")
+    if evidence.startswith("b3:") and provenance.get("raw_observation_hash") != evidence[3:]:
+        errors.append("evento canónico aponta para outra observação que não a do Fato")
+    matched = _flat(fact, "fact.lineage", "matched_rule")
+    if matched and provenance.get("matched_rule") != matched:
+        errors.append(
+            f"regra divergente: Fato casou {matched!r}, evento diz "
+            f"{provenance.get('matched_rule')!r}"
+        )
+    knowledge = str(fact.get("fact.knowledge_version") or "")
+    if knowledge and "@" in knowledge:
+        connector_id, connector_version = knowledge.split("@", 1)
+        if provenance.get("connector_id") != connector_id:
+            errors.append("evento canónico atribuído a outro conector")
+        if provenance.get("connector_version") != connector_version:
+            errors.append("evento canónico atribuído a outra versão do conector")
+    return errors
+
+
 def validate_fact(lsn: int, fact: dict) -> list[str]:
     """Validação fail-closed do contrato que todo conector `.hcx` deve emitir."""
     required = {
         "fact_id": fact.get("fact_id"),
+        # HDB2: sem identidade não há registo. Se isto falta, o Fato não veio
+        # de um `.hdb` desta geração — e aceitar seria escrever no banco
+        # central um evento que não se sabe a quem pertence.
+        "fact.datasource.tenant_id": _flat(fact, "fact.datasource", "tenant_id"),
+        "fact.datasource.datasource_id": _flat(fact, "fact.datasource", "datasource_id"),
+        "fact.datasource.sensor_id": _flat(fact, "fact.datasource", "sensor_id"),
         "fact.time.system_timestamp": _flat(fact, "fact.time", "system_timestamp"),
         "fact.behavior.action": _flat(fact, "fact.behavior", "action"),
         "fact.behavior.class": _flat(fact, "fact.behavior", "class"),
@@ -310,6 +491,73 @@ def validate_fact(lsn: int, fact: dict) -> list[str]:
             f"API de destino incompatível: {att.get('destination_api')!r}; "
             f"esperado {DESTINATION_API_VERSION!r}"
         )
+    # Extensão canónica: só valida se estiver lá (ver `validate_security`).
+    errors.extend(validate_security(fact))
+    return [f"LSN {lsn}: {e}" for e in errors]
+
+
+def telemetry_episode(lsn: int, record: dict) -> dict:
+    """
+    Traduz uma linha de Telemetry Health no episódio do HeraclitusDB.
+
+    O envelope viaja como **texto**, exatamente como foi gravado e coberto pela
+    folha BLAKE3 do registo HFB2: reserializá-lo aqui daria outros bytes e a
+    ponte deixaria de poder afirmar que entregou o que estava no disco.
+    """
+    telemetry = record["telemetry"]
+    envelope = telemetry["envelope"]
+    identity = telemetry["identity"]
+    # O tipo do evento é atributo indexado: a view filtra por ele sem abrir o
+    # conteúdo. Parsear aqui é leitura, não reescrita — o texto segue intacto.
+    event_type = (json.loads(envelope).get("event") or {}).get("type")
+    attrs = {
+        "telemetry.schema": TELEMETRY_SCHEMA_VERSION,
+        "telemetry.event_type": event_type,
+        "tenant_id": identity["tenant_id"],
+        "datasource_id": identity["datasource_id"],
+        "sensor_id": identity["sensor_id"],
+        "producer": PRODUCER,
+        "forge_lsn": lsn,
+        "generated_by": "heraclitus_forge_bridge",
+    }
+    return {
+        "kind": TELEMETRY_KIND,
+        "content": envelope,
+        "agent_id": TELEMETRY_AGENT_ID,
+        "session_id": identity["datasource_id"],
+        "attrs": {k: v for k, v in attrs.items() if v is not None and v != ""},
+        "parents": [],
+    }
+
+
+def validate_telemetry(lsn: int, record: dict) -> list[str]:
+    """Validação fail-closed do que se escreve como evento de saúde."""
+    telemetry = record.get("telemetry")
+    if not isinstance(telemetry, dict):
+        return [f"LSN {lsn}: linha de telemetria sem bloco `telemetry`"]
+    errors = []
+    identity = telemetry.get("identity")
+    if not isinstance(identity, dict):
+        errors.append("identidade do sensor ausente")
+    else:
+        for name in ("tenant_id", "datasource_id", "sensor_id"):
+            if not str(identity.get(name) or "").strip():
+                errors.append(f"{name} ausente")
+    try:
+        envelope = json.loads(telemetry.get("envelope") or "")
+    except (TypeError, ValueError) as exc:
+        return [f"LSN {lsn}: envelope de telemetria ilegível: {exc}"]
+    if envelope.get("schema") != TELEMETRY_SCHEMA_VERSION:
+        errors.append(
+            f"schema de telemetria incompatível: {envelope.get('schema')!r}; "
+            f"esperado {TELEMETRY_SCHEMA_VERSION!r}"
+        )
+    if not (envelope.get("event") or {}).get("type"):
+        errors.append("envelope sem tipo de evento")
+    # A identidade do envelope e a do registo autenticado têm de ser a mesma:
+    # divergirem significa que alguém montou o envelope noutro sítio.
+    if isinstance(identity, dict) and envelope.get("identity") != identity:
+        errors.append("identidade do envelope diverge da identidade autenticada")
     return [f"LSN {lsn}: {e}" for e in errors]
 
 
@@ -319,6 +567,20 @@ def source_event_identity(lsn: int, fact: dict) -> tuple[str, str]:
     source = str(att.get("source_id") or "")
     fact_id = str(fact.get("fact_id") or "")
     identity = f"forge:{source}:{lsn}:{fact_id}"
+    return identity, hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def telemetry_event_identity(lsn: int, record: dict) -> tuple[str, str]:
+    """
+    Identidade exactly-once de um evento de saúde.
+
+    Um evento de saúde não tem `fact_id`, mas tem algo tão bom: o LSN é único no
+    log e o `source_id` identifica a origem. Reprocessar o mesmo LSN devolve a
+    mesma chave e o destino desduplica.
+    """
+    att = record.get("attestation") or {}
+    source = str(att.get("source_id") or "")
+    identity = f"forge-telemetry:{source}:{lsn}"
     return identity, hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
@@ -381,8 +643,8 @@ def connect_destination(heraclitusdb, addr: str, rpc_timeout: float):
     )
 
 
-def export_jsonl(hdb: Path, from_lsn: int, limit: int | None = None):
-    """Produz `(lsn, fact)` em streaming, apenas de snapshot integralmente verificado."""
+def _export_lines(hdb: Path, from_lsn: int, limit: int | None = None):
+    """Linhas cruas do exportador, já verificadas quanto ao contrato."""
     cmd = [exporter_bin(), str(hdb), "--from-lsn", str(from_lsn)]
     if limit:
         cmd += ["--limit", str(limit)]
@@ -410,9 +672,7 @@ def export_jsonl(hdb: Path, from_lsn: int, limit: int | None = None):
                     f"exportador usa contrato {contract!r}; "
                     f"a ponte exige {BRIDGE_CONTRACT_VERSION!r}"
                 )
-            fact = rec["fact"]
-            fact["_forge_export_attestation"] = rec.get("attestation") or {}
-            yield rec["lsn"], fact
+            yield rec
         stderr = proc.stderr.read() if proc.stderr is not None else ""
         code = proc.wait()
         if code != 0:
@@ -426,6 +686,34 @@ def export_jsonl(hdb: Path, from_lsn: int, limit: int | None = None):
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+
+def export_jsonl(hdb: Path, from_lsn: int, limit: int | None = None):
+    """Produz `(lsn, fact)` — apenas Fatos Operacionais."""
+    for rec in _export_lines(hdb, from_lsn, limit):
+        if rec.get("record_type", "OperationalFact") != "OperationalFact":
+            continue
+        fact = rec["fact"]
+        fact["_forge_export_attestation"] = rec.get("attestation") or {}
+        yield rec["lsn"], fact
+
+
+def export_all(hdb: Path, from_lsn: int, limit: int | None = None):
+    """
+    Produz `(lsn, record_type, payload)` — **tudo** o que está no log.
+
+    Um registo íntegro que a ponte não soubesse encaminhar seria perda
+    silenciosa: o log tem-no, o destino não, e ninguém repara. Por isso um tipo
+    desconhecido não é ignorado — é erro (ver `run`).
+    """
+    for rec in _export_lines(hdb, from_lsn, limit):
+        kind = rec.get("record_type", "OperationalFact")
+        if kind == "OperationalFact":
+            fact = rec["fact"]
+            fact["_forge_export_attestation"] = rec.get("attestation") or {}
+            yield rec["lsn"], kind, fact
+        else:
+            yield rec["lsn"], kind, rec
 
 
 # ---------------------------------------------------------------------------
@@ -609,8 +897,7 @@ def decrypt_quarantine(path: Path, *, key: bytes | None = None):
                 continue
             if len(line) > QUARANTINE_MAX_LINE_BYTES:
                 raise BridgeStateError(
-                    f"quarentena: linha {number} excede "
-                    f"{QUARANTINE_MAX_LINE_BYTES} bytes"
+                    f"quarentena: linha {number} excede {QUARANTINE_MAX_LINE_BYTES} bytes"
                 )
             try:
                 envelope = json.loads(line)
@@ -703,16 +990,31 @@ def run(
         errors: list[str] = []
         last_lsn = from_lsn
         try:
-            for lsn, fact in export_jsonl(hdb, from_lsn, limit):
+            for lsn, record_type, payload in export_all(hdb, from_lsn, limit):
                 read += 1
-                validation = validate_fact(lsn, fact)
-                if validation:
-                    _quarantine(quarantine_path, lsn, fact, validation, key=quarantine_key)
-                    errors.extend(validation)
+                if record_type == "OperationalFact":
+                    fact = payload
+                    validation = validate_fact(lsn, fact)
+                    if validation:
+                        _quarantine(quarantine_path, lsn, fact, validation, key=quarantine_key)
+                        errors.extend(validation)
+                        break
+                    ep = map_fact(lsn, fact, subject_secret=subject_secret)
+                    source_identity, idempotency_key = source_event_identity(lsn, fact)
+                elif record_type == TELEMETRY_KIND:
+                    validation = validate_telemetry(lsn, payload)
+                    if validation:
+                        _quarantine(quarantine_path, lsn, payload, validation, key=quarantine_key)
+                        errors.extend(validation)
+                        break
+                    ep = telemetry_episode(lsn, payload)
+                    source_identity, idempotency_key = telemetry_event_identity(lsn, payload)
+                else:
+                    # Um tipo de registo que a ponte não sabe encaminhar não
+                    # pode ser saltado em silêncio: o log tem-no e o destino
+                    # não teria, sem ninguém reparar.
+                    errors.append(f"LSN {lsn}: tipo de registo não encaminhável: {record_type!r}")
                     break
-
-                ep = map_fact(lsn, fact, subject_secret=subject_secret)
-                source_identity, idempotency_key = source_event_identity(lsn, fact)
                 ep["attrs"]["source_event_id"] = source_identity
                 ep["parents"] = [last_event_id] if last_event_id else []
 

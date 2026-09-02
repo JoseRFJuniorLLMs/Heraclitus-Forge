@@ -77,6 +77,9 @@ fn monitor(
     for raw in lines {
         match runner.process_observation(raw) {
             Some(mut f) => {
+                // Todo registo HFB2 carrega identidade de seguranca autenticada.
+                // Esta demo declara-se demo em vez de herdar um tenant por omissao.
+                heraclitus::hfb2::SecurityIdentity::demo(ip).apply(&mut f);
                 let lsn = db.write_fact(&mut f).context("gravar fato falhou")?;
                 let b = &f["fact.behavior"];
                 info!(

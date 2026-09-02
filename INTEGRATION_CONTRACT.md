@@ -4,9 +4,9 @@
 
 | Componente | Versão |
 | --- | --- |
-| Heraclitus-Forge | `1.0.x` |
+| Heraclitus-Forge | `2.0.x` |
 | HeraclitusDB e SDK Python | `1.0.5` |
-| Envelope JSONL | `forge-heraclitusdb/1` |
+| Envelope JSONL | `forge-heraclitusdb/2` |
 | Fato canônico | `operational-fact/1.0` |
 | API gRPC | `heraclitus.v1` |
 

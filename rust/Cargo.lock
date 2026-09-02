@@ -458,7 +458,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "heraclitus-forge"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -466,10 +466,12 @@ dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
  "getrandom 0.2.17",
+ "heraclitus-security-schema",
  "regex",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -478,6 +480,18 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows-service",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "heraclitus-security-schema"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

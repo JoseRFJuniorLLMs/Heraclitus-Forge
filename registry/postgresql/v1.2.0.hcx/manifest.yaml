@@ -4,3 +4,11 @@ version: 1.2.0
 schema_version: v9
 domain: database_security
 compiled_at: '2026-06-26T02:10:00Z'
+security:
+  security_schema: heraclitus-security-event/1.0
+  category: data_access
+  mapping_version: postgresql/1.0.0
+  required_fields:
+  - observed_at_micros
+  - datasource_id
+  - sensor_id
