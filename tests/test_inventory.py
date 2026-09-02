@@ -18,8 +18,22 @@ def test_inventory_is_complete_and_all_hcx_are_trusted():
     inventory = forge_inventory.build_inventory()
     assert forge_inventory.validate(inventory) == []
     assert inventory["baseline"]["heraclitus_forge_commit"]
-    assert inventory["baseline"]["heraclitusdb_commit"]
     assert all(item["signature_status"] == "OK" for item in inventory["artifacts"])
+
+
+def test_o_repositorio_companheiro_ausente_nao_rebenta_o_baseline(monkeypatch, tmp_path):
+    """
+    O baseline liga-se aos dois commits, mas a CI so faz checkout de um.
+
+    Exigir o repositorio companheiro tornava o inventario num relatorio que so
+    corre na maquina de quem o escreveu. Quando falta, tem de dizer PORQUE — nem
+    rebentar, nem omitir o campo como se nunca tivesse sido pedido.
+    """
+    monkeypatch.setenv("HERACLITUSDB_REPO", str(tmp_path / "nao-existe"))
+    inventory = forge_inventory.build_inventory()
+    assert forge_inventory.validate(inventory) == []
+    assert inventory["baseline"]["heraclitusdb_commit"] is None
+    assert "indisponivel" in inventory["baseline"]["heraclitusdb_commit_source"]
 
 
 def test_every_cargo_binary_has_an_explicit_classification():

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -144,13 +145,25 @@ def artifacts() -> list[dict[str, Any]]:
 
 
 def build_inventory() -> dict[str, Any]:
-    database_repo = ROOT.parent / "HeraclitusDB"
+    # O baseline liga-se aos DOIS commits (SPEC-0071 Marco 0), mas o repositorio
+    # companheiro nem sempre esta presente: a CI faz checkout de um so. Exigi-lo
+    # transformava o inventario num relatorio que so corre na maquina de quem o
+    # escreveu — que e precisamente o oposito de um baseline auditavel. Quando
+    # falta, diz-se qual e a razao em vez de rebentar ou, pior, de omitir.
+    database_repo = Path(os.environ.get("HERACLITUSDB_REPO") or ROOT.parent / "HeraclitusDB")
+    try:
+        heraclitusdb_commit = git_head(database_repo)
+        heraclitusdb_source = database_repo.as_posix()
+    except (OSError, ValueError) as error:
+        heraclitusdb_commit = None
+        heraclitusdb_source = f"indisponivel: {type(error).__name__} em {database_repo.as_posix()}"
     return {
         "schema": "forge-capability-inventory/1.0",
         "spec": "HeraclitusDB/docs/md/SPEC-new/SPEC-0071.md",
         "baseline": {
             "heraclitus_forge_commit": git_head(ROOT),
-            "heraclitusdb_commit": git_head(database_repo),
+            "heraclitusdb_commit": heraclitusdb_commit,
+            "heraclitusdb_commit_source": heraclitusdb_source,
         },
         "classification_semantics": {
             "fixture": "presente para teste; nao promovido",
@@ -278,6 +291,8 @@ def validate(inventory: dict[str, Any]) -> list[str]:
     if unknown:
         errors.append("binarios sem classificacao explicita: " + ", ".join(unknown))
 
+    if not inventory["baseline"]["heraclitus_forge_commit"]:
+        errors.append("baseline sem o commit do proprio repositorio")
     for evidence in inventory["telemetry_health"]["evidence"]:
         if not (ROOT / evidence.split("#", 1)[0]).exists():
             errors.append(f"telemetry_health: evidencia ausente: {evidence}")
