@@ -95,13 +95,19 @@ tracing-appender = "0.2"
 
 # O ingestor corre como servico do Windows (mesmo padrao do heraclitus-service):
 # aparece em services.msc, arranca no boot e o SCM aplica a recuperacao.
-[target.'cfg(windows)'.dependencies]
-windows-service = "0.7"
-windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
-# Gateway de ingestao (backend do dashboard) — stack Rust recomendada
+# Gateway de ingestao (backend do dashboard) — stack Rust recomendada.
+# Estiveram declarados em `cfg(windows)` por engano: o `gateway`, o `wire` e os
+# testes da biblioteca usam-nos em qualquer plataforma, e a CI (Linux) so o
+# revelou quando a biblioteca passou a usar `tempfile` tambem.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 axum = "0.7"
 tempfile = "3"
+
+# O ingestor corre como servico do Windows e a substituicao atomica duravel usa
+# a API nativa: estes sim sao especificos da plataforma.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
 
 [profile.release]
 opt-level = 3

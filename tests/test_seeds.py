@@ -10,6 +10,7 @@ haver `ANTHROPIC_API_KEY`. Os testes aqui garantem duas coisas distintas:
   2. que o caminho da API está **pronto para a chave** — o schema da tool é
      gerado localmente e pode ser validado sem chamar ninguém.
 """
+
 from __future__ import annotations
 
 import json
@@ -20,8 +21,8 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import forge_ai  # noqa: E402
-import forge_seeds  # noqa: E402
+import forge_ai
+import forge_seeds
 
 RISCOS = {"Low", "Medium", "High", "Critical"}
 
@@ -35,6 +36,7 @@ def modelo():
 # ---------------------------------------------------------------------------
 # Os perfis respeitam o contrato do forge_ai
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("nome", sorted(forge_seeds.SEEDS))
 def test_perfil_valida_contra_o_schema_do_forge_ai(nome, modelo):
@@ -132,6 +134,7 @@ def test_templates_de_identidade_referem_grupos_existentes(nome):
 # ---------------------------------------------------------------------------
 # O caminho da API está pronto para a chave
 # ---------------------------------------------------------------------------
+
 
 def test_forge_ai_esta_indisponivel_sem_chave(monkeypatch):
     """
