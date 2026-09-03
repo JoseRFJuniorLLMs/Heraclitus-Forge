@@ -288,8 +288,8 @@ a chave. A partir do ficheiro as duas hipóteses são indistinguíveis, portanto
 banco **não** se auto-repara: reassinar automaticamente destruiria exatamente a
 propriedade que a âncora existe para garantir. O estado é nomeado com o número
 de blocos por assinar para que quem opera decida. **Não há hoje uma operação de
-reparação implementada** — é trabalho a seguir, e é uma decisão de política, não
-de código.
+reparação implementada**: o procedimento, os critérios de aceitação e as peças
+que faltam construir estão em [ANCHOR-BEHIND.md](ANCHOR-BEHIND.md).
 
 ## 11. Limites (entrada hostil)
 
