@@ -30,7 +30,6 @@
 //! [`WebhookAuth`], onde não ter autenticação é a variante
 //! [`WebhookAuth::Aberto`], que quem configura tem de escrever com esse nome.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -40,6 +39,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::Router;
 
+use crate::buffer_fonte::FilaLimitada;
 use crate::source::{
     AdapterError, DatasourceIdentity, DatasourceState, Observation, ObservationBatch, SourceAck,
     SourceAdapter, SourceCapabilities, SourceCounters, SourceHealthSample,
@@ -87,15 +87,8 @@ fn comparar_constante(a: &[u8], b: &[u8]) -> bool {
     diferenca == 0
 }
 
-struct Fila {
-    itens: VecDeque<Observation>,
-    bytes: usize,
-    limite_bytes: usize,
-    recusadas: u64,
-}
-
 struct Partilhado {
-    fila: Mutex<Fila>,
+    fila: Mutex<FilaLimitada>,
     recebidas: AtomicU64,
     ultimo_micros: AtomicU64,
     auth: WebhookAuth,
@@ -157,17 +150,10 @@ async fn receber(
         Ok(f) => f,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "fila indisponivel"),
     };
-    let tamanho = corpo.len() + 64;
-    if fila.bytes + tamanho > fila.limite_bytes {
-        // O ramo bom da §5.4: recusar em vez de descartar. O emissor reenvia.
-        fila.recusadas += 1;
-        return (StatusCode::TOO_MANY_REQUESTS, "buffer cheio; reenvie");
-    }
-
-    let seq = partilhado.recebidas.fetch_add(1, Ordering::SeqCst) + 1;
-    partilhado
-        .ultimo_micros
-        .store(agora_micros(), Ordering::Relaxed);
+    // A sequência é lida e só depois escrita, ambas sob o lock da fila: um
+    // pedido recusado NÃO pode consumir um número de sequência, senão o
+    // contador de observadas subia com telemetria que nunca entrou.
+    let seq = partilhado.recebidas.load(Ordering::SeqCst) + 1;
     let obs = Observation {
         payload: corpo.to_vec(),
         // A sequência do emissor ganha à de recepção quando existe: é ela que
@@ -178,8 +164,15 @@ async fn receber(
         source_event_id: event_id,
         observed_at_micros: Some(agora_micros()),
     };
-    fila.bytes += obs.wire_bytes();
-    fila.itens.push_back(obs);
+
+    // O ramo bom da §5.4: recusar em vez de descartar. O emissor reenvia.
+    if !fila.empurrar_se_couber(obs) {
+        return (StatusCode::TOO_MANY_REQUESTS, "buffer cheio; reenvie");
+    }
+    partilhado.recebidas.store(seq, Ordering::SeqCst);
+    partilhado
+        .ultimo_micros
+        .store(agora_micros(), Ordering::Relaxed);
 
     // 202 e não 200: aceite no buffer, ainda não durável.
     (StatusCode::ACCEPTED, "aceite")
@@ -229,12 +222,7 @@ impl HttpWebhookAdapter {
         ouvinte.set_nonblocking(true)?;
 
         let partilhado = Arc::new(Partilhado {
-            fila: Mutex::new(Fila {
-                itens: VecDeque::new(),
-                bytes: 0,
-                limite_bytes,
-                recusadas: 0,
-            }),
+            fila: Mutex::new(FilaLimitada::nova(limite_bytes)),
             recebidas: AtomicU64::new(0),
             ultimo_micros: AtomicU64::new(0),
             auth,
@@ -332,7 +320,7 @@ impl SourceAdapter for HttpWebhookAdapter {
         let fila = self.partilhado.fila.lock().map_err(|_| {
             AdapterError::InvalidConfig("fila do webhook envenenada por um panico".into())
         })?;
-        let observations: Vec<Observation> = fila.itens.iter().take(limit).cloned().collect();
+        let observations: Vec<Observation> = fila.primeiros(limit);
         if observations.is_empty() {
             return Ok(ObservationBatch {
                 observations,
@@ -363,16 +351,14 @@ impl SourceAdapter for HttpWebhookAdapter {
             AdapterError::InvalidConfig("fila do webhook envenenada por um panico".into())
         })?;
         let a_remover = (ate - self.confirmadas) as usize;
-        if a_remover > fila.itens.len() {
+        if a_remover > fila.len() {
             return Err(AdapterError::InvalidAck(format!(
                 "cursor {ate} confirma {a_remover} observacoes; so ha {} por confirmar",
-                fila.itens.len()
+                fila.len()
             )));
         }
         for _ in 0..a_remover {
-            if let Some(obs) = fila.itens.pop_front() {
-                fila.bytes -= obs.wire_bytes();
-            }
+            fila.remover_frente();
         }
         self.confirmadas = ate;
         Ok(())
@@ -383,7 +369,7 @@ impl SourceAdapter for HttpWebhookAdapter {
             .partilhado
             .fila
             .lock()
-            .map(|f| f.recusadas)
+            .map(|f| f.recusadas())
             .unwrap_or(0);
         let recebidas = self.partilhado.recebidas.load(Ordering::SeqCst);
         let ultimo = self.partilhado.ultimo_micros.load(Ordering::Relaxed);

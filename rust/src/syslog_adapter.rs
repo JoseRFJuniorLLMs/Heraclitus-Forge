@@ -27,12 +27,12 @@
 //! mensagens de 8 KiB é 80 MiB, e um tecto em linhas não diz nada sobre a
 //! memória, que é o recurso que realmente acaba.
 
-use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::buffer_fonte::FilaLimitada;
 use crate::source::{
     AdapterError, DatasourceIdentity, DatasourceState, Observation, ObservationBatch, SourceAck,
     SourceAdapter, SourceCapabilities, SourceCounters, SourceHealthSample,
@@ -63,51 +63,12 @@ impl SyslogTransport {
     }
 }
 
-/// A fila partilhada entre os receptores e o `poll`.
-struct Fila {
-    itens: VecDeque<Observation>,
-    bytes: usize,
-    limite_bytes: usize,
-    descartadas: u64,
-}
-
-impl Fila {
-    fn nova(limite_bytes: usize) -> Self {
-        Self {
-            itens: VecDeque::new(),
-            bytes: 0,
-            limite_bytes,
-            descartadas: 0,
-        }
-    }
-
-    /// Enfileira, descartando o mais antigo se for preciso.
-    ///
-    /// Descarta-se o MAIS ANTIGO e não o mais recente: numa detecção, a
-    /// mensagem de agora vale mais do que a de há um minuto, e recusar a nova
-    /// deixaria o adapter cego exactamente durante o pico que encheu a fila.
-    fn empurrar(&mut self, obs: Observation) {
-        let tamanho = obs.wire_bytes();
-        // Uma mensagem maior que o limite inteiro entra na mesma, sozinha:
-        // recusá-la faria o adapter perder sempre e só as maiores, que
-        // costumam ser as mais informativas.
-        while self.bytes + tamanho > self.limite_bytes && !self.itens.is_empty() {
-            if let Some(velha) = self.itens.pop_front() {
-                self.bytes -= velha.wire_bytes();
-                self.descartadas += 1;
-            }
-        }
-        self.itens.push_back(obs);
-        self.bytes += tamanho;
-    }
-}
-
 /// Recebe syslog em background e entrega por `poll`.
 pub struct SyslogAdapter {
     identity: DatasourceIdentity,
     transport: SyslogTransport,
     endereco: SocketAddr,
-    fila: Arc<Mutex<Fila>>,
+    fila: Arc<Mutex<FilaLimitada>>,
     /// Contagem monótona de tudo o que entrou. É o cursor: num transporte sem
     /// retenção, "quantas vi" é a única posição que significa alguma coisa.
     recebidas: Arc<AtomicU64>,
@@ -137,7 +98,7 @@ impl SyslogAdapter {
                 "buffer_limit_bytes tem de ser > 0".into(),
             ));
         }
-        let fila = Arc::new(Mutex::new(Fila::nova(limite_bytes)));
+        let fila = Arc::new(Mutex::new(FilaLimitada::nova(limite_bytes)));
         let recebidas = Arc::new(AtomicU64::new(0));
         let parar = Arc::new(AtomicBool::new(false));
         let ultimo = Arc::new(AtomicU64::new(0));
@@ -223,7 +184,7 @@ impl SyslogAdapter {
 
     fn receber_udp(
         socket: UdpSocket,
-        fila: Arc<Mutex<Fila>>,
+        fila: Arc<Mutex<FilaLimitada>>,
         recebidas: Arc<AtomicU64>,
         parar: Arc<AtomicBool>,
         ultimo: Arc<AtomicU64>,
@@ -249,7 +210,7 @@ impl SyslogAdapter {
 
     fn receber_tcp(
         listener: TcpListener,
-        fila: Arc<Mutex<Fila>>,
+        fila: Arc<Mutex<FilaLimitada>>,
         recebidas: Arc<AtomicU64>,
         parar: Arc<AtomicBool>,
         ultimo: Arc<AtomicU64>,
@@ -344,7 +305,7 @@ impl SourceAdapter for SyslogAdapter {
         let fila = self.fila.lock().map_err(|_| {
             AdapterError::InvalidConfig("fila de syslog envenenada por um pânico".into())
         })?;
-        let observations: Vec<Observation> = fila.itens.iter().take(limit).cloned().collect();
+        let observations: Vec<Observation> = fila.primeiros(limit);
         if observations.is_empty() {
             return Ok(ObservationBatch {
                 observations,
@@ -388,7 +349,7 @@ impl SourceAdapter for SyslogAdapter {
         let mut fila = self.fila.lock().map_err(|_| {
             AdapterError::InvalidConfig("fila de syslog envenenada por um pânico".into())
         })?;
-        while let Some(frente) = fila.itens.front() {
+        while let Some(frente) = fila.frente() {
             let seq: u64 = frente
                 .source_sequence
                 .as_deref()
@@ -397,16 +358,14 @@ impl SourceAdapter for SyslogAdapter {
             if seq > ate {
                 break;
             }
-            let bytes = frente.wire_bytes();
-            fila.itens.pop_front();
-            fila.bytes -= bytes;
+            fila.remover_frente();
         }
         self.confirmadas = ate;
         Ok(())
     }
 
     fn health(&self) -> SourceHealthSample {
-        let descartadas = self.fila.lock().map(|f| f.descartadas).unwrap_or(0);
+        let descartadas = self.fila.lock().map(|f| f.descartadas()).unwrap_or(0);
         let recebidas = self.recebidas.load(Ordering::SeqCst);
         let ultimo = self.ultimo_observado_micros.load(Ordering::Relaxed);
 

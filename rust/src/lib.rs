@@ -6,6 +6,7 @@
 //! lendo os artefatos `.hcx` ja homologados.
 
 pub mod auditd_adapter;
+pub mod buffer_fonte;
 pub mod crc32c;
 pub mod datasource;
 pub mod db;
@@ -20,6 +21,7 @@ pub mod raft;
 pub mod runner;
 pub mod source;
 pub mod syslog_adapter;
+pub mod syslog_tls_adapter;
 pub mod telemetry;
 pub mod webhook_adapter;
 pub mod wineventlog_adapter;
