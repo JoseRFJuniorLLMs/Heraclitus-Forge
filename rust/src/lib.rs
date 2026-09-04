@@ -5,6 +5,7 @@
 //! de producao — o Runner (line-rate) e o HeraclitusDB (append-only) — para Rust,
 //! lendo os artefatos `.hcx` ja homologados.
 
+pub mod auditd_adapter;
 pub mod crc32c;
 pub mod datasource;
 pub mod db;
@@ -13,6 +14,7 @@ pub mod fact;
 pub mod hcx;
 pub mod hfb2;
 pub mod hql;
+pub mod journald_adapter;
 pub mod quarantine;
 pub mod raft;
 pub mod runner;
