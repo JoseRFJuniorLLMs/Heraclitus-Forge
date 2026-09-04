@@ -22,4 +22,5 @@ pub mod source;
 pub mod syslog_adapter;
 pub mod telemetry;
 pub mod webhook_adapter;
+pub mod wineventlog_adapter;
 pub mod wire;

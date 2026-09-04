@@ -107,7 +107,7 @@ tempfile = "3"
 # a API nativa: estes sim sao especificos da plataforma.
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
-windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem", "Win32_System_EventLog", "Win32_Foundation"] }
 
 [profile.release]
 opt-level = 3
