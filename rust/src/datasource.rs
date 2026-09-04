@@ -24,6 +24,19 @@
 //! schema. [`AdmissionStep`] regista qual das seis etapas falhou, e o motivo
 //! vai em texto ao lado.
 //!
+//! ## A ordem das etapas é parte da garantia
+//!
+//! A §5.5 lista "validar o manifesto canónico" como etapa 2, antes do digest e
+//! da assinatura. Aqui a etapa 2 verifica que o manifesto **existe e não está
+//! vazio**, e o parser de YAML só corre depois da etapa 4.
+//!
+//! A secção abre com "antes de carregar qualquer YAML, regex, modelo ou DAG, o
+//! runner MUST [as seis etapas]", e correr `serde_yaml` na etapa 2 seria
+//! carregar YAML antes de alguém ter dito que aqueles bytes são os que a
+//! organização assinou. O parser é código a correr sobre entrada controlada por
+//! quem escreveu o ficheiro; que o valor não fosse usado não muda nada, porque
+//! o risco é a execução.
+//!
 //! ## A ligação que ninguém faria à mão
 //!
 //! O [`DatasourceSpec::connector_ref`] declara QUAL conteúdo o datasource deve
@@ -373,9 +386,63 @@ pub fn admitir(spec: &DatasourceSpec, artefacto: &Path, generation: u64) -> Admi
         Err(erro) => return quarentena(generation, AdmissionStep::TrustRoot, erro.to_string()),
     };
 
-    // 2 — manifesto canónico. Lê-se ANTES da assinatura só para saber se
-    // existe e se é YAML; nada dele é usado antes da etapa 4 passar.
-    let manifesto_bruto = match std::fs::read_to_string(artefacto.join("manifest.yaml")) {
+    // 2 — o manifesto canónico EXISTE e não está vazio.
+    //
+    // Só isso. Não se parseia aqui, e a diferença não é de estilo.
+    //
+    // A §5.5 abre com "antes de carregar qualquer YAML, regex, modelo ou DAG, o
+    // runner MUST [as seis etapas]". Correr o parser de YAML na etapa 2 é
+    // carregar YAML antes de a etapa 4 ter dito que os bytes são os que a
+    // organização assinou — e o parser é código a correr sobre entrada
+    // controlada por quem escreveu o ficheiro. Um `serde_yaml` com um bug de
+    // profundidade ou de alias já foi executado quando a assinatura ainda nem
+    // foi olhada. Não interessa que o VALOR não fosse usado: o problema é a
+    // execução, não o uso.
+    //
+    // Foi o meu comentário anterior que estava errado, e contradizia a
+    // invariante escrita no cabeçalho deste módulo e na linha 5 do `hcx.rs`.
+    let manifesto_caminho = artefacto.join("manifest.yaml");
+    match std::fs::metadata(&manifesto_caminho) {
+        Ok(m) if m.is_file() && m.len() > 0 => {}
+        Ok(_) => {
+            return quarentena(
+                generation,
+                AdmissionStep::Manifesto,
+                "manifest.yaml vazio ou nao e um ficheiro".to_string(),
+            )
+        }
+        Err(erro) => {
+            return quarentena(
+                generation,
+                AdmissionStep::Manifesto,
+                format!("manifest.yaml ausente: {erro}"),
+            )
+        }
+    }
+
+    // 3+4 — digest recomputado de TODOS os ficheiros (o manifesto incluído) e
+    // Ed25519 contra a trust root.
+    let digest_hex = match crate::hcx::verify_artifact(artefacto, &trust_root) {
+        Ok(hex) => hex,
+        Err(erro) => {
+            return quarentena(
+                generation,
+                AdmissionStep::DigestEAssinatura,
+                erro.to_string(),
+            )
+        }
+    };
+
+    // Só agora — com a assinatura verificada — é que o YAML é interpretado.
+    //
+    // Fica uma janela conhecida: o `verify_artifact` leu os bytes para os
+    // somar e esta leitura é outra, e entre as duas o ficheiro pode mudar.
+    // Fechá-la a sério é verificar a partir de uma cópia em memória, o que
+    // muda o `hcx.rs` e afecta também o `runner.rs`, que tem exactamente a
+    // mesma janela. Meia correcção só aqui daria dois comportamentos
+    // diferentes para o mesmo problema — por isso fica declarada em vez de
+    // remendada.
+    let manifesto_bruto = match std::fs::read_to_string(&manifesto_caminho) {
         Ok(texto) => texto,
         Err(erro) => {
             return quarentena(
@@ -392,18 +459,6 @@ pub fn admitir(spec: &DatasourceSpec, artefacto: &Path, generation: u64) -> Admi
                 generation,
                 AdmissionStep::Manifesto,
                 format!("manifest.yaml invalido: {erro}"),
-            )
-        }
-    };
-
-    // 3+4 — digest recomputado de todos os ficheiros e Ed25519.
-    let digest_hex = match crate::hcx::verify_artifact(artefacto, &trust_root) {
-        Ok(hex) => hex,
-        Err(erro) => {
-            return quarentena(
-                generation,
-                AdmissionStep::DigestEAssinatura,
-                erro.to_string(),
             )
         }
     };
@@ -797,6 +852,56 @@ mod tests {
             AdmissionStep::DigestEAssinatura,
             "a assinatura tem de falhar ANTES da compatibilidade"
         );
+    }
+
+    /// O parser de YAML NAO pode correr sobre bytes por verificar.
+    ///
+    /// A §5.5 abre com "antes de carregar qualquer YAML [...] o runner MUST [as
+    /// seis etapas]". Se a etapa 2 parseasse, um `serde_yaml` com um bug de
+    /// profundidade ou de alias ja tinha sido executado quando a assinatura
+    /// ainda nem foi olhada — e nao interessa que o valor nao fosse usado,
+    /// porque o problema e a EXECUCAO.
+    ///
+    /// Este teste poe no manifesto uma coisa que o parser recusaria, e exige
+    /// que a rejeicao venha da ASSINATURA. Se a ordem se inverter outra vez,
+    /// a etapa passa a `Manifesto` e o teste cai.
+    #[test]
+    fn o_yaml_nao_e_parseado_antes_da_assinatura() {
+        let temporario = tempfile::tempdir().expect("tempdir");
+        let copia = registry_temporario(temporario.path());
+        // YAML sintacticamente invalido: aspas por fechar e indentacao absurda.
+        std::fs::write(
+            copia.join("manifest.yaml"),
+            "id: \"sem fecho\n  : : :\n\t\tlixo\n",
+        )
+        .unwrap();
+
+        let resultado = admitir(&spec_valida(&digest_real()), &copia, 1);
+        let AdmissionOutcome::Quarantined { etapa, .. } = resultado else {
+            panic!("nao pode ser admitido");
+        };
+        assert_eq!(
+            etapa,
+            AdmissionStep::DigestEAssinatura,
+            "a rejeicao tem de vir da assinatura; se vier de `Manifesto`, o \
+             parser correu sobre bytes por verificar"
+        );
+    }
+
+    /// A etapa 2 continua a existir: um manifesto AUSENTE e apanhado antes de
+    /// se gastar uma verificacao criptografica.
+    #[test]
+    fn um_manifesto_vazio_e_apanhado_na_etapa_2() {
+        let temporario = tempfile::tempdir().expect("tempdir");
+        let copia = registry_temporario(temporario.path());
+        std::fs::write(copia.join("manifest.yaml"), "").unwrap();
+
+        let resultado = admitir(&spec_valida(&digest_real()), &copia, 1);
+        let AdmissionOutcome::Quarantined { etapa, motivo, .. } = resultado else {
+            panic!("nao pode ser admitido");
+        };
+        assert_eq!(etapa, AdmissionStep::Manifesto);
+        assert!(motivo.contains("vazio"), "motivo: {motivo}");
     }
 
     /// Desligado a mao NAO e o mesmo que rejeitado: um painel que os confunda
