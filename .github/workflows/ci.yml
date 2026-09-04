@@ -49,8 +49,6 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: rust
-      - name: format
-        run: cargo fmt --all -- --check
       - name: clippy — all targets, deny warnings
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: tests — all targets
@@ -61,6 +59,13 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: RustSec — deny vulnerabilities and warnings
         run: cargo audit --deny warnings
+      # Por ULTIMO e com `!cancelled()`: enquanto o `format` foi o primeiro
+      # passo, uma divergencia cosmetica abortava o job antes do `clippy` e
+      # escondia erros de compilacao reais. Continua a reprovar — mas nunca
+      # antes de os gates que importam terem falado.
+      - name: format (nao mascara os gates acima)
+        if: '!cancelled()'
+        run: cargo fmt --all -- --check
 
   python-and-contracts:
     runs-on: ubuntu-latest
@@ -81,10 +86,11 @@ jobs:
           python -m pip install uv==0.11.24
           uv venv .venv --python 3.12
           uv pip sync requirements.lock --python .venv/bin/python --require-hashes
-      - name: Python lint and format
-        run: |
-          .venv/bin/ruff check .
-          .venv/bin/ruff format --check .
+      # `ruff check` fica cedo de proposito: apanha nomes indefinidos e imports
+      # partidos, e um gate semantico e barato. So o `ruff format --check`, que
+      # e puramente cosmetico, foi para o fim do job.
+      - name: Python lint
+        run: .venv/bin/ruff check .
       - name: Python and cross-language tests
         run: .venv/bin/python -m pytest
       - name: Python dependency audit
@@ -100,3 +106,6 @@ jobs:
             echo "inserir.py iniciou sem --confirm-demo-load"
             exit 1
           fi
+      - name: Python format (cosmetico; corre no fim para nao mascarar os testes)
+        if: '!cancelled()'
+        run: .venv/bin/ruff format --check .
