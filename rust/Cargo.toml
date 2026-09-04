@@ -100,7 +100,7 @@ tracing-appender = "0.2"
 # testes da biblioteca usam-nos em qualquer plataforma, e a CI (Linux) so o
 # revelou quando a biblioteca passou a usar `tempfile` tambem.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
-axum = "0.7"
+axum = "0.8"
 tempfile = "3"
 
 # SPEC-0071 §5.2 P0 #3 — syslog sobre TLS com mTLS opcional.
