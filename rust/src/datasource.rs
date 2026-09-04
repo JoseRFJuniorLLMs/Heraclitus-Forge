@@ -32,12 +32,16 @@
 //! se outro — ambos legitimamente assinados. A etapa
 //! [`AdmissionStep::DigestDeclarado`] existe só para isso.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::source::{DatasourceIdentity, DatasourceState, SourceCounters};
+use crate::source::{
+    AdapterError, DatasourceIdentity, DatasourceState, ObservationBatch, SourceAck, SourceAdapter,
+    SourceCounters, SourceSupervisor,
+};
 
 /// Versões de schema que este runtime sabe interpretar (§5.5 etapa 5).
 ///
@@ -435,6 +439,148 @@ impl DatasourceSpec {
     }
 }
 
+/// O supervisor com o portão da §5.5 à frente.
+///
+/// O [`SourceSupervisor`] cru aceita qualquer adapter que lhe deem. Isso é
+/// correcto para ele — não é trabalho dele saber de artefactos assinados — mas
+/// deixa a §5.5 por cumprir enquanto ninguém a chamar. Este tipo é quem a
+/// chama.
+///
+/// A diferença que interessa está em [`FabricSupervisor::admitir_e_registar`]:
+/// o adapter só é **construído** depois de a admissão passar. Construir
+/// primeiro e decidir depois faria um artefacto rejeitado abrir na mesma um
+/// porto de escuta, ou começar a seguir um ficheiro — e um datasource em
+/// quarentena que está a ouvir na rede é uma contradição em termos.
+pub struct FabricSupervisor {
+    interno: SourceSupervisor,
+    /// Estado observado (§5.3) de TODOS os datasources, incluindo os que não
+    /// arrancaram. Um datasource em quarentena não tem adapter, e sem isto
+    /// desaparecia dos painéis — que é a pior forma de esconder uma rejeição.
+    estados: BTreeMap<String, DatasourceStatus>,
+    /// Os `ContentActivated` da etapa 6, à espera de quem os persista.
+    activados: Vec<ContentActivated>,
+}
+
+impl Default for FabricSupervisor {
+    fn default() -> Self {
+        Self::novo()
+    }
+}
+
+impl FabricSupervisor {
+    pub fn novo() -> Self {
+        Self {
+            interno: SourceSupervisor::default(),
+            estados: BTreeMap::new(),
+            activados: Vec::new(),
+        }
+    }
+
+    /// Corre a admissão da §5.5 e, só se ela passar, constrói e regista o
+    /// adapter.
+    ///
+    /// `construir` é uma closure e não um adapter já feito precisamente para
+    /// que nada aconteça no caso rejeitado.
+    pub fn admitir_e_registar(
+        &mut self,
+        spec: &DatasourceSpec,
+        artefacto: &Path,
+        generation: u64,
+        construir: impl FnOnce() -> Result<Box<dyn SourceAdapter>, AdapterError>,
+    ) -> AdmissionOutcome {
+        let resultado = admitir(spec, artefacto, generation);
+        let id = spec.datasource_id.clone();
+
+        match &resultado {
+            AdmissionOutcome::Quarantined { status, .. } => {
+                self.estados.insert(id, status.clone());
+            }
+            AdmissionOutcome::Activated { status, evento } => {
+                match construir() {
+                    Ok(adapter) => {
+                        if let Err(erro) = self.interno.register(adapter) {
+                            // O artefacto era bom e o adapter não arrancou:
+                            // porto ocupado, ficheiro que não existe, id
+                            // duplicado. Não é quarentena — o conteúdo está
+                            // íntegro — mas também não é `Starting`, e dizer
+                            // `Starting` a um datasource que nunca vai receber
+                            // nada é a mentira mais cara que este código podia
+                            // contar.
+                            let mut falhou = status.clone();
+                            falhou.state = DatasourceState::Stopped;
+                            falhou.last_error_code = Some("adapter_nao_arrancou".into());
+                            self.estados.insert(id, falhou.clone());
+                            return AdmissionOutcome::Quarantined {
+                                status: falhou,
+                                etapa: AdmissionStep::SpecInvalida,
+                                motivo: erro.to_string(),
+                            };
+                        }
+                        self.estados.insert(id, status.clone());
+                        self.activados.push(evento.clone());
+                    }
+                    Err(erro) => {
+                        let mut falhou = status.clone();
+                        falhou.state = DatasourceState::Stopped;
+                        falhou.last_error_code = Some("adapter_nao_arrancou".into());
+                        self.estados.insert(id, falhou.clone());
+                        return AdmissionOutcome::Quarantined {
+                            status: falhou,
+                            etapa: AdmissionStep::SpecInvalida,
+                            motivo: erro.to_string(),
+                        };
+                    }
+                }
+            }
+        }
+        resultado
+    }
+
+    /// Passa o que os adapters observaram para o estado observado da §5.3.
+    ///
+    /// Os datasources sem adapter — em quarentena ou parados — não são tocados:
+    /// não há saúde a ler, e sobrescrevê-los com um estado por omissão
+    /// apagaria a razão pela qual não arrancaram.
+    pub fn sincronizar_saude(&mut self) {
+        for (identidade, saude) in self.interno.health() {
+            if let Some(estado) = self.estados.get_mut(&identidade.datasource_id) {
+                estado.state = saude.state;
+                estado.last_observed_at = saude.last_observed_at_micros.map(|m| m as i64);
+                estado.last_checkpoint = saude.last_checkpoint;
+                estado.counters = saude.counters;
+                estado.last_error_code = saude.last_error_code;
+            }
+        }
+    }
+
+    pub fn estado(&self, datasource_id: &str) -> Option<&DatasourceStatus> {
+        self.estados.get(datasource_id)
+    }
+
+    pub fn estados(&self) -> impl Iterator<Item = (&str, &DatasourceStatus)> {
+        self.estados.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Entrega os `ContentActivated` acumulados e esvazia a lista.
+    ///
+    /// Esvaziar aqui e não no registo é o que impede o mesmo evento de ser
+    /// persistido duas vezes se alguém chamar isto em ciclo.
+    pub fn drenar_activados(&mut self) -> Vec<ContentActivated> {
+        std::mem::take(&mut self.activados)
+    }
+
+    pub fn poll_cycle(
+        &mut self,
+        limite_por_fonte: usize,
+    ) -> Vec<(DatasourceIdentity, Result<ObservationBatch, AdapterError>)> {
+        self.interno.poll_cycle(limite_por_fonte)
+    }
+
+    pub fn checkpoint(&mut self, datasource_id: &str, ack: SourceAck) -> Result<(), AdapterError> {
+        self.interno.checkpoint(datasource_id, ack)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,6 +817,184 @@ mod tests {
         assert!(!impresso.contains("cofre"), "vazou: {impresso}");
         assert_eq!(s.vault_id(), "cofre/pg/senha");
         assert!(SecretRef::novo("  ").is_err());
+    }
+
+    /// Adapter minimo, so para o supervisor ter o que registar.
+    struct AdapterFalso {
+        identity: DatasourceIdentity,
+        estado: DatasourceState,
+        observadas: u64,
+    }
+
+    impl SourceAdapter for AdapterFalso {
+        fn identity(&self) -> &DatasourceIdentity {
+            &self.identity
+        }
+        fn capabilities(&self) -> crate::source::SourceCapabilities {
+            crate::source::SourceCapabilities {
+                ordered: true,
+                reliable_transport: true,
+                source_sequence: true,
+                source_timestamp: false,
+                backpressure: true,
+            }
+        }
+        fn poll(&mut self, _limit: usize) -> Result<ObservationBatch, AdapterError> {
+            Ok(ObservationBatch {
+                observations: Vec::new(),
+                ack: None,
+            })
+        }
+        fn checkpoint(&mut self, _ack: SourceAck) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        fn health(&self) -> crate::source::SourceHealthSample {
+            crate::source::SourceHealthSample {
+                state: self.estado,
+                last_observed_at_micros: Some(1234),
+                last_checkpoint: Some("7".into()),
+                counters: SourceCounters {
+                    observed: self.observadas,
+                    acknowledged: 0,
+                    backpressure_events: 0,
+                    dropped: 0,
+                },
+                last_error_code: None,
+            }
+        }
+    }
+
+    /// O ponto todo do `FabricSupervisor`: um artefacto rejeitado nao chega a
+    /// CONSTRUIR o adapter. Construir primeiro e decidir depois faria um
+    /// datasource em quarentena abrir na mesma um porto de escuta.
+    #[test]
+    fn um_datasource_rejeitado_nao_constroi_o_adapter() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut spec = spec_valida(&digest_real());
+        spec.connector_ref = ContentRef::novo("bb".repeat(32)).unwrap();
+
+        let construiu = AtomicBool::new(false);
+        let mut sup = FabricSupervisor::novo();
+        let resultado = sup.admitir_e_registar(&spec, &artefacto(), 1, || {
+            construiu.store(true, Ordering::SeqCst);
+            Ok(Box::new(AdapterFalso {
+                identity: spec.identidade("s"),
+                estado: DatasourceState::Healthy,
+                observadas: 0,
+            }))
+        });
+
+        assert!(!resultado.activou());
+        assert!(
+            !construiu.load(Ordering::SeqCst),
+            "a closure de construcao NAO pode ter corrido"
+        );
+        // E continua visivel: um datasource em quarentena que desaparece do
+        // painel e a pior forma de esconder uma rejeicao.
+        let estado = sup.estado("ds-pg-1").expect("tem de aparecer nos estados");
+        assert_eq!(estado.state, DatasourceState::Quarantined);
+        assert_eq!(sup.estados().count(), 1);
+    }
+
+    #[test]
+    fn um_datasource_admitido_e_registado_e_o_evento_fica_por_drenar() {
+        let spec = spec_valida(&digest_real());
+        let mut sup = FabricSupervisor::novo();
+        let resultado = sup.admitir_e_registar(&spec, &artefacto(), 1, || {
+            Ok(Box::new(AdapterFalso {
+                identity: spec.identidade("s"),
+                estado: DatasourceState::Healthy,
+                observadas: 42,
+            }))
+        });
+        assert!(resultado.activou());
+        assert_eq!(
+            sup.estado("ds-pg-1").unwrap().state,
+            DatasourceState::Starting
+        );
+
+        let eventos = sup.drenar_activados();
+        assert_eq!(eventos.len(), 1);
+        assert_eq!(eventos[0].datasource_id, "ds-pg-1");
+        // Drenar esvazia: chamar em ciclo nao pode persistir o mesmo evento
+        // duas vezes.
+        assert!(sup.drenar_activados().is_empty());
+    }
+
+    /// O `Starting` do registo passa a ser o que o adapter REALMENTE observou.
+    #[test]
+    fn sincronizar_saude_traz_o_observado_para_o_estado() {
+        let spec = spec_valida(&digest_real());
+        let mut sup = FabricSupervisor::novo();
+        sup.admitir_e_registar(&spec, &artefacto(), 1, || {
+            Ok(Box::new(AdapterFalso {
+                identity: spec.identidade("s"),
+                estado: DatasourceState::Healthy,
+                observadas: 42,
+            }))
+        });
+        assert_eq!(sup.estado("ds-pg-1").unwrap().counters.observed, 0);
+
+        sup.sincronizar_saude();
+        let estado = sup.estado("ds-pg-1").unwrap();
+        assert_eq!(estado.state, DatasourceState::Healthy);
+        assert_eq!(estado.counters.observed, 42);
+        assert_eq!(estado.last_observed_at, Some(1234));
+        assert_eq!(estado.last_checkpoint.as_deref(), Some("7"));
+    }
+
+    /// Sincronizar nao pode apagar a razao pela qual um datasource nao arrancou.
+    #[test]
+    fn sincronizar_saude_nao_toca_em_quem_nao_tem_adapter() {
+        let mut mau = spec_valida(&digest_real());
+        mau.datasource_id = "ds-rejeitado".into();
+        mau.connector_ref = ContentRef::novo("cc".repeat(32)).unwrap();
+
+        let bom = spec_valida(&digest_real());
+        let mut sup = FabricSupervisor::novo();
+        sup.admitir_e_registar(&mau, &artefacto(), 1, || panic!("nao devia construir"));
+        sup.admitir_e_registar(&bom, &artefacto(), 1, || {
+            Ok(Box::new(AdapterFalso {
+                identity: bom.identidade("s"),
+                estado: DatasourceState::Healthy,
+                observadas: 9,
+            }))
+        });
+
+        sup.sincronizar_saude();
+        let rejeitado = sup.estado("ds-rejeitado").unwrap();
+        assert_eq!(rejeitado.state, DatasourceState::Quarantined);
+        assert_eq!(
+            rejeitado.last_error_code.as_deref(),
+            Some("hcx_digest_declarado"),
+            "a razao da rejeicao tem de sobreviver ao sync"
+        );
+        assert_eq!(sup.estado("ds-pg-1").unwrap().counters.observed, 9);
+    }
+
+    /// Conteudo bom e adapter que nao arranca (porto ocupado, ficheiro que nao
+    /// existe) NAO e quarentena — mas tambem nao e `Starting`. Dizer `Starting`
+    /// a um datasource que nunca vai receber nada e a mentira mais cara que este
+    /// codigo podia contar.
+    #[test]
+    fn um_adapter_que_nao_arranca_fica_stopped_e_nao_starting() {
+        let spec = spec_valida(&digest_real());
+        let mut sup = FabricSupervisor::novo();
+        let resultado = sup.admitir_e_registar(&spec, &artefacto(), 1, || {
+            Err(AdapterError::InvalidConfig("porto ocupado".into()))
+        });
+        assert!(!resultado.activou());
+        let estado = sup.estado("ds-pg-1").unwrap();
+        assert_eq!(estado.state, DatasourceState::Stopped);
+        assert_eq!(
+            estado.last_error_code.as_deref(),
+            Some("adapter_nao_arrancou")
+        );
+        assert!(!estado.deve_arrancar());
+        // O conteudo era bom, por isso nao ha `ContentActivated` por drenar:
+        // nada foi activado.
+        assert!(sup.drenar_activados().is_empty());
     }
 
     #[test]
