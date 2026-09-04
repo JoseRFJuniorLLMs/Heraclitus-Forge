@@ -33,6 +33,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 
@@ -90,19 +91,22 @@ impl MateriaisTls {
     }
 
     fn construir(&self) -> Result<ServerConfig, AdapterError> {
-        let mut leitor = std::io::Cursor::new(&self.cadeia_pem);
-        let certificados: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut leitor)
-            .collect::<Result<_, _>>()
-            .map_err(|e| AdapterError::InvalidConfig(format!("cadeia PEM invalida: {e}")))?;
+        // O PEM é lido pelo `rustls-pki-types` e não pelo `rustls-pemfile`: o
+        // segundo está marcado como não mantido (RUSTSEC-2025-0134) e a função
+        // dele passou para aqui, que é o crate que o próprio rustls usa. Trocar
+        // é preferível a silenciar o aviso — um aviso silenciado continua
+        // silenciado quando deixar de ser só "não mantido".
+        let certificados: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(&self.cadeia_pem)
+                .collect::<Result<_, _>>()
+                .map_err(|e| AdapterError::InvalidConfig(format!("cadeia PEM invalida: {e}")))?;
         if certificados.is_empty() {
             return Err(AdapterError::InvalidConfig(
                 "a cadeia PEM nao contem certificados".into(),
             ));
         }
-        let mut leitor = std::io::Cursor::new(&self.chave_pem);
-        let chave: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut leitor)
-            .map_err(|e| AdapterError::InvalidConfig(format!("chave PEM invalida: {e}")))?
-            .ok_or_else(|| AdapterError::InvalidConfig("a chave PEM esta vazia".into()))?;
+        let chave = PrivateKeyDer::from_pem_slice(&self.chave_pem)
+            .map_err(|e| AdapterError::InvalidConfig(format!("chave PEM invalida: {e}")))?;
 
         // O provider é indicado explicitamente: com `default-features = false`
         // não há um instalado por omissão, e um `builder()` normal entraria em
@@ -115,10 +119,9 @@ impl MateriaisTls {
         let config = match &self.clientes {
             AutenticacaoDeCliente::Qualquer => base.with_no_client_auth(),
             AutenticacaoDeCliente::CaObrigatoria(pem) => {
-                let mut leitor = std::io::Cursor::new(pem);
                 let mut raizes = rustls::RootCertStore::empty();
                 let mut quantas = 0usize;
-                for cert in rustls_pemfile::certs(&mut leitor) {
+                for cert in CertificateDer::pem_slice_iter(pem) {
                     let cert = cert.map_err(|e| {
                         AdapterError::InvalidConfig(format!("CA de clientes invalida: {e}"))
                     })?;
@@ -542,8 +545,7 @@ mod tests {
     /// proprio certificado.
     fn cliente_config(p: &Pki, com_certificado: Option<(&str, &str)>) -> rustls::ClientConfig {
         let mut raizes = rustls::RootCertStore::empty();
-        let mut leitor = std::io::Cursor::new(p.ca_pem.as_bytes());
-        for cert in rustls_pemfile::certs(&mut leitor) {
+        for cert in CertificateDer::pem_slice_iter(p.ca_pem.as_bytes()) {
             raizes.add(cert.unwrap()).unwrap();
         }
         let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -554,11 +556,11 @@ mod tests {
         match com_certificado {
             None => base.with_no_client_auth(),
             Some((cadeia, chave)) => {
-                let mut lc = std::io::Cursor::new(cadeia.as_bytes());
                 let certs: Vec<CertificateDer<'static>> =
-                    rustls_pemfile::certs(&mut lc).map(|c| c.unwrap()).collect();
-                let mut lk = std::io::Cursor::new(chave.as_bytes());
-                let k = rustls_pemfile::private_key(&mut lk).unwrap().unwrap();
+                    CertificateDer::pem_slice_iter(cadeia.as_bytes())
+                        .map(|c| c.unwrap())
+                        .collect();
+                let k = PrivateKeyDer::from_pem_slice(chave.as_bytes()).unwrap();
                 base.with_client_auth_cert(certs, k).unwrap()
             }
         }

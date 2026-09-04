@@ -107,7 +107,6 @@ tempfile = "3"
 # Provider `ring` e nao o `aws-lc-rs` por omissao: o segundo exige cmake e nasm
 # para compilar em Windows; o ring compila em qualquer maquina de programador.
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
-rustls-pemfile = "2"
 
 # O ingestor corre como servico do Windows e a substituicao atomica duravel usa
 # a API nativa: estes sim sao especificos da plataforma.
