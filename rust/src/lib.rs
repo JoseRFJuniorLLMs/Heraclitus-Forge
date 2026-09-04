@@ -19,4 +19,5 @@ pub mod runner;
 pub mod source;
 pub mod syslog_adapter;
 pub mod telemetry;
+pub mod webhook_adapter;
 pub mod wire;
