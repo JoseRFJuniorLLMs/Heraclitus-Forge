@@ -6,6 +6,7 @@
 //! lendo os artefatos `.hcx` ja homologados.
 
 pub mod crc32c;
+pub mod datasource;
 pub mod db;
 pub mod error;
 pub mod fact;

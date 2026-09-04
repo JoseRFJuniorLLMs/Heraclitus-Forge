@@ -365,10 +365,9 @@ impl SourceAdapter for SyslogAdapter {
 
     /// Só aqui a fila encolhe (§5.4).
     fn checkpoint(&mut self, ack: SourceAck) -> Result<(), AdapterError> {
-        let ate: u64 = ack
-            .cursor
-            .parse()
-            .map_err(|_| AdapterError::InvalidAck(format!("cursor nao numerico: {}", ack.cursor)))?;
+        let ate: u64 = ack.cursor.parse().map_err(|_| {
+            AdapterError::InvalidAck(format!("cursor nao numerico: {}", ack.cursor))
+        })?;
         if ate < self.confirmadas {
             // Um cursor que recua é um erro do chamador, não uma instrução.
             // Aceitá-lo faria o adapter reentregar o que já foi persistido —
