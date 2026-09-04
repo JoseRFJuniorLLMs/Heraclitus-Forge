@@ -28,20 +28,19 @@
 //! isso os handshakes recusados são CONTADOS e passam o datasource a
 //! `Degraded`, com `handshake_recusado` no código de erro.
 
-use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 
-use crate::buffer_fonte::FilaLimitada;
 use crate::source::{
-    AdapterError, DatasourceIdentity, DatasourceState, Observation, ObservationBatch, SourceAck,
-    SourceAdapter, SourceCapabilities, SourceCounters, SourceHealthSample,
+    AdapterError, DatasourceIdentity, DatasourceState, ObservationBatch, SourceAck, SourceAdapter,
+    SourceCapabilities, SourceCounters, SourceHealthSample,
 };
+use crate::syslog_adapter::{preparar_sessao, sessao_de_linhas, Recepcao, MAX_SESSOES};
 
 /// Quem pode ligar-se.
 #[derive(Debug, Clone)]
@@ -155,9 +154,7 @@ impl MateriaisTls {
 }
 
 struct Contadores {
-    recebidas: AtomicU64,
     handshakes_recusados: AtomicU64,
-    ultimo_micros: AtomicU64,
 }
 
 /// Distingue "o TLS recusou este cliente" de "a rede caiu".
@@ -179,13 +176,19 @@ fn e_recusa_de_tls(erro: &std::io::Error) -> bool {
 }
 
 /// Recebe syslog sobre TLS.
+/// Recebe syslog sobre TLS.
 pub struct SyslogTlsAdapter {
     identity: DatasourceIdentity,
     endereco: SocketAddr,
     exige_certificado_de_cliente: bool,
-    fila: Arc<Mutex<FilaLimitada>>,
+    /// A mesma recepção do [`crate::syslog_adapter`]: fila com tecto,
+    /// sequência atribuída sob o lock, chave com o instante de arranque. O que
+    /// muda entre os dois adapters é quem pode falar, não o que se faz com o
+    /// que eles dizem.
+    recepcao: Arc<Recepcao>,
     contadores: Arc<Contadores>,
     confirmadas: u64,
+    cursor_pendente: Option<String>,
     parar: Arc<AtomicBool>,
     aceitador: Option<std::thread::JoinHandle<()>>,
 }
@@ -214,18 +217,16 @@ impl SyslogTlsAdapter {
         let endereco = ouvinte.local_addr()?;
         ouvinte.set_nonblocking(true)?;
 
-        let fila = Arc::new(Mutex::new(FilaLimitada::nova(limite_bytes)));
+        let recepcao = Arc::new(Recepcao::nova(limite_bytes));
         let contadores = Arc::new(Contadores {
-            recebidas: AtomicU64::new(0),
             handshakes_recusados: AtomicU64::new(0),
-            ultimo_micros: AtomicU64::new(0),
         });
         let parar = Arc::new(AtomicBool::new(false));
 
         let aceitador = Self::aceitar(
             ouvinte,
             config,
-            fila.clone(),
+            recepcao.clone(),
             contadores.clone(),
             parar.clone(),
         );
@@ -234,9 +235,10 @@ impl SyslogTlsAdapter {
             identity,
             endereco,
             exige_certificado_de_cliente,
-            fila,
+            recepcao,
             contadores,
             confirmadas: 0,
+            cursor_pendente: None,
             parar,
             aceitador: Some(aceitador),
         })
@@ -251,33 +253,37 @@ impl SyslogTlsAdapter {
         self.exige_certificado_de_cliente
     }
 
-    fn agora_micros() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0)
-    }
-
     fn aceitar(
         ouvinte: TcpListener,
         config: Arc<ServerConfig>,
-        fila: Arc<Mutex<FilaLimitada>>,
+        recepcao: Arc<Recepcao>,
         contadores: Arc<Contadores>,
         parar: Arc<AtomicBool>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut sessoes: Vec<std::thread::JoinHandle<()>> = Vec::new();
             while !parar.load(Ordering::Relaxed) {
+                // Sessões terminadas saem do vector antes de aceitar mais. Sem
+                // isto, um receptor de vida longa acumula `JoinHandle` para
+                // sempre, mesmo com poucas ligações ao mesmo tempo.
+                sessoes.retain(|s| !s.is_finished());
+
                 match ouvinte.accept() {
                     Ok((tcp, _)) => {
+                        if sessoes.len() >= MAX_SESSOES {
+                            recepcao.sessoes_recusadas.fetch_add(1, Ordering::Relaxed);
+                            drop(tcp);
+                            continue;
+                        }
+                        if preparar_sessao(&tcp).is_err() {
+                            recepcao.erros_de_socket.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         let config = config.clone();
-                        let fila = fila.clone();
+                        let recepcao = recepcao.clone();
                         let contadores = contadores.clone();
                         let parar_sessao = parar.clone();
                         sessoes.push(std::thread::spawn(move || {
-                            let _ = tcp.set_nonblocking(false);
-                            let _ =
-                                tcp.set_read_timeout(Some(std::time::Duration::from_millis(200)));
                             let conexao = match rustls::ServerConnection::new(config) {
                                 Ok(c) => c,
                                 Err(erro) => {
@@ -289,43 +295,19 @@ impl SyslogTlsAdapter {
                                 }
                             };
                             let fluxo = rustls::StreamOwned::new(conexao, tcp);
-                            let leitor = BufReader::new(fluxo);
-                            let mut linhas = 0u64;
-                            for linha in leitor.lines() {
-                                if parar_sessao.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                                let linha = match linha {
-                                    Ok(l) => l,
-                                    Err(erro) => {
-                                        // Só uma recusa DE TLS conta como
-                                        // handshake recusado. Um socket
-                                        // abortado pela rede é outra coisa, e
-                                        // contá-lo faria um emissor que fecha
-                                        // mal a ligação parecer um intruso.
-                                        if linhas == 0 && e_recusa_de_tls(&erro) {
-                                            contadores
-                                                .handshakes_recusados
-                                                .fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        break;
-                                    }
-                                };
-                                if linha.trim().is_empty() {
-                                    continue;
-                                }
-                                linhas += 1;
-                                let seq = contadores.recebidas.fetch_add(1, Ordering::SeqCst) + 1;
-                                contadores
-                                    .ultimo_micros
-                                    .store(Self::agora_micros(), Ordering::Relaxed);
-                                if let Ok(mut f) = fila.lock() {
-                                    f.empurrar(Observation {
-                                        payload: linha.into_bytes(),
-                                        source_sequence: Some(seq.to_string()),
-                                        source_event_id: None,
-                                        observed_at_micros: Some(Self::agora_micros()),
-                                    });
+                            // O enquadramento é o mesmo do syslog em claro: um
+                            // timeout é o silêncio normal de um emissor, não o
+                            // fim da ligação.
+                            let fim = sessao_de_linhas(fluxo, &recepcao, &parar_sessao);
+                            if let crate::enquadramento::FimDeSessao::Erro(kind) = fim {
+                                // Só uma recusa DE TLS conta como handshake
+                                // recusado. Um socket abortado pela rede é
+                                // outra coisa, e contá-lo faria um emissor que
+                                // fecha mal a ligação parecer um intruso.
+                                if e_recusa_de_tls(&std::io::Error::from(kind)) {
+                                    contadores
+                                        .handshakes_recusados
+                                        .fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                         }));
@@ -333,7 +315,10 @@ impl SyslogTlsAdapter {
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
-                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                    Err(_) => {
+                        recepcao.erros_de_socket.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
                 }
             }
             for s in sessoes {
@@ -371,11 +356,15 @@ impl SourceAdapter for SyslogTlsAdapter {
 
     /// Entrega sem consumir; só o `checkpoint` consome (§5.4).
     fn poll(&mut self, limit: usize) -> Result<ObservationBatch, AdapterError> {
-        let fila = self.fila.lock().map_err(|_| {
-            AdapterError::InvalidConfig("fila de syslog-tls envenenada por um panico".into())
-        })?;
-        let observations = fila.primeiros(limit);
+        let observations = {
+            let fila = self.recepcao.fila.lock().map_err(|_| {
+                self.recepcao.envenenada.store(true, Ordering::Relaxed);
+                AdapterError::InvalidConfig("fila de syslog-tls envenenada por um panico".into())
+            })?;
+            fila.primeiros(limit)
+        };
         if observations.is_empty() {
+            self.cursor_pendente = None;
             return Ok(ObservationBatch {
                 observations,
                 ack: None,
@@ -385,60 +374,74 @@ impl SourceAdapter for SyslogTlsAdapter {
             .last()
             .and_then(|o| o.source_sequence.clone())
             .unwrap_or_default();
+        self.cursor_pendente = Some(cursor.clone());
         Ok(ObservationBatch {
             observations,
             ack: Some(SourceAck { cursor }),
         })
     }
 
+    /// O cursor tem de ser EXACTAMENTE o do último lote entregue: aceitar
+    /// qualquer cursor plausível apagaria da fila observações que ninguém viu.
     fn checkpoint(&mut self, ack: SourceAck) -> Result<(), AdapterError> {
-        let ate: u64 = ack.cursor.parse().map_err(|_| {
-            AdapterError::InvalidAck(format!("cursor nao numerico: {}", ack.cursor))
-        })?;
-        if ate < self.confirmadas {
+        if self.cursor_pendente.as_deref() != Some(ack.cursor.as_str()) {
             return Err(AdapterError::InvalidAck(format!(
-                "cursor recuou de {} para {ate}",
-                self.confirmadas
+                "cursor {:?} nao corresponde ao ultimo lote entregue ({:?})",
+                ack.cursor, self.cursor_pendente
             )));
         }
-        let recebidas = self.contadores.recebidas.load(Ordering::SeqCst);
-        if ate > recebidas {
-            return Err(AdapterError::InvalidAck(format!(
-                "cursor {ate} ultrapassa as {recebidas} observacoes recebidas"
-            )));
-        }
-        let mut fila = self.fila.lock().map_err(|_| {
+        let mut fila = self.recepcao.fila.lock().map_err(|_| {
+            self.recepcao.envenenada.store(true, Ordering::Relaxed);
             AdapterError::InvalidConfig("fila de syslog-tls envenenada por um panico".into())
         })?;
+        let mut removidas = 0u64;
         while let Some(frente) = fila.frente() {
-            let seq: u64 = frente
-                .source_sequence
-                .as_deref()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            if seq > ate {
+            let e_o_ultimo = frente.source_sequence.as_deref() == Some(ack.cursor.as_str());
+            fila.remover_frente();
+            removidas += 1;
+            if e_o_ultimo {
                 break;
             }
-            fila.remover_frente();
         }
-        self.confirmadas = ate;
+        self.confirmadas = self.confirmadas.saturating_add(removidas);
+        self.cursor_pendente = None;
         Ok(())
     }
 
     fn health(&self) -> SourceHealthSample {
-        let descartadas = self.fila.lock().map(|f| f.descartadas()).unwrap_or(0);
-        let recebidas = self.contadores.recebidas.load(Ordering::SeqCst);
+        let descartadas = self
+            .recepcao
+            .fila
+            .lock()
+            .map(|f| f.descartadas())
+            .unwrap_or_else(|_| {
+                self.recepcao.envenenada.store(true, Ordering::Relaxed);
+                0
+            });
+        let recebidas = self.recepcao.recebidas.load(Ordering::SeqCst);
+        let gigantes = self.recepcao.linhas_gigantes.load(Ordering::Relaxed);
+        let recusadas_sessao = self.recepcao.sessoes_recusadas.load(Ordering::Relaxed);
+        let erros = self.recepcao.erros_de_socket.load(Ordering::Relaxed);
         let recusados = self.contadores.handshakes_recusados.load(Ordering::Relaxed);
-        let ultimo = self.contadores.ultimo_micros.load(Ordering::Relaxed);
+        let ultimo = self.recepcao.ultimo_micros.load(Ordering::Relaxed);
+        let envenenada = self.recepcao.envenenada.load(Ordering::Relaxed);
 
         // Um certificado expirado num emissor manifesta-se como silêncio, e
         // silêncio é indistinguível de "não houve nada a reportar". Por isso o
         // handshake recusado ganha ao descarte na escolha do código de erro:
         // é o que explica o silêncio.
-        let (state, codigo) = if recusados > 0 {
+        let (state, codigo) = if envenenada {
+            (DatasourceState::Degraded, Some("fila_envenenada"))
+        } else if recusados > 0 {
             (DatasourceState::Degraded, Some("handshake_recusado"))
+        } else if erros > 0 {
+            (DatasourceState::Degraded, Some("erro_de_socket"))
         } else if descartadas > 0 {
             (DatasourceState::Degraded, Some("buffer_cheio"))
+        } else if gigantes > 0 {
+            (DatasourceState::Degraded, Some("linha_acima_do_tecto"))
+        } else if recusadas_sessao > 0 {
+            (DatasourceState::Degraded, Some("sessoes_no_tecto"))
         } else if recebidas == 0 {
             (DatasourceState::Starting, None)
         } else {
@@ -448,12 +451,15 @@ impl SourceAdapter for SyslogTlsAdapter {
         SourceHealthSample {
             state,
             last_observed_at_micros: (ultimo > 0).then_some(ultimo),
-            last_checkpoint: (self.confirmadas > 0).then(|| self.confirmadas.to_string()),
+            last_checkpoint: self
+                .cursor_pendente
+                .is_none()
+                .then(|| self.confirmadas.to_string()),
             counters: SourceCounters {
                 observed: recebidas,
                 acknowledged: self.confirmadas,
-                backpressure_events: descartadas + recusados,
-                dropped: descartadas,
+                backpressure_events: descartadas + gigantes + recusadas_sessao + recusados,
+                dropped: descartadas + gigantes,
             },
             last_error_code: codigo.map(str::to_owned),
         }
@@ -710,7 +716,15 @@ mod tests {
             cliente_config(&p, None),
             "<34>forjado\n",
         );
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Esperar por uma RECUSA e nao por um relogio. Um `sleep` fixo passaria
+        // igualmente com o mTLS desligado — o teste dizia "nao entregou nada" e
+        // provava so "ainda nao entregou".
+        esperar_recusa(&a);
+        assert_eq!(
+            a.health().last_error_code.as_deref(),
+            Some("handshake_recusado"),
+            "a recusa tem de ser do TLS e nao de um atraso"
+        );
         assert_eq!(
             a.health().counters.observed,
             0,

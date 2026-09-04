@@ -10,6 +10,7 @@ pub mod buffer_fonte;
 pub mod crc32c;
 pub mod datasource;
 pub mod db;
+pub mod enquadramento;
 pub mod error;
 pub mod fact;
 pub mod hcx;

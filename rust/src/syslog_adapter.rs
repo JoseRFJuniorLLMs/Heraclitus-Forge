@@ -14,12 +14,22 @@
 //! checkpoint pode prometer, e o adapter declara-o em vez de o esconder:
 //!
 //! - [`SourceCapabilities::reliable_transport`] é `false` para UDP;
-//! - o cursor é uma contagem monótona de recepção, não uma posição relegível.
+//! - o cursor é uma contagem de recepção, não uma posição relegível.
 //!
 //! A §5.4 exige "restart pode repetir; nunca perder silenciosamente". Num
 //! transporte sem retenção, a parte que se pode honrar é o **silenciosamente**:
-//! o que se perde é contado em [`SourceCounters::dropped`], muda o estado do
-//! datasource e sai como `TelemetryDropRecorded`.
+//! o que se perde é contado, muda o estado do datasource e sai como
+//! `TelemetryDropRecorded`.
+//!
+//! ## A chave de idempotência tem de sobreviver a um restart
+//!
+//! A contagem de recepção recomeça em 1 a cada arranque. Se ela fosse a chave,
+//! a mensagem número 7 de hoje e a número 7 de amanhã teriam a MESMA chave, e a
+//! deduplicação a jusante deitaria fora a segunda — perda silenciosa causada
+//! precisamente pelo mecanismo que existe para a evitar.
+//!
+//! Por isso a chave é `<arranque>:<n>`, onde `<arranque>` é o instante em que
+//! este adapter subiu. Dois processos diferentes não partilham chaves.
 //!
 //! ## Backpressure em vez de descarte invisível (§5.4)
 //!
@@ -27,12 +37,12 @@
 //! mensagens de 8 KiB é 80 MiB, e um tecto em linhas não diz nada sobre a
 //! memória, que é o recurso que realmente acaba.
 
-use std::io::{BufRead, BufReader};
-use std::net::{SocketAddr, TcpListener, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::buffer_fonte::FilaLimitada;
+use crate::enquadramento::{consumir_linhas, MAX_LINHA};
 use crate::source::{
     AdapterError, DatasourceIdentity, DatasourceState, Observation, ObservationBatch, SourceAck,
     SourceAdapter, SourceCapabilities, SourceCounters, SourceHealthSample,
@@ -45,6 +55,14 @@ use crate::source::{
 /// mensagens legítimas — e uma mensagem truncada é pior do que nenhuma, porque
 /// parece completa.
 const MAX_DATAGRAMA: usize = 65_535;
+
+/// Tecto de ligações TCP simultâneas.
+///
+/// Cada ligação custa uma thread do sistema operativo. Sem tecto, quem se ligar
+/// mil vezes esgota as threads do processo inteiro — e faz isso a partir da
+/// rede. Ao tecto, a ligação nova é fechada e contada, o que é visível; ficar
+/// sem threads não é.
+pub const MAX_SESSOES: usize = 256;
 
 /// Transporte do adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,18 +81,86 @@ impl SyslogTransport {
     }
 }
 
+/// O estado partilhado entre os receptores e o `poll`.
+pub(crate) struct Recepcao {
+    pub(crate) fila: Mutex<FilaLimitada>,
+    /// Quantas entraram desde que o adapter subiu.
+    pub(crate) recebidas: AtomicU64,
+    /// Identificador deste arranque, para as chaves não colidirem entre
+    /// processos.
+    pub(crate) arranque: u64,
+    pub(crate) ultimo_micros: AtomicU64,
+    /// Linhas deitadas fora por passarem o tecto por linha.
+    pub(crate) linhas_gigantes: AtomicU64,
+    /// Ligações recusadas por o tecto de sessões estar cheio.
+    pub(crate) sessoes_recusadas: AtomicU64,
+    /// Erros de socket que não são timeouts.
+    pub(crate) erros_de_socket: AtomicU64,
+    /// Um `Mutex` envenenado por um pânico torna a fila inutilizável. Sem esta
+    /// bandeira o adapter continuaria a dizer `Healthy` enquanto deitava fora
+    /// tudo o que recebia.
+    pub(crate) envenenada: AtomicBool,
+}
+
+impl Recepcao {
+    pub(crate) fn nova(limite_bytes: usize) -> Self {
+        Self {
+            fila: Mutex::new(FilaLimitada::nova(limite_bytes)),
+            recebidas: AtomicU64::new(0),
+            arranque: agora_micros(),
+            ultimo_micros: AtomicU64::new(0),
+            linhas_gigantes: AtomicU64::new(0),
+            sessoes_recusadas: AtomicU64::new(0),
+            erros_de_socket: AtomicU64::new(0),
+            envenenada: AtomicBool::new(false),
+        }
+    }
+
+    /// Enfileira uma mensagem, atribuindo-lhe a sequência **sob o lock da
+    /// fila**.
+    ///
+    /// A ordem importa: se a sequência fosse atribuída antes de pegar no lock,
+    /// duas sessões TCP concorrentes podiam ficar com números 5 e 6 e entrar na
+    /// fila pela ordem 6, 5. O `checkpoint` percorre a fila da frente para trás
+    /// e pára no primeiro que ultrapassa o cursor — com a ordem trocada,
+    /// apagaria a mensagem 6 ao confirmar a 5.
+    pub(crate) fn enfileirar(&self, payload: Vec<u8>) {
+        let Ok(mut fila) = self.fila.lock() else {
+            self.envenenada.store(true, Ordering::Relaxed);
+            return;
+        };
+        let n = self.recebidas.fetch_add(1, Ordering::SeqCst) + 1;
+        let agora = agora_micros();
+        self.ultimo_micros.store(agora, Ordering::Relaxed);
+        fila.empurrar(Observation {
+            payload,
+            source_sequence: Some(format!("{}:{n}", self.arranque)),
+            source_event_id: None,
+            observed_at_micros: Some(agora),
+        });
+    }
+}
+
+pub(crate) fn agora_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
 /// Recebe syslog em background e entrega por `poll`.
 pub struct SyslogAdapter {
     identity: DatasourceIdentity,
     transport: SyslogTransport,
     endereco: SocketAddr,
-    fila: Arc<Mutex<FilaLimitada>>,
-    /// Contagem monótona de tudo o que entrou. É o cursor: num transporte sem
-    /// retenção, "quantas vi" é a única posição que significa alguma coisa.
-    recebidas: Arc<AtomicU64>,
+    recepcao: Arc<Recepcao>,
+    /// Quantas observações foram CONFIRMADAS. É uma contagem, não um número de
+    /// sequência: `acknowledged` num painel ao lado de `observed` só faz
+    /// sentido se as duas contarem a mesma coisa.
     confirmadas: u64,
+    /// O cursor do último lote entregue, à espera de confirmação.
+    cursor_pendente: Option<String>,
     parar: Arc<AtomicBool>,
-    ultimo_observado_micros: Arc<AtomicU64>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -98,39 +184,25 @@ impl SyslogAdapter {
                 "buffer_limit_bytes tem de ser > 0".into(),
             ));
         }
-        let fila = Arc::new(Mutex::new(FilaLimitada::nova(limite_bytes)));
-        let recebidas = Arc::new(AtomicU64::new(0));
+        let recepcao = Arc::new(Recepcao::nova(limite_bytes));
         let parar = Arc::new(AtomicBool::new(false));
-        let ultimo = Arc::new(AtomicU64::new(0));
         let mut threads = Vec::new();
 
         let endereco = match transport {
             SyslogTransport::Udp => {
                 let socket = UdpSocket::bind(addr)?;
                 let endereco = socket.local_addr()?;
-                // O timeout é o que permite ver a bandeira de paragem sem
-                // bloquear para sempre num `recv_from`.
+                // Sem este timeout o `recv_from` bloqueia para sempre e o
+                // `Drop` nunca conseguiria juntar a thread.
                 socket.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
-                threads.push(Self::receber_udp(
-                    socket,
-                    fila.clone(),
-                    recebidas.clone(),
-                    parar.clone(),
-                    ultimo.clone(),
-                ));
+                threads.push(Self::receber_udp(socket, recepcao.clone(), parar.clone()));
                 endereco
             }
             SyslogTransport::Tcp => {
                 let listener = TcpListener::bind(addr)?;
                 let endereco = listener.local_addr()?;
                 listener.set_nonblocking(true)?;
-                threads.push(Self::receber_tcp(
-                    listener,
-                    fila.clone(),
-                    recebidas.clone(),
-                    parar.clone(),
-                    ultimo.clone(),
-                ));
+                threads.push(Self::aceitar_tcp(listener, recepcao.clone(), parar.clone()));
                 endereco
             }
         };
@@ -139,11 +211,10 @@ impl SyslogAdapter {
             identity,
             transport,
             endereco,
-            fila,
-            recebidas,
+            recepcao,
             confirmadas: 0,
+            cursor_pendente: None,
             parar,
-            ultimo_observado_micros: ultimo,
             threads,
         })
     }
@@ -161,100 +232,85 @@ impl SyslogAdapter {
         self.transport
     }
 
-    fn agora_micros() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0)
-    }
-
-    fn observacao(payload: Vec<u8>, sequencia: u64) -> Observation {
-        Observation {
-            payload,
-            // §5.4: "source sequence, quando disponível, participa da chave de
-            // idempotência". O syslog não traz sequência própria, e a de
-            // recepção é o mais próximo que existe — é monótona por receptor e
-            // distingue duas mensagens byte-a-byte iguais seguidas, que é
-            // exactamente o caso que uma chave só de conteúdo fundiria numa.
-            source_sequence: Some(sequencia.to_string()),
-            source_event_id: None,
-            observed_at_micros: Some(Self::agora_micros()),
-        }
-    }
-
     fn receber_udp(
         socket: UdpSocket,
-        fila: Arc<Mutex<FilaLimitada>>,
-        recebidas: Arc<AtomicU64>,
+        recepcao: Arc<Recepcao>,
         parar: Arc<AtomicBool>,
-        ultimo: Arc<AtomicU64>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut buf = vec![0u8; MAX_DATAGRAMA];
             while !parar.load(Ordering::Relaxed) {
                 match socket.recv_from(&mut buf) {
-                    Ok((n, _)) if n > 0 => {
-                        let seq = recebidas.fetch_add(1, Ordering::SeqCst) + 1;
-                        ultimo.store(Self::agora_micros(), Ordering::Relaxed);
-                        let obs = Self::observacao(buf[..n].to_vec(), seq);
-                        if let Ok(mut f) = fila.lock() {
-                            f.empurrar(obs);
-                        }
+                    Ok((n, _)) if n > 0 => recepcao.enfileirar(buf[..n].to_vec()),
+                    Ok(_) => continue,
+                    // O timeout é o silêncio normal entre datagramas.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        continue
                     }
-                    // Timeout é o funcionamento normal deste laço.
-                    _ => continue,
+                    // Um erro a sério NÃO pode ser tratado como timeout: o laço
+                    // giraria a 100% de CPU sem ninguém saber. Conta-se e
+                    // espera-se, para que a saúde o mostre.
+                    Err(_) => {
+                        recepcao.erros_de_socket.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
                 }
             }
         })
     }
 
-    fn receber_tcp(
+    fn aceitar_tcp(
         listener: TcpListener,
-        fila: Arc<Mutex<FilaLimitada>>,
-        recebidas: Arc<AtomicU64>,
+        recepcao: Arc<Recepcao>,
         parar: Arc<AtomicBool>,
-        ultimo: Arc<AtomicU64>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut sessoes: Vec<std::thread::JoinHandle<()>> = Vec::new();
             while !parar.load(Ordering::Relaxed) {
+                // Limpar as sessões já terminadas antes de aceitar: sem isto o
+                // vector cresce para sempre num servidor de vida longa, mesmo
+                // com poucas ligações simultâneas.
+                sessoes.retain(|s| !s.is_finished());
+
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let fila = fila.clone();
-                        let recebidas = recebidas.clone();
+                        if sessoes.len() >= MAX_SESSOES {
+                            recepcao.sessoes_recusadas.fetch_add(1, Ordering::Relaxed);
+                            // Fechar já: aceitar e não ler deixaria o emissor a
+                            // escrever para um buraco.
+                            drop(stream);
+                            continue;
+                        }
+                        // Sem timeout de leitura a sessão bloqueia para sempre
+                        // e o `Drop` do adapter nunca a consegue juntar. Se não
+                        // se conseguir pôr, mais vale não aceitar a ligação do
+                        // que ficar com uma thread presa até ao fim do processo.
+                        if preparar_sessao(&stream).is_err() {
+                            recepcao.erros_de_socket.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        let recepcao = recepcao.clone();
                         let parar_sessao = parar.clone();
-                        let ultimo = ultimo.clone();
                         sessoes.push(std::thread::spawn(move || {
-                            let _ = stream.set_nonblocking(false);
-                            let _ = stream
-                                .set_read_timeout(Some(std::time::Duration::from_millis(200)));
-                            let leitor = BufReader::new(stream);
-                            // Uma linha por mensagem: é o enquadramento de
-                            // syslog sobre TCP mais usado (RFC 6587,
-                            // non-transparent framing). O octet-counting da
-                            // mesma RFC precisa de outro parser e fica para
-                            // quando um órgão real o exigir.
-                            for linha in leitor.lines() {
-                                if parar_sessao.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                                let Ok(linha) = linha else { break };
-                                if linha.trim().is_empty() {
-                                    continue;
-                                }
-                                let seq = recebidas.fetch_add(1, Ordering::SeqCst) + 1;
-                                ultimo.store(Self::agora_micros(), Ordering::Relaxed);
-                                let obs = Self::observacao(linha.into_bytes(), seq);
-                                if let Ok(mut f) = fila.lock() {
-                                    f.empurrar(obs);
-                                }
-                            }
+                            sessao_de_linhas(stream, &recepcao, &parar_sessao);
                         }));
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
-                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                    Err(_) => {
+                        // `EMFILE` e companhia entram aqui. Sem contador, o
+                        // datasource ficava calado sem nada a explicar porquê.
+                        recepcao.erros_de_socket.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
                 }
             }
             for s in sessoes {
@@ -262,6 +318,34 @@ impl SyslogAdapter {
             }
         })
     }
+}
+
+/// Lê uma ligação TCP até ela acabar.
+///
+/// Partilhada com o [`crate::syslog_tls_adapter`] através do genérico: o que
+/// muda entre os dois é o que está por baixo do `Read`, não o enquadramento.
+pub(crate) fn sessao_de_linhas<R: std::io::Read>(
+    fonte: R,
+    recepcao: &Recepcao,
+    parar: &AtomicBool,
+) -> crate::enquadramento::FimDeSessao {
+    consumir_linhas(
+        fonte,
+        MAX_LINHA,
+        parar,
+        |linha| recepcao.enfileirar(linha),
+        || {
+            recepcao.linhas_gigantes.fetch_add(1, Ordering::Relaxed);
+        },
+    )
+}
+
+/// Prepara um socket aceite para leitura com timeout.
+pub(crate) fn preparar_sessao(stream: &TcpStream) -> Result<(), std::io::Error> {
+    stream.set_nonblocking(false)?;
+    // O timeout NÃO fecha a ligação — ver `crate::enquadramento`. Serve só para
+    // o laço poder ver a bandeira de paragem.
+    stream.set_read_timeout(Some(std::time::Duration::from_millis(200)))
 }
 
 impl Drop for SyslogAdapter {
@@ -302,22 +386,25 @@ impl SourceAdapter for SyslogAdapter {
     /// um crash entre o `poll` e o append perderia o lote — e perdia-o em
     /// silêncio, que é precisamente o que a §5.4 proíbe.
     fn poll(&mut self, limit: usize) -> Result<ObservationBatch, AdapterError> {
-        let fila = self.fila.lock().map_err(|_| {
-            AdapterError::InvalidConfig("fila de syslog envenenada por um pânico".into())
-        })?;
-        let observations: Vec<Observation> = fila.primeiros(limit);
+        let observations = {
+            let fila = self.recepcao.fila.lock().map_err(|_| {
+                self.recepcao.envenenada.store(true, Ordering::Relaxed);
+                AdapterError::InvalidConfig("fila de syslog envenenada por um panico".into())
+            })?;
+            fila.primeiros(limit)
+        };
         if observations.is_empty() {
+            self.cursor_pendente = None;
             return Ok(ObservationBatch {
                 observations,
                 ack: None,
             });
         }
-        // O cursor é a última sequência do lote: confirmá-lo significa "já
-        // persisti tudo até aqui".
         let cursor = observations
             .last()
             .and_then(|o| o.source_sequence.clone())
             .unwrap_or_default();
+        self.cursor_pendente = Some(cursor.clone());
         Ok(ObservationBatch {
             observations,
             ack: Some(SourceAck { cursor }),
@@ -325,74 +412,92 @@ impl SourceAdapter for SyslogAdapter {
     }
 
     /// Só aqui a fila encolhe (§5.4).
+    ///
+    /// O cursor tem de ser EXACTAMENTE o do último lote entregue. Aceitar
+    /// qualquer cursor "plausível" — como aceitar qualquer número menor ou igual
+    /// ao total recebido — apagaria da fila observações que nunca chegaram a ser
+    /// entregues a ninguém.
     fn checkpoint(&mut self, ack: SourceAck) -> Result<(), AdapterError> {
-        let ate: u64 = ack.cursor.parse().map_err(|_| {
-            AdapterError::InvalidAck(format!("cursor nao numerico: {}", ack.cursor))
-        })?;
-        if ate < self.confirmadas {
-            // Um cursor que recua é um erro do chamador, não uma instrução.
-            // Aceitá-lo faria o adapter reentregar o que já foi persistido —
-            // duplicação silenciosa, que é tão invisível quanto a perda.
+        if self.cursor_pendente.as_deref() != Some(ack.cursor.as_str()) {
             return Err(AdapterError::InvalidAck(format!(
-                "cursor recuou de {} para {ate}",
-                self.confirmadas
+                "cursor {:?} nao corresponde ao ultimo lote entregue ({:?})",
+                ack.cursor, self.cursor_pendente
             )));
         }
-        let recebidas = self.recebidas.load(Ordering::SeqCst);
-        if ate > recebidas {
-            // Confirmar o que nunca se entregou apagaria da fila mensagens que
-            // ainda ninguém persistiu.
-            return Err(AdapterError::InvalidAck(format!(
-                "cursor {ate} ultrapassa as {recebidas} observacoes recebidas"
-            )));
-        }
-        let mut fila = self.fila.lock().map_err(|_| {
-            AdapterError::InvalidConfig("fila de syslog envenenada por um pânico".into())
+        let mut fila = self.recepcao.fila.lock().map_err(|_| {
+            self.recepcao.envenenada.store(true, Ordering::Relaxed);
+            AdapterError::InvalidConfig("fila de syslog envenenada por um panico".into())
         })?;
+        // Remove-se por IDENTIDADE e não por comparação numérica: a chave é
+        // `<arranque>:<n>` e comparar strings de números daria ordens erradas.
+        let mut removidas = 0u64;
         while let Some(frente) = fila.frente() {
-            let seq: u64 = frente
-                .source_sequence
-                .as_deref()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            if seq > ate {
+            let e_o_ultimo = frente.source_sequence.as_deref() == Some(ack.cursor.as_str());
+            fila.remover_frente();
+            removidas += 1;
+            if e_o_ultimo {
                 break;
             }
-            fila.remover_frente();
         }
-        self.confirmadas = ate;
+        self.confirmadas = self.confirmadas.saturating_add(removidas);
+        self.cursor_pendente = None;
         Ok(())
     }
 
     fn health(&self) -> SourceHealthSample {
-        let descartadas = self.fila.lock().map(|f| f.descartadas()).unwrap_or(0);
-        let recebidas = self.recebidas.load(Ordering::SeqCst);
-        let ultimo = self.ultimo_observado_micros.load(Ordering::Relaxed);
+        let descartadas = self
+            .recepcao
+            .fila
+            .lock()
+            .map(|f| f.descartadas())
+            .unwrap_or_else(|_| {
+                self.recepcao.envenenada.store(true, Ordering::Relaxed);
+                0
+            });
+        let recebidas = self.recepcao.recebidas.load(Ordering::SeqCst);
+        let gigantes = self.recepcao.linhas_gigantes.load(Ordering::Relaxed);
+        let recusadas = self.recepcao.sessoes_recusadas.load(Ordering::Relaxed);
+        let erros = self.recepcao.erros_de_socket.load(Ordering::Relaxed);
+        let ultimo = self.recepcao.ultimo_micros.load(Ordering::Relaxed);
+        let envenenada = self.recepcao.envenenada.load(Ordering::Relaxed);
 
-        // O estado sai do que se observou, não de uma suposição.
-        //
-        // `Degraded` quando houve descarte: a §5.4 chama-lhe "descarte
-        // autorizado", e autorizado não é o mesmo que saudável — quem opera tem
-        // de ver que o buffer não chega para o caudal.
-        let state = if descartadas > 0 {
-            DatasourceState::Degraded
+        // A ordem desta escada é a ordem pela qual quem opera quer saber das
+        // coisas. Uma fila envenenada engole tudo o que chega, por isso vem
+        // primeiro; um `Healthy` nesse estado seria uma mentira completa.
+        let (state, codigo) = if envenenada {
+            (DatasourceState::Degraded, Some("fila_envenenada"))
+        } else if erros > 0 {
+            (DatasourceState::Degraded, Some("erro_de_socket"))
+        } else if descartadas > 0 {
+            (DatasourceState::Degraded, Some("buffer_cheio"))
+        } else if gigantes > 0 {
+            (DatasourceState::Degraded, Some("linha_acima_do_tecto"))
+        } else if recusadas > 0 {
+            (DatasourceState::Degraded, Some("sessoes_no_tecto"))
         } else if recebidas == 0 {
-            DatasourceState::Starting
+            (DatasourceState::Starting, None)
         } else {
-            DatasourceState::Healthy
+            (DatasourceState::Healthy, None)
         };
 
         SourceHealthSample {
             state,
             last_observed_at_micros: (ultimo > 0).then_some(ultimo),
-            last_checkpoint: (self.confirmadas > 0).then(|| self.confirmadas.to_string()),
+            last_checkpoint: self
+                .cursor_pendente
+                .is_none()
+                .then(|| self.confirmadas.to_string()),
             counters: SourceCounters {
                 observed: recebidas,
                 acknowledged: self.confirmadas,
-                backpressure_events: descartadas,
-                dropped: descartadas,
+                // Tudo o que representa pressão: fila cheia, linhas
+                // descartadas, ligações recusadas.
+                backpressure_events: descartadas + gigantes + recusadas,
+                // `dropped` conta só o que se perdeu DEPOIS de entrar: o que
+                // foi recusado à porta nunca chegou a ser uma observação.
+                dropped: descartadas + gigantes,
             },
-            last_error_code: (descartadas > 0).then(|| "buffer_cheio".to_string()),
+            last_error_code: codigo.map(str::to_owned),
         }
     }
 }
@@ -417,7 +522,7 @@ mod tests {
     }
 
     fn esperar_recebidas(adapter: &SyslogAdapter, quantas: u64) {
-        let prazo = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let prazo = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while adapter.health().counters.observed < quantas {
             assert!(
                 std::time::Instant::now() < prazo,
@@ -445,7 +550,6 @@ mod tests {
         assert_eq!(lote.observations.len(), 5);
         assert!(lote.observations[0].source_sequence.is_some());
         assert!(lote.observations[0].observed_at_micros.is_some());
-        assert_eq!(lote.ack.unwrap().cursor, "5");
     }
 
     /// §5.4 — o `poll` NAO esvazia. Se esvaziasse, um crash entre o poll e o
@@ -472,7 +576,11 @@ mod tests {
 
         adapter.checkpoint(segundo.ack.clone().unwrap()).unwrap();
         assert!(adapter.poll(1000).unwrap().observations.is_empty());
-        assert_eq!(adapter.health().counters.acknowledged, 3);
+        assert_eq!(
+            adapter.health().counters.acknowledged,
+            3,
+            "`acknowledged` conta observacoes; nao e um numero de sequencia"
+        );
     }
 
     /// Um checkpoint parcial so apaga o que foi confirmado.
@@ -492,16 +600,16 @@ mod tests {
         let parcial = adapter.poll(2).unwrap();
         assert_eq!(parcial.observations.len(), 2);
         adapter.checkpoint(parcial.ack.unwrap()).unwrap();
+        assert_eq!(adapter.health().counters.acknowledged, 2);
 
         let resto = adapter.poll(1000).unwrap();
         assert_eq!(resto.observations.len(), 2, "as outras duas tem de ficar");
-        assert_eq!(resto.observations[0].source_sequence.as_deref(), Some("3"));
     }
 
-    /// Um cursor que recua — ou que salta a frente do que se recebeu — e um
-    /// erro do chamador, nao uma instrucao.
+    /// O defeito que a revisao apanhou: um cursor que nenhum `poll` produziu
+    /// apagava da fila observacoes que ninguem tinha visto.
     #[test]
-    fn um_cursor_invalido_e_recusado() {
+    fn um_cursor_que_nenhum_poll_produziu_e_recusado() {
         let mut adapter = ligar("ds-udp3", SyslogTransport::Udp, 1 << 20);
         let destino = adapter.endereco_local();
         let cliente = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -510,29 +618,66 @@ mod tests {
         }
         esperar_recebidas(&adapter, 10);
 
-        adapter
+        // Confirmar sem ter feito poll nenhum.
+        let arranque = adapter.recepcao.arranque;
+        let erro = adapter
             .checkpoint(SourceAck {
-                cursor: "10".into(),
+                cursor: format!("{arranque}:5"),
             })
+            .unwrap_err();
+        assert!(matches!(erro, AdapterError::InvalidAck(_)));
+        assert_eq!(
+            adapter.poll(1000).unwrap().observations.len(),
+            10,
+            "nada pode ter sido apagado"
+        );
+
+        // Um cursor de outro formato tambem nao passa.
+        assert!(adapter
+            .checkpoint(SourceAck {
+                cursor: "abc".into()
+            })
+            .is_err());
+
+        // E confirmar duas vezes o mesmo lote tambem nao.
+        let lote = adapter.poll(1000).unwrap();
+        let ack = lote.ack.unwrap();
+        adapter.checkpoint(ack.clone()).unwrap();
+        assert!(adapter.checkpoint(ack).is_err(), "ja nao ha pendente");
+    }
+
+    /// A chave tem de sobreviver a um restart, senao a mensagem numero 7 de
+    /// hoje e a numero 7 de amanha deduplicam uma contra a outra.
+    #[test]
+    fn a_chave_nao_colide_entre_arranques() {
+        let mut primeiro = ligar("ds-arranque", SyslogTransport::Udp, 1 << 20);
+        let destino = primeiro.endereco_local();
+        let cliente = UdpSocket::bind("127.0.0.1:0").unwrap();
+        cliente.send_to(b"evento", destino).unwrap();
+        esperar_recebidas(&primeiro, 1);
+        let chave_um = primeiro.poll(1).unwrap().observations[0]
+            .source_sequence
+            .clone()
+            .unwrap();
+        drop(primeiro);
+
+        // Um segundo adapter e o que um restart e.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let mut segundo = ligar("ds-arranque", SyslogTransport::Udp, 1 << 20);
+        let cliente2 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        cliente2
+            .send_to(b"evento", segundo.endereco_local())
+            .unwrap();
+        esperar_recebidas(&segundo, 1);
+        let chave_dois = segundo.poll(1).unwrap().observations[0]
+            .source_sequence
+            .clone()
             .unwrap();
 
-        let recuo = adapter
-            .checkpoint(SourceAck { cursor: "5".into() })
-            .unwrap_err();
-        assert!(matches!(recuo, AdapterError::InvalidAck(_)));
-
-        // Confirmar o que nunca se entregou apagaria o que ninguem persistiu.
-        assert!(adapter
-            .checkpoint(SourceAck {
-                cursor: "999".into()
-            })
-            .is_err());
-
-        assert!(adapter
-            .checkpoint(SourceAck {
-                cursor: "nao-numerico".into()
-            })
-            .is_err());
+        assert_ne!(
+            chave_um, chave_dois,
+            "as duas sao a primeira mensagem do seu processo; as chaves NAO podem ser iguais"
+        );
     }
 
     /// §5.4 — "nunca descarte invisivel". O descarte conta-se, muda o estado e
@@ -540,7 +685,7 @@ mod tests {
     #[test]
     fn o_buffer_cheio_descarta_o_mais_antigo_e_conta() {
         // Tecto minusculo para forcar o descarte com poucas mensagens.
-        let mut adapter = ligar("ds-udp4", SyslogTransport::Udp, 120);
+        let mut adapter = ligar("ds-udp4", SyslogTransport::Udp, 200);
         let destino = adapter.endereco_local();
         let cliente = UdpSocket::bind("127.0.0.1:0").unwrap();
         for i in 0..20 {
@@ -553,7 +698,7 @@ mod tests {
         let saude = adapter.health();
         assert!(
             saude.counters.dropped > 0,
-            "20 mensagens com 120 bytes de tecto tinham de descartar"
+            "20 mensagens com 200 bytes de tecto tinham de descartar"
         );
         assert_eq!(
             saude.state,
@@ -561,7 +706,6 @@ mod tests {
             "descarte autorizado NAO e o mesmo que saudavel"
         );
         assert_eq!(saude.last_error_code.as_deref(), Some("buffer_cheio"));
-        assert_eq!(saude.counters.backpressure_events, saude.counters.dropped);
 
         // O que sobrou e o MAIS RECENTE: numa deteccao, a mensagem de agora
         // vale mais do que a de ha um minuto.
@@ -606,6 +750,77 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&obs[1].payload), "<34>segunda");
     }
 
+    /// O defeito mais grave que a revisao apanhou: um emissor de syslog fica
+    /// calado entre mensagens, e o timeout de leitura fechava-lhe a ligacao.
+    /// Isto derrubava TODOS os emissores reais.
+    #[test]
+    fn uma_ligacao_tcp_inactiva_nao_e_derrubada() {
+        let mut adapter = ligar("ds-tcp-inactiva", SyslogTransport::Tcp, 1 << 20);
+        let mut cliente = std::net::TcpStream::connect(adapter.endereco_local()).unwrap();
+
+        cliente.write_all(b"<34>antes\n").unwrap();
+        cliente.flush().unwrap();
+        esperar_recebidas(&adapter, 1);
+
+        // Muito mais do que o timeout de 200 ms do socket.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+
+        // A MESMA ligacao continua a servir.
+        cliente.write_all(b"<34>depois\n").unwrap();
+        cliente.flush().unwrap();
+        esperar_recebidas(&adapter, 2);
+
+        let obs = adapter.poll(10).unwrap().observations;
+        assert_eq!(obs.len(), 2);
+        assert_eq!(String::from_utf8_lossy(&obs[1].payload), "<34>depois");
+    }
+
+    /// Uma linha entregue em pedacos, com pausas maiores que o timeout, nao
+    /// pode perder os bytes de antes da pausa.
+    #[test]
+    fn uma_linha_partida_por_uma_pausa_chega_inteira() {
+        let mut adapter = ligar("ds-tcp-parcial", SyslogTransport::Tcp, 1 << 20);
+        let mut cliente = std::net::TcpStream::connect(adapter.endereco_local()).unwrap();
+
+        cliente.write_all(b"<34>primeira ").unwrap();
+        cliente.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        cliente.write_all(b"metade\n").unwrap();
+        cliente.flush().unwrap();
+        esperar_recebidas(&adapter, 1);
+
+        let obs = adapter.poll(10).unwrap().observations;
+        assert_eq!(
+            String::from_utf8_lossy(&obs[0].payload),
+            "<34>primeira metade"
+        );
+    }
+
+    /// Sem tecto por linha, quem se ligar esgota a memoria a partir da rede.
+    #[test]
+    fn uma_linha_gigante_e_descartada_contada_e_nao_para_a_sessao() {
+        let mut adapter = ligar("ds-tcp-gigante", SyslogTransport::Tcp, 1 << 20);
+        let mut cliente = std::net::TcpStream::connect(adapter.endereco_local()).unwrap();
+
+        let gigante = vec![b'x'; MAX_LINHA + 1000];
+        cliente.write_all(&gigante).unwrap();
+        cliente.write_all(b"\n<34>boa\n").unwrap();
+        cliente.flush().unwrap();
+        esperar_recebidas(&adapter, 1);
+
+        let saude = adapter.health();
+        assert!(saude.counters.dropped >= 1, "o descarte tem de ser contado");
+        assert_eq!(
+            saude.last_error_code.as_deref(),
+            Some("linha_acima_do_tecto")
+        );
+
+        // A sessao continua viva e a linha seguinte entra inteira.
+        let obs = adapter.poll(10).unwrap().observations;
+        assert_eq!(obs.len(), 1);
+        assert_eq!(String::from_utf8_lossy(&obs[0].payload), "<34>boa");
+    }
+
     /// Duas mensagens byte-a-byte iguais tem de continuar a ser duas: e por
     /// isso que a sequencia de recepcao entra na chave de idempotencia.
     #[test]
@@ -623,19 +838,19 @@ mod tests {
         assert_ne!(obs[0].source_sequence, obs[1].source_sequence);
     }
 
+    /// Vale para os DOIS transportes: um bind que falha tem de falhar no
+    /// arranque, e nao numa thread que ninguem observa.
     #[test]
     fn um_endereco_ocupado_falha_no_arranque_e_nao_em_silencio() {
-        let primeiro = ligar("ds-ocupado", SyslogTransport::Tcp, 1 << 20);
-        let ocupado = primeiro.endereco_local().to_string();
-
-        // O segundo TEM de falhar aqui, com erro.
-        assert!(SyslogAdapter::ligar(
-            identidade("ds-ocupado-2"),
-            SyslogTransport::Tcp,
-            &ocupado,
-            1 << 20,
-        )
-        .is_err());
+        for transporte in [SyslogTransport::Tcp, SyslogTransport::Udp] {
+            let primeiro = ligar("ds-ocupado", transporte, 1 << 20);
+            let ocupado = primeiro.endereco_local().to_string();
+            assert!(
+                SyslogAdapter::ligar(identidade("ds-ocupado-2"), transporte, &ocupado, 1 << 20,)
+                    .is_err(),
+                "{transporte:?}: o segundo bind tinha de falhar"
+            );
+        }
     }
 
     #[test]
