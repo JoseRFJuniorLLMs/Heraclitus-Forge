@@ -553,8 +553,51 @@ impl DatasourceSpec {
 /// primeiro e decidir depois faria um artefacto rejeitado abrir na mesma um
 /// porto de escuta, ou começar a seguir um ficheiro — e um datasource em
 /// quarentena que está a ouvir na rede é uma contradição em termos.
+/// O que a spec diz sobre o ritmo esperado de um datasource (§5.3).
+struct Cadencia {
+    expected_cadence_secs: Option<u64>,
+    max_lateness_secs: u64,
+}
+
+/// Traduz "há quanto tempo não chega nada" nos estados `Delayed` e `Silent`.
+///
+/// Sem isto, dois dos oito estados da §5.3 eram inalcançáveis: nenhum adapter
+/// os pode produzir sozinho, porque nenhum adapter sabe qual é o ritmo esperado
+/// da SUA fonte — isso está na spec, não no transporte.
+///
+/// E é a diferença que interessa numa plataforma de telemetria: uma fonte que
+/// emudeceu parece exactamente igual a uma fonte sem nada a reportar. É por
+/// isso que os campos `expected_cadence_secs` e `max_lateness_secs` existem na
+/// §5.3, e enquanto ninguém os lesse eram decoração.
+///
+/// Só se aplica a quem estaria `Healthy`: um `Degraded` ou um `Drifted` dizem
+/// algo mais específico, e trocá-los por `Delayed` perderia a razão concreta.
+fn aplicar_silencio(estado: &mut DatasourceStatus, cadencia: &Cadencia, agora_micros: u64) {
+    if estado.state != DatasourceState::Healthy {
+        return;
+    }
+    let Some(ultimo) = estado.last_observed_at else {
+        return;
+    };
+    let decorridos_secs = agora_micros.saturating_sub(ultimo.max(0) as u64) / 1_000_000;
+
+    if decorridos_secs > cadencia.max_lateness_secs {
+        estado.state = DatasourceState::Silent;
+        estado.last_error_code = Some("sem_observacoes".into());
+        return;
+    }
+    if let Some(esperada) = cadencia.expected_cadence_secs {
+        if decorridos_secs > esperada {
+            estado.state = DatasourceState::Delayed;
+            estado.last_error_code = Some("atrasado".into());
+        }
+    }
+}
+
 pub struct FabricSupervisor {
     interno: SourceSupervisor,
+    /// O ritmo esperado de cada datasource, guardado no registo.
+    cadencias: BTreeMap<String, Cadencia>,
     /// Estado observado (§5.3) de TODOS os datasources, incluindo os que não
     /// arrancaram. Um datasource em quarentena não tem adapter, e sem isto
     /// desaparecia dos painéis — que é a pior forma de esconder uma rejeição.
@@ -573,6 +616,7 @@ impl FabricSupervisor {
     pub fn novo() -> Self {
         Self {
             interno: SourceSupervisor::default(),
+            cadencias: BTreeMap::new(),
             estados: BTreeMap::new(),
             activados: Vec::new(),
         }
@@ -619,6 +663,13 @@ impl FabricSupervisor {
                                 motivo: erro.to_string(),
                             };
                         }
+                        self.cadencias.insert(
+                            id.clone(),
+                            Cadencia {
+                                expected_cadence_secs: spec.expected_cadence_secs,
+                                max_lateness_secs: spec.max_lateness_secs,
+                            },
+                        );
                         self.estados.insert(id, status.clone());
                         self.activados.push(evento.clone());
                     }
@@ -645,14 +696,23 @@ impl FabricSupervisor {
     /// Os datasources sem adapter — em quarentena ou parados — não são tocados:
     /// não há saúde a ler, e sobrescrevê-los com um estado por omissão
     /// apagaria a razão pela qual não arrancaram.
-    pub fn sincronizar_saude(&mut self) {
+    ///
+    /// `agora_micros` entra por argumento e não é lido do relógio aqui: um
+    /// silêncio que só se manifesta ao fim de horas seria impossível de testar
+    /// de outra forma, e um teste que espera horas não é um teste.
+    pub fn sincronizar_saude(&mut self, agora_micros: u64) {
         for (identidade, saude) in self.interno.health() {
-            if let Some(estado) = self.estados.get_mut(&identidade.datasource_id) {
-                estado.state = saude.state;
-                estado.last_observed_at = saude.last_observed_at_micros.map(|m| m as i64);
-                estado.last_checkpoint = saude.last_checkpoint;
-                estado.counters = saude.counters;
-                estado.last_error_code = saude.last_error_code;
+            let Some(estado) = self.estados.get_mut(&identidade.datasource_id) else {
+                continue;
+            };
+            estado.state = saude.state;
+            estado.last_observed_at = saude.last_observed_at_micros.map(|m| m as i64);
+            estado.last_checkpoint = saude.last_checkpoint;
+            estado.counters = saude.counters;
+            estado.last_error_code = saude.last_error_code;
+
+            if let Some(cadencia) = self.cadencias.get(&identidade.datasource_id) {
+                aplicar_silencio(estado, cadencia, agora_micros);
             }
         }
     }
@@ -1169,7 +1229,7 @@ mod tests {
         });
         assert_eq!(sup.estado("ds-pg-1").unwrap().counters.observed, 0);
 
-        sup.sincronizar_saude();
+        sup.sincronizar_saude(0);
         let estado = sup.estado("ds-pg-1").unwrap();
         assert_eq!(estado.state, DatasourceState::Healthy);
         assert_eq!(estado.counters.observed, 42);
@@ -1195,7 +1255,7 @@ mod tests {
             }))
         });
 
-        sup.sincronizar_saude();
+        sup.sincronizar_saude(0);
         let rejeitado = sup.estado("ds-rejeitado").unwrap();
         assert_eq!(rejeitado.state, DatasourceState::Quarantined);
         assert_eq!(
@@ -1204,6 +1264,75 @@ mod tests {
             "a razao da rejeicao tem de sobreviver ao sync"
         );
         assert_eq!(sup.estado("ds-pg-1").unwrap().counters.observed, 9);
+    }
+
+    /// Dois dos oito estados da §5.3 eram inalcancaveis: nenhum adapter os pode
+    /// produzir sozinho, porque nenhum adapter sabe qual e o ritmo esperado da
+    /// SUA fonte — isso esta na spec.
+    ///
+    /// E e a distincao que interessa numa plataforma de telemetria: uma fonte
+    /// que emudeceu parece exactamente igual a uma fonte sem nada a reportar.
+    #[test]
+    fn uma_fonte_que_emudece_deixa_de_parecer_saudavel() {
+        let mut spec = spec_valida(&digest_real());
+        spec.expected_cadence_secs = Some(60);
+        spec.max_lateness_secs = 300;
+
+        let mut sup = FabricSupervisor::novo();
+        sup.admitir_e_registar(&spec, &artefacto(), 1, || {
+            Ok(Box::new(AdapterFalso {
+                identity: spec.identidade("s"),
+                estado: DatasourceState::Healthy,
+                observadas: 5,
+            }))
+        });
+
+        // O adapter falso diz que a ultima observacao foi aos 1234 micros.
+        const ULTIMA: u64 = 1234;
+
+        // Dentro da cadencia: saudavel.
+        sup.sincronizar_saude(ULTIMA + 30 * 1_000_000);
+        assert_eq!(
+            sup.estado("ds-pg-1").unwrap().state,
+            DatasourceState::Healthy
+        );
+
+        // Passada a cadencia esperada: atrasado.
+        sup.sincronizar_saude(ULTIMA + 90 * 1_000_000);
+        let atrasado = sup.estado("ds-pg-1").unwrap();
+        assert_eq!(atrasado.state, DatasourceState::Delayed);
+        assert_eq!(atrasado.last_error_code.as_deref(), Some("atrasado"));
+
+        // Passada a tolerancia maxima: calado.
+        sup.sincronizar_saude(ULTIMA + 400 * 1_000_000);
+        let calado = sup.estado("ds-pg-1").unwrap();
+        assert_eq!(calado.state, DatasourceState::Silent);
+        assert_eq!(calado.last_error_code.as_deref(), Some("sem_observacoes"));
+    }
+
+    /// O silencio NAO pode tapar um problema mais especifico: um `Degraded` diz
+    /// porque, e troca-lo por `Delayed` perderia a razao.
+    #[test]
+    fn o_silencio_nao_tapa_um_estado_mais_especifico() {
+        let mut spec = spec_valida(&digest_real());
+        spec.expected_cadence_secs = Some(1);
+        spec.max_lateness_secs = 2;
+
+        let mut sup = FabricSupervisor::novo();
+        sup.admitir_e_registar(&spec, &artefacto(), 1, || {
+            Ok(Box::new(AdapterFalso {
+                identity: spec.identidade("s"),
+                estado: DatasourceState::Degraded,
+                observadas: 5,
+            }))
+        });
+
+        sup.sincronizar_saude(1234 + 999 * 1_000_000);
+        assert_eq!(
+            sup.estado("ds-pg-1").unwrap().state,
+            DatasourceState::Degraded,
+            "o `Degraded` do adapter e mais especifico e fica"
+        );
     }
 
     /// Conteudo bom e adapter que nao arranca (porto ocupado, ficheiro que nao

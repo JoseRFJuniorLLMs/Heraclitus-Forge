@@ -91,6 +91,12 @@ struct Partilhado {
     fila: Mutex<FilaLimitada>,
     recebidas: AtomicU64,
     ultimo_micros: AtomicU64,
+    /// Pedidos recusados por credencial invalida.
+    ///
+    /// Alguem a tentar adivinhar o token nao afecta a telemetria que ja chega,
+    /// mas e um evento de seguranca — e um webhook que recusa em silencio nao
+    /// distingue "ninguem tentou" de "estao a tentar ha uma hora".
+    autenticacoes_falhadas: AtomicU64,
     auth: WebhookAuth,
 }
 
@@ -125,6 +131,9 @@ async fn receber(
     corpo: Bytes,
 ) -> (StatusCode, &'static str) {
     if !partilhado.autorizado(&headers) {
+        partilhado
+            .autenticacoes_falhadas
+            .fetch_add(1, Ordering::Relaxed);
         return (StatusCode::UNAUTHORIZED, "credencial invalida");
     }
     if corpo.is_empty() {
@@ -225,6 +234,7 @@ impl HttpWebhookAdapter {
             fila: Mutex::new(FilaLimitada::nova(limite_bytes)),
             recebidas: AtomicU64::new(0),
             ultimo_micros: AtomicU64::new(0),
+            autenticacoes_falhadas: AtomicU64::new(0),
             auth,
         });
 
@@ -251,6 +261,11 @@ impl HttpWebhookAdapter {
                 };
                 let app = Router::new()
                     .route("/ingest", post(receber))
+                    // O tecto de corpo tem de ser o DOCUMENTADO. Por omissao o
+                    // axum corta a 2 MiB, e o `MAX_CORPO_BYTES` de 8 MiB era
+                    // inalcancavel: o codigo dizia uma coisa e o servidor fazia
+                    // outra, e o 413 do handler nunca chegava a disparar.
+                    .layer(axum::extract::DefaultBodyLimit::max(MAX_CORPO_BYTES))
                     .with_state(estado);
                 if let Err(erro) = axum::serve(ouvinte, app)
                     .with_graceful_shutdown(async {
@@ -291,7 +306,20 @@ impl Drop for HttpWebhookAdapter {
             let _ = desligar.send(());
         }
         if let Some(t) = self.servidor.take() {
-            let _ = t.join();
+            // O `with_graceful_shutdown` espera pelas ligacoes em voo, e um
+            // cliente que abra uma ligacao e nao a feche prende o `join` para
+            // sempre — largar um adapter passava a bloquear o processo. Espera-
+            // se um prazo curto e desiste-se: a thread e detached e morre com o
+            // processo, o que e preferivel a nunca sair.
+            let prazo = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !t.is_finished() && std::time::Instant::now() < prazo {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            } else {
+                tracing::warn!("webhook: o servidor nao encerrou em 5s; a largar a thread");
+            }
         }
     }
 }
@@ -377,12 +405,22 @@ impl SourceAdapter for HttpWebhookAdapter {
         // `Degraded` com recusas: o emissor está a levar 429 e alguém tem de
         // saber. Não é `Quarantined` — o datasource está bom, o caudal é que
         // não cabe.
-        let state = if recusadas > 0 {
-            DatasourceState::Degraded
+        let falhas_de_auth = self
+            .partilhado
+            .autenticacoes_falhadas
+            .load(Ordering::Relaxed);
+
+        let (state, codigo) = if recusadas > 0 {
+            (DatasourceState::Degraded, Some("buffer_cheio_429"))
+        } else if falhas_de_auth > 0 {
+            // `Drifted` e nao `Degraded`: a telemetria legitima continua a
+            // entrar. O que mudou foi haver quem tente entrar sem credencial, e
+            // isso tem de aparecer em vez de morrer num 401 silencioso.
+            (DatasourceState::Drifted, Some("autenticacao_recusada"))
         } else if recebidas == 0 {
-            DatasourceState::Starting
+            (DatasourceState::Starting, None)
         } else {
-            DatasourceState::Healthy
+            (DatasourceState::Healthy, None)
         };
 
         SourceHealthSample {
@@ -396,7 +434,7 @@ impl SourceAdapter for HttpWebhookAdapter {
                 // Zero por construção: este adapter recusa, não descarta.
                 dropped: 0,
             },
-            last_error_code: (recusadas > 0).then(|| "buffer_cheio_429".to_string()),
+            last_error_code: codigo.map(str::to_owned),
         }
     }
 }
@@ -500,6 +538,46 @@ mod tests {
             "um prefixo correcto nao vale"
         );
         assert_eq!(adapter.health().counters.observed, 0);
+    }
+
+    /// Quem tenta adivinhar o token tem de aparecer. Um 401 silencioso nao
+    /// distingue "ninguem tentou" de "estao a tentar ha uma hora".
+    #[test]
+    fn as_tentativas_de_autenticacao_falhadas_sao_visiveis() {
+        let adapter = ligar("ds-wh-brute", 1 << 20, WebhookAuth::Bearer(TOKEN.into()));
+        let destino = adapter.endereco_local();
+        assert_eq!(adapter.health().last_error_code, None);
+
+        for _ in 0..5 {
+            assert_eq!(postar(destino, "x", Some("errado"), &[]), 401);
+        }
+        let saude = adapter.health();
+        assert_eq!(
+            saude.state,
+            DatasourceState::Drifted,
+            "a telemetria legitima nao parou, mas alguem esta a tentar entrar"
+        );
+        assert_eq!(
+            saude.last_error_code.as_deref(),
+            Some("autenticacao_recusada")
+        );
+        assert_eq!(saude.counters.observed, 0, "nenhuma entrou");
+    }
+
+    /// O tecto documentado tem de ser o tecto em vigor. Por omissao o axum
+    /// corta a 2 MiB e o `MAX_CORPO_BYTES` de 8 MiB era inalcancavel: o codigo
+    /// dizia uma coisa e o servidor fazia outra.
+    #[test]
+    fn um_corpo_entre_o_tecto_do_axum_e_o_nosso_e_aceite() {
+        let adapter = ligar("ds-wh-tecto", 16 << 20, WebhookAuth::Aberto);
+        // 3 MiB: acima do limite por omissao do axum (2 MiB) e abaixo do nosso.
+        let corpo = "z".repeat(3 * 1024 * 1024);
+        assert_eq!(
+            postar(adapter.endereco_local(), &corpo, None, &[]),
+            202,
+            "o tecto em vigor tem de ser o que esta documentado"
+        );
+        esperar_recebidas(&adapter, 1);
     }
 
     /// Um token curto da a sensacao de proteccao enquanto se adivinha.
