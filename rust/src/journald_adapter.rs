@@ -11,16 +11,23 @@
 //! É por isso que este é o único destes adapters em que "restart pode repetir,
 //! nunca perder" se cumpre nos dois lados.
 //!
-//! ## Porque não se usa `journalctl -n`
+//! ## O `-n` do `journalctl` serve para uma coisa e estraga a outra
 //!
-//! A tentação é `journalctl --after-cursor=X -n 100` para limitar o lote. Está
-//! errado: o `-n` devolve as ÚLTIMAS 100 entradas do conjunto, não as 100
-//! primeiras. Com mais de 100 entradas por ler, as mais antigas desaparecem sem
-//! erro nenhum — perda silenciosa, que é o que a §5.4 proíbe pelo nome.
+//! **A retomar, o `-n` está errado.** `journalctl --after-cursor=X -n 100`
+//! devolve as ÚLTIMAS 100 entradas do conjunto, não as 100 primeiras. Com mais
+//! de 100 por ler, as mais antigas desaparecem sem erro nenhum — perda
+//! silenciosa, que é o que a §5.4 proíbe pelo nome. Por isso, com cursor, o
+//! comando não é limitado: lê-se o fluxo e para-se ao fim de `limit` linhas, e
+//! o que sobra vem no `poll` seguinte.
 //!
-//! Aqui não se limita o comando: lê-se o fluxo e para-se ao fim de `limit`
-//! linhas. O que sobra fica no jornal e vem no `poll` seguinte, porque o
-//! cursor guardado é o da última linha consumida.
+//! **No primeiro arranque, o `-n` é a única coisa que serve.** Sem cursor
+//! guardado é preciso um ponto de partida, e "as N mais recentes" é exactamente
+//! isso. A alternativa que estava aqui antes — `--since=now` — não devolve nada
+//! sem `--follow`, e o adapter nunca chegava a ter um primeiro cursor: ficava
+//! calado para sempre a reportar `Starting`.
+//!
+//! Os argumentos vivem em [`argumentos`], separados do processo, porque foi
+//! nessa construção que o defeito viveu e nenhum teste lá chegava.
 //!
 //! ## Parsing
 //!
@@ -74,6 +81,40 @@ impl Default for JournalctlCli {
     }
 }
 
+/// Os argumentos do `journalctl`, isolados para poderem ser testados sem
+/// systemd.
+///
+/// Foi aqui que viveu o defeito mais caro deste adapter: sem cursor guardado, o
+/// código punha `--since=now`, que **não devolve nada** sem `--follow`. O
+/// adapter nunca obtinha um primeiro cursor e ficava calado para sempre, a
+/// reportar `Starting`. Não havia teste que o apanhasse porque o jornal falso
+/// dos testes nunca viu um argumento.
+pub fn argumentos(
+    filtros: &[String],
+    apos_cursor: Option<&str>,
+    limite: usize,
+    desde_o_fim_sem_cursor: bool,
+) -> Vec<String> {
+    let mut args = vec!["--output=json".to_string(), "--no-pager".to_string()];
+    args.extend(filtros.iter().cloned());
+    match apos_cursor {
+        Some(c) => {
+            // A retomar: SEM `-n`. O `-n` devolve as ÚLTIMAS N do conjunto e
+            // não as N primeiras — com mais de N por ler, as mais antigas
+            // desapareciam sem erro nenhum.
+            args.push(format!("--after-cursor={c}"));
+        }
+        None if desde_o_fim_sem_cursor => {
+            // `-n` é seguro AQUI e só aqui: o que se quer é justamente as mais
+            // recentes, para haver um ponto de partida. A partir do primeiro
+            // checkpoint passa-se ao ramo de cima.
+            args.push(format!("-n{}", limite.max(1)));
+        }
+        None => {}
+    }
+    args
+}
+
 impl LeitorDeJornal for JournalctlCli {
     fn ler(
         &mut self,
@@ -83,44 +124,81 @@ impl LeitorDeJornal for JournalctlCli {
         use std::io::BufRead;
 
         let mut cmd = std::process::Command::new("journalctl");
-        cmd.arg("--output=json").arg("--no-pager");
-        for f in &self.filtros {
-            cmd.arg(f);
-        }
-        match apos_cursor {
-            Some(c) => {
-                cmd.arg(format!("--after-cursor={c}"));
-            }
-            None if self.desde_o_fim_sem_cursor => {
-                // `-n 0` com `--since=now` daria o mesmo; isto é o que o
-                // journalctl documenta para "só o que vier a seguir".
-                cmd.arg("--since=now");
-            }
-            None => {}
+        for a in argumentos(
+            &self.filtros,
+            apos_cursor,
+            limite,
+            self.desde_o_fim_sem_cursor,
+        ) {
+            cmd.arg(a);
         }
         cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
 
         let mut filho = cmd.spawn()?;
         let saida = filho
             .stdout
             .take()
             .ok_or_else(|| AdapterError::InvalidConfig("journalctl sem stdout".into()))?;
+
         let mut linhas = Vec::new();
+        let mut atingiu_limite = false;
+        // O erro de leitura NÃO pode sair daqui com um `?` directo: isso
+        // devolveria antes do `kill`/`wait`, e cada poll falhado deixava um
+        // `journalctl` zombie até os descritores acabarem.
+        let mut erro_de_leitura: Option<std::io::Error> = None;
         for linha in std::io::BufReader::new(saida).lines() {
-            let linha = linha?;
-            if linha.trim().is_empty() {
-                continue;
-            }
-            linhas.push(linha);
-            if linhas.len() >= limite {
-                break;
+            match linha {
+                Ok(l) => {
+                    if l.trim().is_empty() {
+                        continue;
+                    }
+                    linhas.push(l);
+                    if linhas.len() >= limite {
+                        atingiu_limite = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    erro_de_leitura = Some(e);
+                    break;
+                }
             }
         }
-        // Parar de ler não termina o processo. Matá-lo é o que impede um
-        // `journalctl` por poll a acumular até esgotar os descritores.
-        let _ = filho.kill();
-        let _ = filho.wait();
+        if let Some(e) = erro_de_leitura {
+            let _ = filho.kill();
+            let _ = filho.wait();
+            return Err(e.into());
+        }
+
+        if atingiu_limite {
+            // Parar de ler não termina o processo. Matá-lo é o que impede um
+            // `journalctl` por poll a acumular até esgotar os descritores. Aqui
+            // o código de saída é o do sinal e não diz nada.
+            let _ = filho.kill();
+            let _ = filho.wait();
+            return Ok(linhas);
+        }
+
+        // Chegou-se ao fim do stdout sem interromper: agora o código de saída
+        // significa alguma coisa.
+        //
+        // Ignorá-lo era o segundo defeito grave deste adapter: um `journalctl`
+        // em falta, sem permissões, ou com um filtro inválido produz stdout
+        // vazio e sai com erro — indistinguível de "o jornal não tem nada de
+        // novo". O datasource ficava cego a reportar `Healthy`.
+        let estado = filho.wait()?;
+        if !estado.success() {
+            let mut erro = String::new();
+            if let Some(mut e) = filho.stderr.take() {
+                use std::io::Read;
+                let _ = e.read_to_string(&mut erro);
+            }
+            return Err(AdapterError::InvalidConfig(format!(
+                "journalctl saiu com {estado}: {}",
+                erro.trim()
+            )));
+        }
         Ok(linhas)
     }
 }
@@ -605,6 +683,42 @@ mod tests {
             timestamp_da_linha(r#"{"__CURSOR":"a","__REALTIME_TIMESTAMP":7}"#),
             Some(7)
         );
+    }
+
+    /// O defeito mais caro deste adapter viveu na construcao dos argumentos, e
+    /// nenhum teste o podia apanhar porque o jornal falso nunca ve um
+    /// argumento. Agora ve-se.
+    #[test]
+    fn os_argumentos_do_journalctl_nao_calam_o_adapter() {
+        // Sem cursor: TEM de pedir as ultimas N. Um `--since=now` sem
+        // `--follow` nao devolve nada, e o adapter ficava calado para sempre.
+        let a = argumentos(&[], None, 50, true);
+        assert!(
+            a.iter().any(|x| x == "-n50"),
+            "sem cursor tem de haver um ponto de partida: {a:?}"
+        );
+        assert!(
+            !a.iter().any(|x| x.contains("--since")),
+            "`--since=now` sem `--follow` nao devolve nada: {a:?}"
+        );
+
+        // A retomar: `--after-cursor` e NUNCA `-n`. O `-n` devolveria as
+        // ULTIMAS N e as mais antigas desapareciam sem erro.
+        let b = argumentos(&[], Some("c123"), 50, true);
+        assert!(b.iter().any(|x| x == "--after-cursor=c123"), "{b:?}");
+        assert!(
+            !b.iter().any(|x| x.starts_with("-n")),
+            "com cursor, o `-n` saltaria as entradas mais antigas: {b:?}"
+        );
+
+        // Um limite de 0 nao pode virar `-n0`, que nao devolve nada.
+        let c = argumentos(&[], None, 0, true);
+        assert!(c.iter().any(|x| x == "-n1"), "{c:?}");
+
+        // Os filtros do orgao passam.
+        let d = argumentos(&["-u".into(), "sshd".into()], None, 10, true);
+        assert!(d.contains(&"sshd".to_string()));
+        assert!(d.contains(&"--output=json".to_string()));
     }
 
     #[test]

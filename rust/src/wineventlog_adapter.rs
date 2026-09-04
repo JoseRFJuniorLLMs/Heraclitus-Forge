@@ -18,8 +18,16 @@
 //! `EventRecordID > N`. Não é preciso guardar bookmarks opacos.
 //!
 //! O que ela NÃO sobrevive é a limpeza do canal: quando alguém limpa o log de
-//! Segurança, a numeração recomeça no 1. O adapter detecta-o — um record id
-//! menor do que o confirmado só pode ser isso — e conta-o em vez de o ignorar.
+//! Segurança, a numeração recomeça no 1 — e a consulta `EventRecordID > N`
+//! deixa de casar com fosse o que fosse, **para sempre**.
+//!
+//! Detectar isso de dentro da própria consulta é impossível: ela nunca entrega
+//! os ids novos, que são precisamente os pequenos. Por isso, quando um lote vem
+//! vazio e há cursor guardado, pergunta-se ao canal qual é o registo mais
+//! recente **sem filtro** ([`LeitorDeEventLog::record_id_mais_recente`]). Se
+//! for menor do que o confirmado, o canal foi limpo: sobe-se a geração, e a
+//! chave passa a `geracao:id` para os eventos novos não colidirem com os
+//! antigos.
 //!
 //! ## Porque é que a lógica não está dentro do `cfg(windows)`
 //!
@@ -46,6 +54,33 @@ pub trait LeitorDeEventLog: Send {
         apos_record_id: Option<u64>,
         limite: usize,
     ) -> Result<Vec<String>, AdapterError>;
+
+    /// O `EventRecordID` mais recente do canal, **ignorando o cursor**.
+    ///
+    /// Existe por uma razão só, e é a que torna este adapter utilizável depois
+    /// de alguém limpar o log de Segurança.
+    ///
+    /// A retoma é uma consulta XPath `EventRecordID > N`. Quando o canal é
+    /// limpo, a numeração recomeça no 1 — e essa consulta passa a não devolver
+    /// **nada**, para sempre, porque nenhum id novo é maior que o antigo. O
+    /// adapter ficava cego a reportar `Healthy`, e o código que detectava a
+    /// limpeza era inalcançável: esperava ver um id pequeno que a consulta
+    /// nunca lhe entregava.
+    ///
+    /// Sem cursor na consulta, o id mais recente aparece. Se for menor do que o
+    /// confirmado, o canal foi limpo.
+    fn record_id_mais_recente(&mut self) -> Result<Option<u64>, AdapterError>;
+
+    /// Quantos eventos o leitor não conseguiu materializar.
+    ///
+    /// Um evento que falha o `EvtRender` não pode simplesmente desaparecer: o
+    /// cursor passaria por cima dele e ninguém saberia. Como não há maneira de
+    /// lhe extrair o record id sem o renderizar, o leitor pára o lote ali e
+    /// conta — o evento é retentado no `poll` seguinte, e o contador explica
+    /// porque é que o datasource não avança.
+    fn falhas_de_render(&self) -> u64 {
+        0
+    }
 }
 
 /// Extrai o `EventRecordID` do XML do evento.
@@ -160,7 +195,7 @@ impl SourceAdapter for WinEventLogAdapter {
                 ack: None,
             });
         }
-        let eventos = match self.leitor.ler(self.confirmado, limit) {
+        let mut eventos = match self.leitor.ler(self.confirmado, limit) {
             Ok(e) => e,
             Err(erro) => {
                 self.ultimo_erro = Some("eventlog_falhou".into());
@@ -168,6 +203,30 @@ impl SourceAdapter for WinEventLogAdapter {
             }
         };
         self.ultimo_erro = None;
+
+        // Um lote vazio com cursor guardado tem duas explicações: não houve
+        // eventos novos, ou o canal foi limpo e a consulta `EventRecordID > N`
+        // deixou de casar com o que lá está. As duas são indistinguíveis do
+        // lado de dentro da consulta — por isso pergunta-se sem cursor.
+        if eventos.is_empty() {
+            if let Some(confirmado) = self.confirmado {
+                match self.leitor.record_id_mais_recente() {
+                    Ok(Some(topo)) if topo < confirmado => {
+                        self.geracao = self.geracao.saturating_add(1);
+                        self.confirmado = None;
+                        self.ultimo_erro = Some("canal_limpo".into());
+                        // Reler já: o canal limpo tem eventos que a consulta
+                        // anterior não podia ver.
+                        eventos = self.leitor.ler(None, limit).unwrap_or_default();
+                    }
+                    Ok(_) => {}
+                    Err(erro) => {
+                        self.ultimo_erro = Some("eventlog_falhou".into());
+                        return Err(erro);
+                    }
+                }
+            }
+        }
 
         let mut observations = Vec::with_capacity(eventos.len());
         let mut ultimo = None;
@@ -236,7 +295,14 @@ impl SourceAdapter for WinEventLogAdapter {
     }
 
     fn health(&self) -> SourceHealthSample {
+        let falhas_de_render = self.leitor.falhas_de_render();
         let state = if self.ultimo_erro.as_deref() == Some("eventlog_falhou") {
+            DatasourceState::Degraded
+        } else if falhas_de_render > 0 {
+            // O cursor não avança enquanto isto durar, e é essa a intenção: um
+            // evento que não renderiza é retentado em vez de saltado. Mas o
+            // datasource fica parado, e parado em silêncio seria pior do que o
+            // salto que se evitou.
             DatasourceState::Degraded
         } else if self.ultimo_erro.as_deref() == Some("canal_limpo") || self.sem_record_id > 0 {
             // O canal ter sido limpo não é uma falha do adapter, mas é uma
@@ -254,11 +320,15 @@ impl SourceAdapter for WinEventLogAdapter {
             counters: SourceCounters {
                 observed: self.observadas,
                 acknowledged: self.confirmadas,
-                backpressure_events: 0,
-                // O canal retém: o que não coube sai no poll seguinte.
+                backpressure_events: falhas_de_render,
+                // O canal retém: o que não coube sai no poll seguinte, e um
+                // evento que não renderiza é retentado em vez de saltado.
                 dropped: 0,
             },
-            last_error_code: self.ultimo_erro.clone(),
+            last_error_code: self
+                .ultimo_erro
+                .clone()
+                .or_else(|| (falhas_de_render > 0).then(|| "evento_nao_renderizou".to_string())),
         }
     }
 }
@@ -274,10 +344,10 @@ fn escrever_atomico(destino: &Path, dados: &[u8]) -> Result<(), AdapterError> {
 #[cfg(windows)]
 pub mod nativo {
     use super::{AdapterError, LeitorDeEventLog};
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_NO_MORE_ITEMS};
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_NO_MORE_ITEMS, ERROR_TIMEOUT};
     use windows_sys::Win32::System::EventLog::{
-        EvtClose, EvtNext, EvtQuery, EvtQueryChannelPath, EvtQueryForwardDirection, EvtRender,
-        EvtRenderEventXml, EVT_HANDLE,
+        EvtClose, EvtNext, EvtQuery, EvtQueryChannelPath, EvtQueryForwardDirection,
+        EvtQueryReverseDirection, EvtRender, EvtRenderEventXml, EVT_HANDLE,
     };
 
     fn larga(texto: &str) -> Vec<u16> {
@@ -301,12 +371,14 @@ pub mod nativo {
     /// Leitor de um canal do Windows Event Log.
     pub struct EventLogNativo {
         canal: String,
+        falhas_de_render: u64,
     }
 
     impl EventLogNativo {
         pub fn novo(canal: impl Into<String>) -> Self {
             Self {
                 canal: canal.into(),
+                falhas_de_render: 0,
             }
         }
 
@@ -316,6 +388,27 @@ pub mod nativo {
                 Some(n) => format!("*[System[EventRecordID > {n}]]"),
                 None => "*".to_string(),
             }
+        }
+
+        /// Abre uma consulta no canal.
+        fn abrir(canal: &str, consulta: &str, direccao: u32) -> Result<Handle, AdapterError> {
+            let canal_w = larga(canal);
+            let consulta_w = larga(consulta);
+            let h = unsafe {
+                EvtQuery(
+                    0,
+                    canal_w.as_ptr(),
+                    consulta_w.as_ptr(),
+                    EvtQueryChannelPath | direccao,
+                )
+            };
+            if h == 0 {
+                let codigo = unsafe { GetLastError() };
+                return Err(AdapterError::InvalidConfig(format!(
+                    "EvtQuery falhou no canal {canal:?} com {codigo}"
+                )));
+            }
+            Ok(Handle(h))
         }
 
         fn renderizar(evento: EVT_HANDLE) -> Result<String, AdapterError> {
@@ -373,24 +466,13 @@ pub mod nativo {
             apos_record_id: Option<u64>,
             limite: usize,
         ) -> Result<Vec<String>, AdapterError> {
-            let canal = larga(&self.canal);
-            let consulta = larga(&Self::consulta(apos_record_id));
-            let resultado = unsafe {
-                EvtQuery(
-                    0,
-                    canal.as_ptr(),
-                    consulta.as_ptr(),
-                    EvtQueryChannelPath | EvtQueryForwardDirection,
-                )
-            };
-            if resultado == 0 {
-                let codigo = unsafe { GetLastError() };
-                return Err(AdapterError::InvalidConfig(format!(
-                    "EvtQuery falhou no canal {:?} com {codigo}",
-                    self.canal
-                )));
-            }
-            let resultado = Handle(resultado);
+            // O `Handle` fecha-se sozinho no fim do escopo; sem ele, cada poll
+            // deixava um handle do serviço de eventos por fechar.
+            let resultado = Self::abrir(
+                &self.canal,
+                &Self::consulta(apos_record_id),
+                EvtQueryForwardDirection,
+            )?;
 
             let mut linhas = Vec::new();
             // Lotes pequenos: cada handle devolvido tem de ser fechado, e um
@@ -414,7 +496,11 @@ pub mod nativo {
                 };
                 if ok == 0 {
                     let codigo = unsafe { GetLastError() };
-                    if codigo == ERROR_NO_MORE_ITEMS {
+                    // `ERROR_NO_MORE_ITEMS` e `ERROR_TIMEOUT` sao os dois
+                    // "nao ha mais nada agora". Com timeout 0 o `EvtNext`
+                    // devolve o segundo, e trata-lo como falha dura punha o
+                    // canal em `Degraded` a cada poll sem eventos.
+                    if codigo == ERROR_NO_MORE_ITEMS || codigo == ERROR_TIMEOUT {
                         break;
                     }
                     return Err(AdapterError::InvalidConfig(format!(
@@ -424,20 +510,52 @@ pub mod nativo {
                 if devolvidos == 0 {
                     break;
                 }
+                let mut falhou = false;
                 for evento in eventos.iter().take(devolvidos as usize) {
                     let guarda = Handle(*evento);
                     match Self::renderizar(guarda.0) {
                         Ok(xml) => linhas.push(xml),
-                        // Um evento que não renderiza não pode parar o lote
-                        // inteiro: os outros são bons. Fica sem record id e o
-                        // adapter conta-o.
+                        // Um evento que nao renderiza NAO pode ser saltado: o
+                        // cursor passaria por cima dele e ninguem saberia. Sem
+                        // o render nao ha record id, por isso o lote para aqui
+                        // e o evento e retentado no poll seguinte — com um
+                        // contador a explicar porque e que o cursor nao avanca.
                         Err(erro) => {
                             tracing::warn!(%erro, "eventlog: evento nao renderizou");
+                            self.falhas_de_render += 1;
+                            falhou = true;
+                            break;
                         }
                     }
                 }
+                if falhou {
+                    break;
+                }
             }
             Ok(linhas)
+        }
+
+        /// Pergunta ao canal qual é o registo mais recente, sem filtro de
+        /// cursor. É a única forma de ver que a numeração recomeçou.
+        fn record_id_mais_recente(&mut self) -> Result<Option<u64>, AdapterError> {
+            let resultado = Self::abrir(&self.canal, "*", EvtQueryReverseDirection)?;
+            let mut evento: EVT_HANDLE = 0;
+            let mut devolvidos: u32 = 0;
+            let ok = unsafe { EvtNext(resultado.0, 1, &mut evento, 0, 0, &mut devolvidos) };
+            if ok == 0 || devolvidos == 0 {
+                // Canal vazio ou sem mais nada: não é erro. Um canal acabado de
+                // limpar pode estar mesmo vazio, e nesse caso não há como
+                // decidir — decide-se no poll seguinte, quando houver um
+                // evento.
+                return Ok(None);
+            }
+            let guarda = Handle(evento);
+            let xml = Self::renderizar(guarda.0)?;
+            Ok(super::record_id_do_xml(&xml))
+        }
+
+        fn falhas_de_render(&self) -> u64 {
+            self.falhas_de_render
         }
     }
 }
@@ -481,6 +599,11 @@ mod tests {
                 falhar: Arc::new(Mutex::new(false)),
             }
         }
+        /// O que uma limpeza do canal faz: o conteudo antigo desaparece e a
+        /// numeracao recomeca.
+        fn limpar_para(&self, eventos: Vec<String>) {
+            *self.eventos.lock().unwrap() = eventos;
+        }
     }
 
     impl LeitorDeEventLog for CanalFalso {
@@ -503,6 +626,19 @@ mod tests {
                 .take(limite)
                 .cloned()
                 .collect())
+        }
+
+        fn record_id_mais_recente(&mut self) -> Result<Option<u64>, AdapterError> {
+            if *self.falhar.lock().unwrap() {
+                return Err(AdapterError::InvalidConfig("canal indisponivel".into()));
+            }
+            Ok(self
+                .eventos
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| record_id_do_xml(e))
+                .max())
         }
     }
 
@@ -579,6 +715,60 @@ mod tests {
         fn ler(&mut self, _apos: Option<u64>, limite: usize) -> Result<Vec<String>, AdapterError> {
             Ok(self.0.iter().take(limite).cloned().collect())
         }
+        fn record_id_mais_recente(&mut self) -> Result<Option<u64>, AdapterError> {
+            Ok(self.0.iter().filter_map(|e| record_id_do_xml(e)).max())
+        }
+    }
+
+    /// O defeito que a revisao apanhou: com um leitor REALISTA — que filtra
+    /// `EventRecordID > N`, como a consulta XPath faz — a limpeza do canal
+    /// deixava o adapter cego para sempre. A consulta nunca devolvia os ids
+    /// novos, mais pequenos, e o codigo que detectava a limpeza esperava ver
+    /// exactamente esses ids: era inalcancavel.
+    ///
+    /// O teste antigo passava porque usava um falso que ignorava o filtro.
+    #[test]
+    fn a_limpeza_e_detectada_com_um_leitor_que_filtra_a_serio() {
+        let b = bancada(vec![evento(50, "velho"), evento(51, "velho2")]);
+        let mut a = adapter(&b);
+        let lote = a.poll(10).unwrap();
+        assert_eq!(lote.observations.len(), 2);
+        a.checkpoint(lote.ack.unwrap()).unwrap();
+        assert_eq!(a.record_id_confirmado(), Some(51));
+
+        // Alguem limpou o canal: a numeracao recomeca no 1.
+        b.canal
+            .limpar_para(vec![evento(1, "novo"), evento(2, "novo2")]);
+
+        // A consulta `EventRecordID > 51` nao devolve nada. Antes, o adapter
+        // ficava aqui para sempre.
+        let obs = a.poll(10).unwrap().observations;
+        assert_eq!(
+            obs.len(),
+            2,
+            "o adapter tem de recuperar os eventos de depois da limpeza"
+        );
+        assert_eq!(a.geracao(), 1, "a geracao tem de subir");
+        assert_eq!(obs[0].source_sequence.as_deref(), Some("1:1"));
+        assert_eq!(a.health().state, DatasourceState::Drifted);
+        assert_eq!(a.health().last_error_code.as_deref(), Some("canal_limpo"));
+    }
+
+    /// Um canal simplesmente sem novidades NAO pode ser confundido com um canal
+    /// limpo: subir a geracao sem razao trocaria as chaves de idempotencia de
+    /// tudo o que viesse a seguir.
+    #[test]
+    fn um_canal_sem_novidades_nao_conta_como_limpo() {
+        let b = bancada(vec![evento(10, "a")]);
+        let mut a = adapter(&b);
+        let lote = a.poll(10).unwrap();
+        a.checkpoint(lote.ack.unwrap()).unwrap();
+
+        for _ in 0..3 {
+            assert!(a.poll(10).unwrap().observations.is_empty());
+        }
+        assert_eq!(a.geracao(), 0, "nada foi limpo");
+        assert_eq!(a.health().last_error_code, None);
     }
 
     /// Limpar o log de Seguranca reinicia a numeracao no 1. Continuar com a
@@ -728,5 +918,18 @@ mod tests {
             let id = record_id_do_xml(e).expect("record id");
             assert!(id > corte, "a consulta filtrou mal: {id} <= {corte}");
         }
+
+        // A consulta em sentido INVERSO e o que deteta a limpeza do canal.
+        // Sem ela o adapter ficava cego para sempre depois de alguem limpar o
+        // log, por isso tem de funcionar contra o canal real.
+        let topo = leitor
+            .record_id_mais_recente()
+            .expect("consulta inversa")
+            .expect("o canal Application tem eventos");
+        assert!(
+            topo >= *ids.iter().max().unwrap(),
+            "o mais recente ({topo}) tem de ser >= aos que a consulta directa deu ({ids:?})"
+        );
+        assert_eq!(leitor.falhas_de_render(), 0);
     }
 }

@@ -75,6 +75,12 @@ struct CheckpointAuditd {
 #[derive(Debug, Clone)]
 struct Grupo {
     serial: Option<u64>,
+    /// A geracao do ficheiro em que este grupo foi LIDO.
+    ///
+    /// Um grupo que ainda esta por entregar quando o ficheiro roda pertence
+    /// ao ficheiro anterior. Entrega-lo com a geracao nova daria a um evento
+    /// velho a chave de um evento novo.
+    geracao: u64,
     linhas: Vec<String>,
     /// Offset no ficheiro logo a seguir à última linha deste grupo. É o que
     /// pode ser confirmado quando o consumidor persistir até aqui.
@@ -104,6 +110,8 @@ pub struct AuditdAdapter {
     observadas: u64,
     confirmadas: u64,
     ultimo_offset_entregue: Option<u64>,
+    /// Eventos entregues incompletos porque o ficheiro rodou a meio deles.
+    truncados: u64,
     ultimo_erro: Option<String>,
 }
 
@@ -148,6 +156,7 @@ impl AuditdAdapter {
             observadas: 0,
             confirmadas: 0,
             ultimo_offset_entregue: None,
+            truncados: 0,
             ultimo_erro: None,
         })
     }
@@ -160,20 +169,53 @@ impl AuditdAdapter {
     /// linha, que é pior do que recomeçar.
     fn detectar_rotacao(&mut self) -> Result<(), AdapterError> {
         let tamanho = std::fs::metadata(&self.ficheiro)?.len();
-        if tamanho < self.offset {
-            self.offset = 0;
-            self.geracao = self.geracao.saturating_add(1);
-            // Um grupo retido pertencia ao ficheiro anterior; entregá-lo agora
-            // misturaria duas gerações no mesmo evento.
-            self.retido = None;
-            self.ultimo_erro = Some("rotacao_detectada".into());
+        if tamanho >= self.offset {
+            return Ok(());
         }
+
+        // O ficheiro rodou. O que estava RETIDO era um evento a meio, e o resto
+        // dele foi-se com o ficheiro antigo: entrega-se o que há e conta-se
+        // como truncado. Deitá-lo fora em silêncio é o que a §5.4 proíbe;
+        // fingir que está completo seria pior ainda.
+        if let Some(g) = self.retido.take() {
+            self.truncados = self.truncados.saturating_add(1);
+            self.observadas = self.observadas.saturating_add(1);
+            self.prontos.push_back(g);
+        }
+
+        // A rotação ESPERA que a geração anterior seja entregue.
+        //
+        // Sem isto, a fila ficava com grupos de duas gerações misturados: os
+        // antigos com offsets grandes, os novos a recomeçar em zero. O cursor é
+        // um offset, e passava a andar para trás — o `checkpoint` apagava da
+        // fila o que ainda ninguém tinha visto. Adiar a rotação um ciclo custa
+        // latência; misturar gerações custa dados.
+        if !self.prontos.is_empty() {
+            self.ultimo_erro = Some("rotacao_pendente".into());
+            return Ok(());
+        }
+
+        self.offset = 0;
+        self.geracao = self.geracao.saturating_add(1);
+        self.ultimo_erro = Some("rotacao_detectada".into());
         Ok(())
     }
 
     /// Lê tudo o que há de novo e agrupa.
-    fn absorver(&mut self) -> Result<(), AdapterError> {
+    fn absorver(&mut self, limite: usize) -> Result<(), AdapterError> {
         self.detectar_rotacao()?;
+        // A rotacao ficou adiada porque ainda ha grupos da geracao anterior
+        // por entregar: nao se le nada do ficheiro novo ate a fila esvaziar.
+        if std::fs::metadata(&self.ficheiro)?.len() < self.offset {
+            return Ok(());
+        }
+        // Um `audit.log` com semanas por ler nao pode entrar todo em memoria:
+        // o `limit` do poll tem de limitar tambem a LEITURA, e nao so a
+        // entrega. Sem isto o adapter jurava `dropped: 0` enquanto consumia
+        // toda a memoria da maquina.
+        if self.prontos.len() >= limite {
+            return Ok(());
+        }
         let tamanho = std::fs::metadata(&self.ficheiro)?.len();
         if tamanho > self.offset {
             self.ultimo_crescimento = std::time::Instant::now();
@@ -209,9 +251,13 @@ impl AuditdAdapter {
                 // Serial diferente: o grupo anterior fechou.
                 Some(_) => {
                     let fechado = self.retido.take().expect("acabado de verificar");
+                    // Conta-se aqui, quando o evento fica COMPLETO. Contar na
+                    // entrega inflava o numero a cada re-poll do mesmo lote.
+                    self.observadas = self.observadas.saturating_add(1);
                     self.prontos.push_back(fechado);
                     self.retido = Some(Grupo {
                         serial,
+                        geracao: self.geracao,
                         linhas: vec![texto],
                         fim_offset: cursor,
                     });
@@ -219,6 +265,7 @@ impl AuditdAdapter {
                 None => {
                     self.retido = Some(Grupo {
                         serial,
+                        geracao: self.geracao,
                         linhas: vec![texto],
                         fim_offset: cursor,
                     });
@@ -233,6 +280,7 @@ impl AuditdAdapter {
         let sem_serial = self.retido.as_ref().is_some_and(|g| g.serial.is_none());
         if quieto || sem_serial {
             if let Some(g) = self.retido.take() {
+                self.observadas = self.observadas.saturating_add(1);
                 self.prontos.push_back(g);
             }
         }
@@ -260,7 +308,7 @@ impl SourceAdapter for AuditdAdapter {
     }
 
     fn poll(&mut self, limit: usize) -> Result<ObservationBatch, AdapterError> {
-        self.absorver()?;
+        self.absorver(limit)?;
         let quantos = limit.min(self.prontos.len());
         if quantos == 0 {
             return Ok(ObservationBatch {
@@ -278,19 +326,18 @@ impl SourceAdapter for AuditdAdapter {
                 // kernel pode reiniciar a numeração, e dois eventos diferentes
                 // com a mesma chave seriam fundidos num pela idempotência.
                 source_sequence: Some(match grupo.serial {
-                    Some(s) => format!("{}:{s}", self.geracao),
-                    None => format!("{}:offset{}", self.geracao, grupo.fim_offset),
+                    Some(s) => format!("{}:{s}", grupo.geracao),
+                    None => format!("{}:offset{}", grupo.geracao, grupo.fim_offset),
                 }),
                 source_event_id: Some(format!(
                     "{}:{}:{}",
                     self.ficheiro.display(),
-                    self.geracao,
+                    grupo.geracao,
                     grupo.fim_offset
                 )),
                 observed_at_micros: None,
             });
         }
-        self.observadas = self.observadas.saturating_add(quantos as u64);
         self.ultimo_offset_entregue = Some(fim);
         Ok(ObservationBatch {
             observations,
@@ -334,7 +381,12 @@ impl SourceAdapter for AuditdAdapter {
     }
 
     fn health(&self) -> SourceHealthSample {
-        let state = if self.observadas == 0 {
+        let state = if self.truncados > 0 {
+            // Um evento entregue a meio nao e um datasource saudavel.
+            DatasourceState::Degraded
+        } else if self.ultimo_erro.as_deref() == Some("rotacao_pendente") {
+            DatasourceState::Delayed
+        } else if self.observadas == 0 {
             DatasourceState::Starting
         } else {
             DatasourceState::Healthy
@@ -346,10 +398,11 @@ impl SourceAdapter for AuditdAdapter {
             counters: SourceCounters {
                 observed: self.observadas,
                 acknowledged: self.confirmadas,
-                backpressure_events: 0,
-                // Um ficheiro não descarta: o que não coube fica lá para o
-                // próximo poll. É a vantagem de uma fonte com retenção.
-                dropped: 0,
+                backpressure_events: self.truncados,
+                // Um ficheiro nao descarta: o que nao coube fica la para o
+                // proximo poll. A excepcao e o evento que a rotacao apanhou a
+                // meio — esse chegou incompleto, e conta.
+                dropped: self.truncados,
             },
             last_error_code: self.ultimo_erro.clone(),
         }
@@ -611,6 +664,131 @@ mod tests {
 
         acrescentar(&b, "type=SYSCALL msg=audit(1364481365.000:24289): novo\n");
         assert_eq!(a.poll(10).unwrap().observations.len(), 1);
+    }
+
+    /// O compromisso central deste adapter: o grupo do fim sai quando o
+    /// ficheiro fica QUIETO. Sem teste, o `atraso_de_agrupamento` era so um
+    /// campo bonito.
+    #[test]
+    fn o_grupo_do_fim_sai_quando_o_ficheiro_fica_quieto() {
+        let b = bancada(EVENTO_24287);
+        let mut a = AuditdAdapter::abrir(identidade(), &b.log, &b.checkpoint, true).unwrap();
+        a.atraso_de_agrupamento = std::time::Duration::from_millis(300);
+
+        // Acabado de crescer: fica retido.
+        assert!(
+            a.poll(10).unwrap().observations.is_empty(),
+            "ainda pode chegar mais uma linha do mesmo serial"
+        );
+
+        // Passado o prazo sem crescer, sai.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let obs = a.poll(10).unwrap().observations;
+        assert_eq!(
+            obs.len(),
+            1,
+            "o ficheiro ficou quieto: o evento tem de sair"
+        );
+        assert_eq!(String::from_utf8_lossy(&obs[0].payload).lines().count(), 3);
+    }
+
+    /// A rotacao NAO pode misturar geracoes na fila: os grupos antigos tem
+    /// offsets grandes e os novos recomecam em zero, e o cursor — que e um
+    /// offset — passaria a andar para tras.
+    #[test]
+    fn a_rotacao_espera_pela_entrega_da_geracao_anterior() {
+        let b = bancada(&format!("{EVENTO_24287}{EVENTO_24288}"));
+        let mut a = abrir(&b);
+
+        // Le os dois eventos mas NAO confirma.
+        let lote = a.poll(10).unwrap();
+        assert_eq!(lote.observations.len(), 2);
+
+        // O ficheiro roda com o lote por confirmar.
+        std::fs::write(&b.log, "type=SYSCALL msg=audit(1.0:1): novo\n").unwrap();
+
+        // O que sai continua a ser da geracao 0, com as chaves antigas.
+        let outra_vez = a.poll(10).unwrap();
+        assert_eq!(outra_vez.observations.len(), 2);
+        assert_eq!(
+            outra_vez.observations[0].source_sequence.as_deref(),
+            Some("0:24287"),
+            "o evento e do ficheiro anterior; a chave tem de ser a antiga"
+        );
+        assert_eq!(a.health().state, DatasourceState::Delayed);
+
+        // Confirmado o lote antigo, a rotacao aplica-se e o ficheiro novo entra.
+        a.checkpoint(outra_vez.ack.unwrap()).unwrap();
+        let novo = a.poll(10).unwrap().observations;
+        assert_eq!(novo.len(), 1);
+        assert_eq!(
+            novo[0].source_sequence.as_deref(),
+            Some("1:1"),
+            "geracao nova: o serial 1 nao colide com nada do ficheiro anterior"
+        );
+    }
+
+    /// Um evento apanhado a meio pela rotacao chega incompleto. Deita-lo fora
+    /// em silencio e o que a §5.4 proibe; fingir que esta completo e pior.
+    #[test]
+    fn um_evento_truncado_pela_rotacao_e_entregue_e_contado() {
+        let b = bancada(EVENTO_24287);
+        let mut a = AuditdAdapter::abrir(identidade(), &b.log, &b.checkpoint, true).unwrap();
+        // Atraso longo: o grupo fica retido, a meio.
+        a.atraso_de_agrupamento = std::time::Duration::from_secs(3600);
+        assert!(a.poll(10).unwrap().observations.is_empty());
+
+        // O ficheiro roda com o evento ainda retido.
+        std::fs::write(&b.log, "").unwrap();
+
+        let obs = a.poll(10).unwrap().observations;
+        assert_eq!(obs.len(), 1, "o que havia do evento tem de sair");
+        let saude = a.health();
+        assert_eq!(saude.counters.dropped, 1, "chegou incompleto e conta");
+        assert_eq!(saude.state, DatasourceState::Degraded);
+    }
+
+    /// `observed` conta OBSERVACOES. Contar entregas inflava o numero a cada
+    /// re-poll do mesmo lote, e um painel dizia que tinham chegado tres vezes
+    /// mais eventos do que os que existiam.
+    #[test]
+    fn o_contador_de_observadas_nao_infla_com_o_re_poll() {
+        let b = bancada(&format!("{EVENTO_24287}{EVENTO_24288}"));
+        let mut a = abrir(&b);
+        a.poll(10).unwrap();
+        assert_eq!(a.health().counters.observed, 2);
+        a.poll(10).unwrap();
+        a.poll(10).unwrap();
+        assert_eq!(
+            a.health().counters.observed,
+            2,
+            "tres polls do mesmo lote continuam a ser dois eventos"
+        );
+    }
+
+    /// O `limit` do poll tem de limitar tambem a LEITURA. Sem isso, um
+    /// `audit.log` com semanas por ler entrava todo em memoria enquanto o
+    /// adapter jurava `dropped: 0`.
+    #[test]
+    fn o_limite_do_poll_limita_a_leitura() {
+        let mut muitos = String::new();
+        for i in 0..500 {
+            muitos.push_str(&format!("type=SYSCALL msg=audit(1.0:{i}): linha\n"));
+        }
+        let b = bancada(&muitos);
+        let mut a = abrir(&b);
+
+        let lote = a.poll(5).unwrap();
+        assert_eq!(lote.observations.len(), 5);
+        assert!(
+            a.offset < 20_000,
+            "leu o ficheiro todo ({} bytes) apesar do limite de 5",
+            a.offset
+        );
+
+        // E o resto continua la para os polls seguintes.
+        a.checkpoint(lote.ack.unwrap()).unwrap();
+        assert_eq!(a.poll(5).unwrap().observations.len(), 5);
     }
 
     #[test]

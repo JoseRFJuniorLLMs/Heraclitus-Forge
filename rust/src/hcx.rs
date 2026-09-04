@@ -23,15 +23,25 @@ fn artifact_error(message: impl Into<String>) -> HeraclitusError {
 }
 
 fn decode_hex(value: &str, field: &str) -> Result<Vec<u8>, HeraclitusError> {
-    if !value.len().is_multiple_of(2) {
+    // Sobre BYTES e não sobre a `&str` fatiada por índices.
+    //
+    // `&value[i..i + 2]` entra em PÂNICO quando o corte cai a meio de um
+    // caractere multibyte. O conteúdo vem de um `signature.sig` que ainda não
+    // foi verificado — é entrada não confiável por definição — e um pânico aqui
+    // derruba o verificador em vez de produzir `Quarantined`. Um verificador
+    // que morre não é fail-closed: é fail-nenhum.
+    let bytes = value.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err(artifact_error(format!(
             "{field} hexadecimal tem tamanho impar"
         )));
     }
-    (0..value.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&value[i..i + 2], 16)
+    bytes
+        .chunks_exact(2)
+        .map(|par| {
+            let texto = std::str::from_utf8(par)
+                .map_err(|_| artifact_error(format!("{field} hexadecimal invalido")))?;
+            u8::from_str_radix(texto, 16)
                 .map_err(|_| artifact_error(format!("{field} hexadecimal invalido")))
         })
         .collect()
@@ -58,11 +68,21 @@ fn collect_files(
         }
         if file_type.is_dir() {
             collect_files(root, &path, files)?;
-        } else if file_type.is_file()
-            && path.file_name().and_then(|name| name.to_str()) != Some(SIGNATURE_FILE)
-        {
-            path.strip_prefix(root)
+        } else if file_type.is_file() {
+            let relativo = path
+                .strip_prefix(root)
                 .map_err(|_| artifact_error("ficheiro fora da raiz do artefato"))?;
+            // Só o `signature.sig` da RAIZ fica de fora do digest — é ele que
+            // contém o digest, e não se pode assinar a si próprio.
+            //
+            // A exclusão era por nome, a qualquer profundidade: um ficheiro
+            // `subpasta/signature.sig` ficava fora do digest e podia ser
+            // trocado sem a verificação dar por nada. Conteúdo não assinado
+            // dentro de um artefacto que verifica é exactamente o que a §5.5
+            // existe para impedir.
+            if relativo == Path::new(SIGNATURE_FILE) {
+                continue;
+            }
             files.push(path);
         }
     }
@@ -248,6 +268,58 @@ mod tests {
         let error = verify_artifact(&copy, Path::new(TRUST_ROOT))
             .expect_err("um byte alterado deve impedir load");
         assert!(error.to_string().contains("adulterado"));
+    }
+
+    /// O `signature.sig` chega como texto NAO verificado. Um corte a meio de um
+    /// caractere multibyte fazia o `decode_hex` entrar em panico, e um
+    /// verificador que morre nao e fail-closed: e fail-nenhum.
+    #[test]
+    fn decode_hex_nao_entra_em_panico_com_multibyte() {
+        // 'é' ocupa dois bytes: o corte de dois em dois cai a meio dele.
+        assert!(decode_hex("éé", "teste").is_err());
+        assert!(decode_hex("ab€cd", "teste").is_err());
+        assert!(decode_hex("日本語", "teste").is_err());
+        // E o caminho normal continua a funcionar.
+        assert_eq!(
+            decode_hex("00ff10", "teste").unwrap(),
+            vec![0x00, 0xff, 0x10]
+        );
+        assert!(decode_hex("abc", "teste").is_err(), "tamanho impar");
+    }
+
+    /// Um ficheiro chamado `signature.sig` DENTRO de uma subpasta ficava fora do
+    /// digest: conteudo nao assinado dentro de um artefacto que verifica.
+    #[test]
+    fn um_signature_sig_em_subpasta_e_coberto_pelo_digest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let copy = temp.path().join("v1.1.0.hcx");
+        copy_dir(Path::new(ARTIFACT), &copy).expect("copiar artefato");
+
+        let sub = copy.join("modelos");
+        fs::create_dir_all(&sub).unwrap();
+        let intruso = sub.join(SIGNATURE_FILE);
+        fs::write(&intruso, b"conteudo qualquer").unwrap();
+
+        let com = artifact_digest(&copy).expect("digest com o ficheiro");
+        fs::write(&intruso, b"conteudo DIFERENTE").unwrap();
+        let depois = artifact_digest(&copy).expect("digest depois de mexer");
+        assert_ne!(
+            com, depois,
+            "mexer num `subpasta/signature.sig` TEM de mudar o digest"
+        );
+
+        // E o `signature.sig` da raiz continua de fora — nao se pode assinar a
+        // si proprio.
+        let so_raiz = artifact_digest(Path::new(ARTIFACT)).expect("digest do original");
+        let mut ficheiros = Vec::new();
+        collect_files(Path::new(ARTIFACT), Path::new(ARTIFACT), &mut ficheiros).unwrap();
+        assert!(
+            !ficheiros
+                .iter()
+                .any(|f| f.file_name().and_then(|n| n.to_str()) == Some(SIGNATURE_FILE)),
+            "o signature.sig da raiz nao entra no digest"
+        );
+        assert_eq!(so_raiz.len(), 32);
     }
 
     fn copy_dir(source: &Path, destination: &Path) -> std::io::Result<()> {

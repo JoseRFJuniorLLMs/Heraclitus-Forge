@@ -116,6 +116,21 @@ impl fmt::Display for ContentRef {
 /// O tipo guarda um identificador de cofre. Se guardasse o valor, ele acabaria
 /// num `Debug`, num log ou num `.hdb` — e um segredo que passou por um log
 /// deixou de ser segredo.
+///
+/// ## Porque é que o `Debug` esconde e o `Serialize` não
+///
+/// Parece incoerente e não é. São duas saídas com destinos diferentes:
+///
+/// - o `Debug` aparece em mensagens de erro, em `tracing` e em despejos de
+///   estado, sítios onde ninguém decidiu que aquele identificador devia ir. Um
+///   caminho de cofre num log expõe a estrutura interna do cofre a quem lê o
+///   log, e isso é meio caminho para o segredo;
+/// - o `Serialize` é a persistência DELIBERADA do estado desejado. Uma
+///   `DatasourceSpec` sem `credential_ref` é inútil: ninguém saberia que
+///   credencial usar. Escondê-lo aqui não protegeria nada e partiria a spec.
+///
+/// O que nunca acontece, em nenhuma das duas, é o VALOR do segredo sair — ele
+/// não está aqui dentro.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretRef {
     vault_id: String,
@@ -339,12 +354,16 @@ impl AdmissionOutcome {
 #[derive(Deserialize)]
 struct ManifestoMinimo {
     id: String,
-    #[serde(default = "schema_por_omissao")]
+    /// SEM valor por omissao.
+    ///
+    /// Tinha `#[serde(default)]` a devolver "v9", e isso fazia a etapa 5 da
+    /// §5.5 falhar ABERTA: um manifesto que nao declarasse schema nenhum era
+    /// admitido como se declarasse o schema que este runtime sabe ler. A
+    /// verificacao de compatibilidade passava sem nada ter sido verificado.
+    ///
+    /// Um artefacto que nao diz que schema usa nao pode ser interpretado — nao
+    /// se adivinha o significado dos campos de outra pessoa.
     schema_version: String,
-}
-
-fn schema_por_omissao() -> String {
-    "v9".into()
 }
 
 fn quarentena(
@@ -1005,6 +1024,32 @@ mod tests {
         assert!(!impresso.contains("cofre"), "vazou: {impresso}");
         assert_eq!(s.vault_id(), "cofre/pg/senha");
         assert!(SecretRef::novo("  ").is_err());
+
+        // O `Serialize` EMITE o identificador, e e para emitir: uma spec sem
+        // `credential_ref` nao diz que credencial usar. O que nunca sai, nem
+        // aqui nem no Debug, e o VALOR do segredo — ele nao esta neste tipo.
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            json.contains("cofre/pg/senha"),
+            "a spec persistida precisa do identificador: {json}"
+        );
+    }
+
+    /// A etapa 5 da §5.5 falhava ABERTA: um manifesto que nao declarasse schema
+    /// nenhum era lido como se declarasse "v9", e a verificacao de
+    /// compatibilidade passava sem nada ter sido verificado.
+    #[test]
+    fn um_manifesto_sem_schema_version_nao_e_lido_como_v9() {
+        let sem: Result<ManifestoMinimo, _> = serde_yaml::from_str("id: qualquer\n");
+        assert!(
+            sem.is_err(),
+            "nao se adivinha o schema de outra pessoa; tem de ser recusado"
+        );
+
+        let com: ManifestoMinimo =
+            serde_yaml::from_str("id: x\nschema_version: v9\n").expect("com schema le-se");
+        assert_eq!(com.schema_version, "v9");
+        assert_eq!(com.id, "x");
     }
 
     /// Adapter minimo, so para o supervisor ter o que registar.
