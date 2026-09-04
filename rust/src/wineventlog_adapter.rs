@@ -36,7 +36,7 @@
 //! isso corre e é testado na CI de Linux também. Um adapter que só se
 //! compilasse numa plataforma seria um adapter que só lá se testaria.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -133,10 +133,20 @@ impl WinEventLogAdapter {
             ));
         }
         let checkpoint_path = checkpoint_path.into();
-        let guardado = std::fs::read_to_string(&checkpoint_path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<CheckpointEventLog>(&t).ok())
-            .filter(|c| c.canal == canal);
+        let (guardado, aviso) =
+            match crate::checkpoint::carregar::<CheckpointEventLog>(&checkpoint_path) {
+                crate::checkpoint::EstadoDoCheckpoint::Carregado(c) if c.canal == canal => {
+                    (Some(c), None)
+                }
+                crate::checkpoint::EstadoDoCheckpoint::Carregado(_) => {
+                    (None, Some("checkpoint_de_outro_canal".to_string()))
+                }
+                crate::checkpoint::EstadoDoCheckpoint::Ausente => (None, None),
+                crate::checkpoint::EstadoDoCheckpoint::Ilegivel(motivo) => {
+                    tracing::warn!(%motivo, "eventlog: checkpoint ilegivel; a recomecar");
+                    (None, Some("checkpoint_ilegivel".to_string()))
+                }
+            };
         let (confirmado, geracao) = match guardado {
             Some(c) => (Some(c.record_id), c.geracao),
             None => (None, 0),
@@ -152,7 +162,7 @@ impl WinEventLogAdapter {
             observadas: 0,
             confirmadas: 0,
             sem_record_id: 0,
-            ultimo_erro: None,
+            ultimo_erro: aviso,
         })
     }
 
@@ -287,7 +297,7 @@ impl SourceAdapter for WinEventLogAdapter {
             geracao: self.geracao,
         })
         .map_err(|e| AdapterError::InvalidAck(e.to_string()))?;
-        escrever_atomico(&self.checkpoint_path, texto.as_bytes())?;
+        crate::checkpoint::escrever_atomico(&self.checkpoint_path, texto.as_bytes())?;
         self.confirmado = Some(ate);
         self.pendente = None;
         self.confirmadas = self.confirmadas.saturating_add(1);
@@ -331,13 +341,6 @@ impl SourceAdapter for WinEventLogAdapter {
                 .or_else(|| (falhas_de_render > 0).then(|| "evento_nao_renderizou".to_string())),
         }
     }
-}
-
-fn escrever_atomico(destino: &Path, dados: &[u8]) -> Result<(), AdapterError> {
-    let temporario = destino.with_extension("tmp");
-    std::fs::write(&temporario, dados)?;
-    std::fs::rename(&temporario, destino)?;
-    Ok(())
 }
 
 /// O leitor real, sobre `wevtapi`.

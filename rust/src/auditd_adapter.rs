@@ -38,7 +38,7 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -132,10 +132,25 @@ impl AuditdAdapter {
         let checkpoint_path = checkpoint_path.into();
         let tamanho = std::fs::metadata(&ficheiro)?.len();
 
-        let guardado = std::fs::read_to_string(&checkpoint_path)
-            .ok()
-            .and_then(|texto| serde_json::from_str::<CheckpointAuditd>(&texto).ok())
-            .filter(|c| c.ficheiro == ficheiro && c.offset <= tamanho);
+        let (guardado, aviso) =
+            match crate::checkpoint::carregar::<CheckpointAuditd>(&checkpoint_path) {
+                crate::checkpoint::EstadoDoCheckpoint::Carregado(c)
+                    if c.ficheiro == ficheiro && c.offset <= tamanho =>
+                {
+                    (Some(c), None)
+                }
+                // Existe mas nao serve: e de outro ficheiro, ou aponta para
+                // alem do fim. Nao e corrupcao, mas tambem nao e "nao ha
+                // checkpoint" — o operador tem de saber que se recomecou.
+                crate::checkpoint::EstadoDoCheckpoint::Carregado(_) => {
+                    (None, Some("checkpoint_nao_corresponde".to_string()))
+                }
+                crate::checkpoint::EstadoDoCheckpoint::Ausente => (None, None),
+                crate::checkpoint::EstadoDoCheckpoint::Ilegivel(motivo) => {
+                    tracing::warn!(%motivo, "auditd: checkpoint ilegivel; a recomecar");
+                    (None, Some("checkpoint_ilegivel".to_string()))
+                }
+            };
 
         let (offset, geracao) = match guardado {
             Some(c) => (c.offset, c.geracao),
@@ -157,7 +172,7 @@ impl AuditdAdapter {
             confirmadas: 0,
             ultimo_offset_entregue: None,
             truncados: 0,
-            ultimo_erro: None,
+            ultimo_erro: aviso,
         })
     }
 
@@ -375,7 +390,7 @@ impl SourceAdapter for AuditdAdapter {
         };
         let texto =
             serde_json::to_string(&estado).map_err(|e| AdapterError::InvalidAck(e.to_string()))?;
-        escrever_atomico(&self.checkpoint_path, texto.as_bytes())?;
+        crate::checkpoint::escrever_atomico(&self.checkpoint_path, texto.as_bytes())?;
         self.ultimo_offset_entregue = None;
         Ok(())
     }
@@ -407,18 +422,6 @@ impl SourceAdapter for AuditdAdapter {
             last_error_code: self.ultimo_erro.clone(),
         }
     }
-}
-
-/// Escreve por ficheiro temporário e renomeia.
-///
-/// Um checkpoint escrito por cima do antigo pode ficar a meio se a máquina cair
-/// durante a escrita — e um checkpoint truncado é lido como um offset errado no
-/// arranque seguinte.
-fn escrever_atomico(destino: &Path, dados: &[u8]) -> Result<(), AdapterError> {
-    let temporario = destino.with_extension("tmp");
-    std::fs::write(&temporario, dados)?;
-    std::fs::rename(&temporario, destino)?;
-    Ok(())
 }
 
 #[cfg(test)]

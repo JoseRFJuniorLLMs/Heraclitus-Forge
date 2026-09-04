@@ -7,6 +7,7 @@
 
 pub mod auditd_adapter;
 pub mod buffer_fonte;
+pub mod checkpoint;
 pub mod crc32c;
 pub mod datasource;
 pub mod db;

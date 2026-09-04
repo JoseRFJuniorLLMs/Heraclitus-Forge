@@ -36,7 +36,7 @@
 //! cursor não há checkpoint nenhum. A interpretação da `MESSAGE` e dos campos
 //! do serviço continua a ser da camada de cima.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -253,10 +253,18 @@ impl JournaldAdapter {
     ) -> Result<Self, AdapterError> {
         identity.validate()?;
         let checkpoint_path = checkpoint_path.into();
-        let cursor_confirmado = std::fs::read_to_string(&checkpoint_path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<CheckpointJornal>(&t).ok())
-            .map(|c| c.cursor);
+        let (cursor_confirmado, aviso) =
+            match crate::checkpoint::carregar::<CheckpointJornal>(&checkpoint_path) {
+                crate::checkpoint::EstadoDoCheckpoint::Carregado(c) => (Some(c.cursor), None),
+                crate::checkpoint::EstadoDoCheckpoint::Ausente => (None, None),
+                // Recomecar em silencio a partir de um ficheiro corrompido e
+                // uma decisao grande tomada sem ninguem saber: num jornal com
+                // retencao reprocessa, e o operador tem de poder ver porque.
+                crate::checkpoint::EstadoDoCheckpoint::Ilegivel(motivo) => {
+                    tracing::warn!(%motivo, "journald: checkpoint ilegivel; a recomecar");
+                    (None, Some("checkpoint_ilegivel".to_string()))
+                }
+            };
         Ok(Self {
             identity,
             leitor,
@@ -267,7 +275,7 @@ impl JournaldAdapter {
             confirmadas: 0,
             invalidas: 0,
             ultimo_micros: None,
-            ultimo_erro: None,
+            ultimo_erro: aviso,
         })
     }
 
@@ -385,7 +393,7 @@ impl SourceAdapter for JournaldAdapter {
             cursor: ack.cursor.clone(),
         })
         .map_err(|e| AdapterError::InvalidAck(e.to_string()))?;
-        escrever_atomico(&self.checkpoint_path, texto.as_bytes())?;
+        crate::checkpoint::escrever_atomico(&self.checkpoint_path, texto.as_bytes())?;
         self.cursor_confirmado = Some(ack.cursor);
         self.cursor_pendente = None;
         self.confirmadas = self.confirmadas.saturating_add(1);
@@ -416,13 +424,6 @@ impl SourceAdapter for JournaldAdapter {
             last_error_code: self.ultimo_erro.clone(),
         }
     }
-}
-
-fn escrever_atomico(destino: &Path, dados: &[u8]) -> Result<(), AdapterError> {
-    let temporario = destino.with_extension("tmp");
-    std::fs::write(&temporario, dados)?;
-    std::fs::rename(&temporario, destino)?;
-    Ok(())
 }
 
 #[cfg(test)]
