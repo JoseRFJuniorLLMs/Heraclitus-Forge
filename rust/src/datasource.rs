@@ -238,6 +238,15 @@ pub enum AdmissionStep {
     Compatibilidade,
     /// A spec em si estava malformada; nem se chega a olhar para o artefacto.
     SpecInvalida,
+    /// O órgão desligou este datasource. Não é uma falha de nada.
+    Desactivado,
+    /// O artefacto passou e o adapter é que não subiu: porto ocupado, ficheiro
+    /// inexistente, id duplicado.
+    ///
+    /// Tem etapa própria porque conflacioná-la com [`Self::SpecInvalida`]
+    /// mandaria quem opera procurar um erro de configuração que não existe — a
+    /// spec estava correcta e o conteúdo estava íntegro.
+    ArranqueDoAdapter,
 }
 
 impl AdmissionStep {
@@ -250,7 +259,25 @@ impl AdmissionStep {
             Self::DigestDeclarado => "hcx_digest_declarado",
             Self::Compatibilidade => "hcx_schema_incompativel",
             Self::SpecInvalida => "spec_invalida",
+            Self::Desactivado => "desactivado",
+            Self::ArranqueDoAdapter => "adapter_nao_arrancou",
         }
+    }
+
+    /// Se esta etapa representa um problema com o CONTEÚDO.
+    ///
+    /// Serve para separar o que exige investigação de segurança — pacote
+    /// adulterado, chave errada — do que é operacional ou deliberado. Um alerta
+    /// que trate as duas coisas por igual acaba silenciado.
+    pub fn e_falha_de_conteudo(&self) -> bool {
+        matches!(
+            self,
+            Self::TrustRoot
+                | Self::Manifesto
+                | Self::DigestEAssinatura
+                | Self::DigestDeclarado
+                | Self::Compatibilidade
+        )
     }
 }
 
@@ -332,9 +359,10 @@ pub fn admitir(spec: &DatasourceSpec, artefacto: &Path, generation: u64) -> Admi
         // os dois faria um datasource desligado à mão parecer um pacote rejeitado.
         let mut status = DatasourceStatus::admitido(generation, [0u8; 32]);
         status.state = DatasourceState::Stopped;
+        status.last_error_code = Some(AdmissionStep::Desactivado.codigo().into());
         return AdmissionOutcome::Quarantined {
             status,
-            etapa: AdmissionStep::SpecInvalida,
+            etapa: AdmissionStep::Desactivado,
             motivo: "datasource desactivado no spec".into(),
         };
     }
@@ -508,11 +536,12 @@ impl FabricSupervisor {
                             // contar.
                             let mut falhou = status.clone();
                             falhou.state = DatasourceState::Stopped;
-                            falhou.last_error_code = Some("adapter_nao_arrancou".into());
+                            falhou.last_error_code =
+                                Some(AdmissionStep::ArranqueDoAdapter.codigo().into());
                             self.estados.insert(id, falhou.clone());
                             return AdmissionOutcome::Quarantined {
                                 status: falhou,
-                                etapa: AdmissionStep::SpecInvalida,
+                                etapa: AdmissionStep::ArranqueDoAdapter,
                                 motivo: erro.to_string(),
                             };
                         }
@@ -522,11 +551,12 @@ impl FabricSupervisor {
                     Err(erro) => {
                         let mut falhou = status.clone();
                         falhou.state = DatasourceState::Stopped;
-                        falhou.last_error_code = Some("adapter_nao_arrancou".into());
+                        falhou.last_error_code =
+                            Some(AdmissionStep::ArranqueDoAdapter.codigo().into());
                         self.estados.insert(id, falhou.clone());
                         return AdmissionOutcome::Quarantined {
                             status: falhou,
-                            etapa: AdmissionStep::SpecInvalida,
+                            etapa: AdmissionStep::ArranqueDoAdapter,
                             motivo: erro.to_string(),
                         };
                     }
@@ -778,6 +808,59 @@ mod tests {
         let resultado = admitir(&spec, &artefacto(), 3);
         assert_eq!(resultado.status().state, DatasourceState::Stopped);
         assert!(!resultado.status().deve_arrancar());
+        let AdmissionOutcome::Quarantined { etapa, status, .. } = &resultado else {
+            panic!("desactivado nao arranca");
+        };
+        assert_eq!(*etapa, AdmissionStep::Desactivado);
+        assert_eq!(status.last_error_code.as_deref(), Some("desactivado"));
+        assert!(
+            !etapa.e_falha_de_conteudo(),
+            "nao ha nada de errado com o pacote"
+        );
+    }
+
+    /// As etapas separam o que exige investigacao de seguranca do que e
+    /// operacional ou deliberado. Um alerta que trate as duas coisas por igual
+    /// acaba silenciado, e depois o que se perde e o caso a serio.
+    #[test]
+    fn as_etapas_separam_falha_de_conteudo_de_problema_operacional() {
+        use AdmissionStep::*;
+
+        for e in [
+            TrustRoot,
+            Manifesto,
+            DigestEAssinatura,
+            DigestDeclarado,
+            Compatibilidade,
+        ] {
+            assert!(e.e_falha_de_conteudo(), "{e:?} e um problema do pacote");
+        }
+        for e in [SpecInvalida, Desactivado, ArranqueDoAdapter] {
+            assert!(
+                !e.e_falha_de_conteudo(),
+                "{e:?} nao diz nada sobre o pacote"
+            );
+        }
+
+        // Os codigos tem de ser todos diferentes: dois estados com o mesmo
+        // codigo sao indistinguiveis num alerta.
+        let codigos = [
+            TrustRoot,
+            Manifesto,
+            DigestEAssinatura,
+            DigestDeclarado,
+            Compatibilidade,
+            SpecInvalida,
+            Desactivado,
+            ArranqueDoAdapter,
+        ]
+        .map(|e| e.codigo());
+        let unicos: std::collections::BTreeSet<_> = codigos.iter().collect();
+        assert_eq!(
+            unicos.len(),
+            codigos.len(),
+            "codigos repetidos: {codigos:?}"
+        );
     }
 
     #[test]
@@ -985,6 +1068,18 @@ mod tests {
             Err(AdapterError::InvalidConfig("porto ocupado".into()))
         });
         assert!(!resultado.activou());
+        let AdmissionOutcome::Quarantined { etapa, .. } = &resultado else {
+            panic!("um adapter que nao arranca nao pode contar como activado");
+        };
+        assert_eq!(
+            *etapa,
+            AdmissionStep::ArranqueDoAdapter,
+            "nao e `SpecInvalida`: a spec estava correcta e o conteudo integro"
+        );
+        assert!(
+            !etapa.e_falha_de_conteudo(),
+            "isto nao manda ninguem investigar o pacote"
+        );
         let estado = sup.estado("ds-pg-1").unwrap();
         assert_eq!(estado.state, DatasourceState::Stopped);
         assert_eq!(
