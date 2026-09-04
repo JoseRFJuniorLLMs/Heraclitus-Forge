@@ -16,5 +16,6 @@ pub mod quarantine;
 pub mod raft;
 pub mod runner;
 pub mod source;
+pub mod syslog_adapter;
 pub mod telemetry;
 pub mod wire;
