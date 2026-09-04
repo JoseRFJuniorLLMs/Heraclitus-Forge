@@ -366,10 +366,13 @@ mod tests {
 
     /// Um jornal falso com as mesmas regras do verdadeiro: entrega o que vem
     /// DEPOIS do cursor dado, por ordem, ate ao limite.
+    /// O que o falso regista de cada chamada: o cursor pedido e o limite.
+    type PedidosRegistados = Arc<Mutex<Vec<(Option<String>, usize)>>>;
+
     #[derive(Clone, Default)]
     struct JornalFalso {
         entradas: Arc<Mutex<Vec<String>>>,
-        pedidos: Arc<Mutex<Vec<(Option<String>, usize)>>>,
+        pedidos: PedidosRegistados,
         falhar: Arc<Mutex<bool>>,
     }
 
