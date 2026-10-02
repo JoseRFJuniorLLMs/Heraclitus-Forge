@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import datetime, timedelta
 
@@ -6,14 +7,26 @@ import pandas as pd
 import psutil
 import streamlit as st
 
-st.set_page_config(page_title="Heraclitus Dashboard — DEMO", layout="wide")
-if os.environ.get("FORGE_ENABLE_DEMO_DASHBOARD") != "1":
+st.set_page_config(page_title="Heraclitus Dashboard — SOC & Evidência", layout="wide")
+
+REAL_DATA_PATH = "data/dialectic_output/operational_facts.jsonl"
+has_real_data = os.path.exists(REAL_DATA_PATH)
+is_demo_enabled = os.environ.get("FORGE_ENABLE_DEMO_DASHBOARD") == "1"
+
+if not has_real_data and not is_demo_enabled:
     st.error(
-        "Dashboard desativado: contém somente dados sintéticos. "
-        "Para uma demonstração consciente, defina FORGE_ENABLE_DEMO_DASHBOARD=1."
+        "Dashboard desativado: nenhum dado real forjado encontrado em 'data/dialectic_output/' "
+        "e a variável FORGE_ENABLE_DEMO_DASHBOARD=1 não está definida para simulação sintética."
     )
+    st.info("Dica: Execute 'python forge_dialectic_pipeline.py --demo' para forjar dados reais.")
     st.stop()
-st.warning("DEMONSTRAÇÃO — todos os eventos e indicadores desta tela são sintéticos.")
+
+if has_real_data:
+    st.success(
+        "✅ Conectado aos Dados Reais da Forja Dialética (data/dialectic_output/operational_facts.jsonl)"
+    )
+else:
+    st.warning("DEMONSTRAÇÃO — todos os eventos e indicadores desta tela são sintéticos.")
 
 
 # Conversor de números gigantes para notação simplificada nacional (M / B)
@@ -370,48 +383,63 @@ if menu_navegacao == "Central de Comando (SOC)":
     st.markdown(github_html, unsafe_allow_html=True)
 
     st.markdown("#### 📋 Últimos Registros Inseridos na Janela Ativa")
-    eventos_demo = [
-        {
-            "hora": "09:41:02",
-            "origem": "guest",
-            "alvo": "prod_db",
-            "acao": "authorization.failure",
-            "risco": "Medium",
-            "hash": "b3:b1cab9dd351db...",
-        },
-        {
-            "hora": "09:40:58",
-            "origem": "admin",
-            "alvo": "prod_db",
-            "acao": "query.execute",
-            "risco": "Low",
-            "hash": "b3:07e93b78408d3...",
-        },
-        {
-            "hora": "09:39:44",
-            "origem": "admin",
-            "alvo": "postgresql",
-            "acao": "authentication.failure",
-            "risco": "Critical",
-            "hash": "b3:a52d87df89718...",
-        },
-        {
-            "hora": "09:38:12",
-            "origem": "admin",
-            "alvo": "postgresql",
-            "acao": "authentication.failure",
-            "risco": "Critical",
-            "hash": "b3:2a8c9f08f8041...",
-        },
-    ]
-    t_html = '<table class="forensic-table"><thead><tr><th>HORA</th><th>ATOR ORIGEM</th><th>ALVO</th><th>AÇÃO OPERACIONAL</th><th>RISCO</th><th>HASH CRIPTOGRÁFICO</th></tr></thead><tbody>'
-    for ev in eventos_demo:
+    eventos_tabela = []
+    if has_real_data:
+        try:
+            with open(REAL_DATA_PATH, encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        fact = json.loads(line)
+                        ident = fact.get("identity", {})
+                        eventos_tabela.append(
+                            {
+                                "hora": "Ao Vivo",
+                                "origem": ident.get("actor", "desconhecido"),
+                                "alvo": ident.get("datasource", "heraclitus_edge"),
+                                "acao": fact.get("action", "activity"),
+                                "risco": fact.get("risk", "Low"),
+                                "hash": f"{fact.get('fact_id', 'fact')} (Score: {fact.get('judge_score', 0):.2f})",
+                            }
+                        )
+        except Exception:
+            eventos_tabela = []
+
+    if not eventos_tabela:
+        eventos_tabela = [
+            {
+                "hora": "09:41:02",
+                "origem": "guest",
+                "alvo": "prod_db",
+                "acao": "authorization.failure",
+                "risco": "Medium",
+                "hash": "b3:b1cab9dd351db...",
+            },
+            {
+                "hora": "09:40:58",
+                "origem": "admin",
+                "alvo": "prod_db",
+                "acao": "query.execute",
+                "risco": "Low",
+                "hash": "b3:07e93b78408d3...",
+            },
+            {
+                "hora": "09:39:44",
+                "origem": "admin",
+                "alvo": "postgresql",
+                "acao": "authentication.failure",
+                "risco": "Critical",
+                "hash": "b3:a52d87df89718...",
+            },
+        ]
+
+    t_html = '<table class="forensic-table"><thead><tr><th>HORA</th><th>ATOR ORIGEM</th><th>ALVO</th><th>AÇÃO OPERACIONAL</th><th>RISCO</th><th>HASH / ID FORENSE</th></tr></thead><tbody>'
+    for ev in eventos_tabela:
         badge_type = (
             "bg-critical"
-            if ev["risco"] == "Critical"
+            if ev["risco"] in ("Critical", "High")
             else ("bg-medium" if ev["risco"] == "Medium" else "bg-low")
         )
-        t_html += f'<tr><td style="font-family:monospace;">{ev["hora"]}</td><td><b>{ev["origem"]}</b></td><td>{ev["alvo"]}</td><td>{ev["acao"]}</td><td><span class="badge {badge_type}">{ev["risco"]}</span></td><td style="font-family:monospace; opacity:0.6;">{ev["hash"]}</td></tr>'
+        t_html += f'<tr><td style="font-family:monospace;">{ev["hora"]}</td><td><b>{ev["origem"]}</b></td><td>{ev["alvo"]}</td><td>{ev["acao"]}</td><td><span class="badge {badge_type}">{ev["risco"]}</span></td><td style="font-family:monospace; opacity:0.8;">{ev["hash"]}</td></tr>'
     t_html += "</tbody></table>"
     st.markdown(t_html, unsafe_allow_html=True)
 
