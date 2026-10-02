@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/heraclitus-forge-logo.svg" alt="Heraclitus Forge" width="100%" />
+</p>
+
 # Heraclitus-Forge
 
 O Heraclitus-Forge 2.0 transforma logs em **Fatos Operacionais** determinísticos,
