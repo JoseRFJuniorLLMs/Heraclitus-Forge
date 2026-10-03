@@ -34,7 +34,7 @@ fonte/collector -> Runner Rust -> .hdb assinado -> export_facts
                        |                              |
                        +-> quarentena .hq             +-> JSONL versionado
                                                            |
-                                      bridge.py -> gRPC -> HeraclitusDB
+                                   bridge (Rust) -> gRPC -> HeraclitusDB
 ```
 
 O contrato está em [INTEGRATION_CONTRACT.md](INTEGRATION_CONTRACT.md):
@@ -145,8 +145,9 @@ do conteúdo do log, e o `forge_lsn` do evento é confirmado contra o LSN que a
 escrita devolveu: se divergirem, o ingestor pára em vez de gravar uma cadeia de
 custódia que não se sustenta.
 
-A ponte valida o evento e recusa um que descreva outra observação, outra regra
-ou outro conector.
+A ponte Rust valida o evento e recusa um que descreva outra observação, outra
+regra ou outro conector. O antigo `bridge.py` permanece apenas como caminho de
+compatibilidade; produção nova usa o binário `bridge`.
 
 ## Instalação reproduzível
 
@@ -154,7 +155,6 @@ Python de CI: 3.12. O lock contém versões e hashes.
 
 ```powershell
 uv pip sync --python 3.12 --require-hashes requirements.lock
-uv pip install -e ..\HeraclitusDB\sdk\python
 cd rust
 cargo build --release --bins --locked
 ```
@@ -254,23 +254,29 @@ explícito para quem quer o histórico.
 > linhas. É o compromisso certo aqui: num sistema de auditoria, repetir é
 > recuperável, perder não é.
 
-Para a ponte, configure caminhos explícitos, segredo HMAC do titular e
-chave da quarentena; faça primeiro o dry-run:
+Para a ponte de produção, configure caminhos explícitos, segredo HMAC do
+titular e chave da quarentena; faça primeiro o dry-run:
 
 ```powershell
-$env:HERACLITUS_ARTIFACT = 'D:\seguro\registry\postgresql'
-$env:HERACLITUS_SAMPLE = 'D:\entrada\cliente.log'
 $env:HERACLITUS_DB_PATH = 'D:\dados\cliente\edge.hdb'
-$env:FORGE_QUARANTINE_PATH = 'D:\dados\cliente\quarantine.hq'
 $env:FORGE_QUARANTINE_KEY = '<64 hex em cofre>'
 $env:FORGE_SUBJECT_HMAC_KEY = '<segredo >= 32 bytes em cofre>'
 $env:HERACLITUS_TOKEN_FILE = 'D:\seguro\heraclitus\writer.token'
 
-python bridge.py --hdb $env:HERACLITUS_DB_PATH
-python bridge.py --hdb $env:HERACLITUS_DB_PATH --apply
+cd rust
+cargo run --release --bin bridge -- --hdb $env:HERACLITUS_DB_PATH
+cargo run --release --bin bridge -- --hdb $env:HERACLITUS_DB_PATH --apply
+
+# operação 24x7: só cria snapshot quando a âncora HDB2 avança
+cargo run --release --bin bridge -- --hdb $env:HERACLITUS_DB_PATH --apply --follow
 ```
 
-Fora de loopback, a ponte recusa plaintext e exige
+O caminho quente agora é integralmente Rust: HDB2/HFB2 → validação → mapeamento
+→ gRPC Append → ACK → checkpoint. `export_facts` continua para JSONL,
+auditoria, air-gap e integrações externas; `bridge.py` fica como compatibilidade
+legada e não é necessário numa implantação nova.
+
+Fora de loopback, a bridge Rust recusa plaintext e exige
 `HERACLITUS_TLS_CA`; para mTLS, configure também `HERACLITUS_TLS_CERT` e
 `HERACLITUS_TLS_KEY`.
 
