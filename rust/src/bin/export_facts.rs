@@ -100,9 +100,7 @@ fn main() -> ExitCode {
             }
         }
 
-        if let Err(error) =
-            serde_json::to_writer(&mut out, &line).map_err(std::io::Error::from)
-        {
+        if let Err(error) = serde_json::to_writer(&mut out, &line).map_err(std::io::Error::from) {
             write_error = Some(error);
             return false;
         }

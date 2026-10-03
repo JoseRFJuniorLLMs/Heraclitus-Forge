@@ -157,10 +157,7 @@ fn host_from_addr(addr: &str) -> String {
 
 fn is_loopback(addr: &str) -> bool {
     let host = host_from_addr(addr).to_ascii_lowercase();
-    host == "localhost"
-        || host == "127.0.0.1"
-        || host == "::1"
-        || host.starts_with("127.")
+    host == "localhost" || host == "127.0.0.1" || host == "::1" || host.starts_with("127.")
 }
 
 fn endpoint(addr: &str, tls: bool) -> String {
@@ -209,8 +206,7 @@ async fn connect_destination(args: &Args) -> Result<Client> {
 
     let connect_timeout = Duration::from_secs(10);
     let mut client = if let Some(ca_path) = ca {
-        let ca_pem = fs::read(&ca_path)
-            .with_context(|| format!("ler CA TLS {ca_path}"))?;
+        let ca_pem = fs::read(&ca_path).with_context(|| format!("ler CA TLS {ca_path}"))?;
         let identity = match (cert, key) {
             (Some(cert), Some(key)) => Some((
                 fs::read(&cert).with_context(|| format!("ler certificado {cert}"))?,
@@ -218,8 +214,8 @@ async fn connect_destination(args: &Args) -> Result<Client> {
             )),
             _ => None,
         };
-        let domain = env::var("HERACLITUS_TLS_SERVER_NAME")
-            .unwrap_or_else(|_| host_from_addr(&args.addr));
+        let domain =
+            env::var("HERACLITUS_TLS_SERVER_NAME").unwrap_or_else(|_| host_from_addr(&args.addr));
         Client::connect_tls(
             endpoint(&args.addr, true),
             ca_pem,
@@ -280,11 +276,7 @@ async fn append_with_retry(
             ..AppendOptions::default()
         };
         match client
-            .append_with_result(
-                &episode.agent_id,
-                episode.content.as_bytes(),
-                options,
-            )
+            .append_with_result(&episode.agent_id, episode.content.as_bytes(), options)
             .await
         {
             Ok(response) => return Ok(response),
@@ -390,8 +382,8 @@ async fn bridge_pass(
                     quarantine_invalid(quarantine, lsn, &errors, &payload)?;
                     bail!("{}", errors.join("; "));
                 }
-                let episode = map_telemetry(lsn, &identity, &envelope)
-                    .map_err(anyhow::Error::msg)?;
+                let episode =
+                    map_telemetry(lsn, &identity, &envelope).map_err(anyhow::Error::msg)?;
                 let (identity_key, key) = telemetry_event_identity(lsn, &attestation);
                 (
                     episode,
@@ -427,8 +419,7 @@ async fn bridge_pass(
         let db = client
             .as_mut()
             .context("cliente HeraclitusDB não inicializado")?;
-        let response =
-            append_with_retry(db, &episode, idempotency_key, args.max_retries).await?;
+        let response = append_with_retry(db, &episode, idempotency_key, args.max_retries).await?;
 
         if response.deduplicated {
             deduplicated += 1;
@@ -483,9 +474,9 @@ async fn main() -> Result<()> {
 
     let secret = match env::var(SUBJECT_HMAC_ENV) {
         Ok(value) if value.as_bytes().len() >= 32 => value.into_bytes(),
-        _ if args.apply => bail!(
-            "{SUBJECT_HMAC_ENV} é obrigatório em --apply e deve ter ao menos 32 bytes"
-        ),
+        _ if args.apply => {
+            bail!("{SUBJECT_HMAC_ENV} é obrigatório em --apply e deve ter ao menos 32 bytes")
+        }
         _ => b"forge-insecure-dry-run-only".to_vec(),
     };
 
@@ -513,7 +504,10 @@ async fn main() -> Result<()> {
     };
 
     let state = load_state(&args.state).context("ler checkpoint")?;
-    let previous = state.get(&state_key(&args.hdb)).cloned().unwrap_or_default();
+    let previous = state
+        .get(&state_key(&args.hdb))
+        .cloned()
+        .unwrap_or_default();
     let mut from_lsn = if args.reset { 0 } else { previous.last_lsn };
     let mut last_event_id = if args.reset {
         String::new()
@@ -534,7 +528,11 @@ async fn main() -> Result<()> {
     println!("  retoma : LSN > {from_lsn}");
     println!(
         "  modo   : {}\n",
-        if args.follow { "contínuo" } else { "uma passagem" }
+        if args.follow {
+            "contínuo"
+        } else {
+            "uma passagem"
+        }
     );
 
     let mut total_new = 0u64;

@@ -157,12 +157,12 @@ pub fn session_of(fact: &Value, secret: &[u8]) -> String {
 }
 
 pub fn render_content(fact: &Value) -> String {
-    let actor = text_at(fact, &["fact.identity", "actor.name"])
-        .unwrap_or_else(|| "unknown".to_string());
-    let target = text_at(fact, &["fact.identity", "target.id"])
-        .unwrap_or_else(|| "unknown".to_string());
-    let action = text_at(fact, &["fact.behavior", "action"])
-        .unwrap_or_else(|| "unknown".to_string());
+    let actor =
+        text_at(fact, &["fact.identity", "actor.name"]).unwrap_or_else(|| "unknown".to_string());
+    let target =
+        text_at(fact, &["fact.identity", "target.id"]).unwrap_or_else(|| "unknown".to_string());
+    let action =
+        text_at(fact, &["fact.behavior", "action"]).unwrap_or_else(|| "unknown".to_string());
     let source = text_at(fact, &["fact.identity", "source.ip"]);
     match source {
         Some(source) => format!("{actor} executed {action} on {target} from {source}"),
@@ -185,7 +185,10 @@ pub fn map_fact(lsn: u64, fact: &Value, attestation: &Value, secret: &[u8]) -> E
         ("action_class", &["fact.behavior", "class"][..]),
         ("risk_level", &["fact.behavior", "risk_level"][..]),
         ("system_timestamp", &["fact.time", "system_timestamp"][..]),
-        ("evidence_hash", &["fact.evidence", "raw_observation_hash"][..]),
+        (
+            "evidence_hash",
+            &["fact.evidence", "raw_observation_hash"][..],
+        ),
         (
             "carimbo_tempo_legal",
             &["fact.evidence", "carimbo_tempo_legal"][..],
@@ -297,8 +300,7 @@ pub fn map_fact(lsn: u64, fact: &Value, attestation: &Value, secret: &[u8]) -> E
 fn positive_integer(value: Option<&Value>) -> bool {
     match value {
         Some(Value::Number(number)) => {
-            number.as_u64().is_some_and(|v| v > 0)
-                || number.as_i64().is_some_and(|v| v > 0)
+            number.as_u64().is_some_and(|v| v > 0) || number.as_i64().is_some_and(|v| v > 0)
         }
         _ => false,
     }
@@ -379,7 +381,11 @@ pub fn validate_security(fact: &Value) -> Vec<String> {
 
     if let Some(evidence) = text_at(fact, &["fact.evidence", "raw_observation_hash"]) {
         if let Some(stripped) = evidence.strip_prefix("b3:") {
-            if provenance.get("raw_observation_hash").and_then(Value::as_str) != Some(stripped) {
+            if provenance
+                .get("raw_observation_hash")
+                .and_then(Value::as_str)
+                != Some(stripped)
+            {
                 errors.push("evento canónico aponta para outra observação".to_string());
             }
         }
@@ -425,10 +431,7 @@ pub fn validate_fact(lsn: u64, fact: &Value, attestation: &Value) -> Vec<String>
             "fact.behavior.action",
             at(fact, &["fact.behavior", "action"]),
         ),
-        (
-            "fact.behavior.class",
-            at(fact, &["fact.behavior", "class"]),
-        ),
+        ("fact.behavior.class", at(fact, &["fact.behavior", "class"])),
         (
             "fact.evidence.raw_observation_hash",
             at(fact, &["fact.evidence", "raw_observation_hash"]),
@@ -464,18 +467,10 @@ pub fn validate_fact(lsn: u64, fact: &Value, attestation: &Value) -> Vec<String>
     if attestation["destination_api"].as_str() != Some(DESTINATION_API_VERSION) {
         errors.push("API de destino incompatível".to_string());
     }
-    if attestation["public_key"]
-        .as_str()
-        .map_or(0, str::len)
-        != 64
-    {
+    if attestation["public_key"].as_str().map_or(0, str::len) != 64 {
         errors.push("chave pública Ed25519 inválida".to_string());
     }
-    if attestation["anchor_signature"]
-        .as_str()
-        .map_or(0, str::len)
-        != 128
-    {
+    if attestation["anchor_signature"].as_str().map_or(0, str::len) != 128 {
         errors.push("assinatura Ed25519 da âncora inválida".to_string());
     }
     if attestation["source_id"]
@@ -511,19 +506,11 @@ pub fn map_telemetry(
     insert_owned(&mut attrs, "telemetry.schema", TELEMETRY_SCHEMA_VERSION);
     insert_owned(&mut attrs, "telemetry.event_type", event_type);
     insert_owned(&mut attrs, "tenant_id", identity.tenant_id.clone());
-    insert_owned(
-        &mut attrs,
-        "datasource_id",
-        identity.datasource_id.clone(),
-    );
+    insert_owned(&mut attrs, "datasource_id", identity.datasource_id.clone());
     insert_owned(&mut attrs, "sensor_id", identity.sensor_id.clone());
     insert_owned(&mut attrs, "producer", PRODUCER);
     insert_owned(&mut attrs, "forge_lsn", lsn.to_string());
-    insert_owned(
-        &mut attrs,
-        "generated_by",
-        "heraclitus_forge_bridge_rust",
-    );
+    insert_owned(&mut attrs, "generated_by", "heraclitus_forge_bridge_rust");
 
     Ok(Episode {
         kind: TELEMETRY_KIND.to_string(),
