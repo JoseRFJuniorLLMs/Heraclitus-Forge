@@ -3,7 +3,7 @@ blake3>=1.0
 # Assinatura ed25519 dos artefatos .hcx (forge_sign.py, Marco B)
 cryptography>=42.0
 # Quarentena XChaCha20-Poly1305 interoperável com o utilitário Rust.
-PyNaCl>=1.5.0
+PyNaCl>=1.6.2
 # Transporte da ponte. O pacote `heraclitusdb==1.0.5` é instalado a partir do
 # checkout/wheel privado do HeraclitusDB; ele não é publicado implicitamente.
 grpcio>=1.80
