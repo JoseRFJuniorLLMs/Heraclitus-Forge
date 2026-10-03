@@ -50,10 +50,15 @@ path = "src/bin/fabric.rs"
 name = "coverage"
 path = "src/bin/coverage.rs"
 
-# Ponte Forge -> HeraclitusDB: exporta os Fatos do .hdb em JSON Lines
+# Exportador offline/auditoria: HDB2 -> JSONL.
 [[bin]]
 name = "export_facts"
 path = "src/bin/export_facts.rs"
+
+# Ponte de produção: HDB2 -> gRPC HeraclitusDB, 100% Rust.
+[[bin]]
+name = "bridge"
+path = "src/bin/bridge.rs"
 
 # Marco D: ingestor real (segue um ficheiro de log ao vivo)
 [[bin]]
@@ -102,6 +107,10 @@ tracing-appender = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 axum = "0.7"
 tempfile = "3"
+fs2 = "0.4" # lock cross-platform do checkpoint da bridge
+# SDK Rust oficial do HeraclitusDB, pinado para que o contrato gRPC seja
+# reproduzível e não dependa de uma versão flutuante do repositório irmão.
+heraclitus-client = { git = "https://github.com/JoseRFJuniorLLMs/HeraclitusDB", rev = "cda5ba5e332a023a39aa1e35eb5b390e989103ab", package = "heraclitus-client" }
 
 # SPEC-0071 §5.2 P0 #3 — syslog sobre TLS com mTLS opcional.
 # Provider `ring` e nao o `aws-lc-rs` por omissao: o segundo exige cmake e nasm

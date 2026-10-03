@@ -5,7 +5,9 @@
 | Componente | Versão |
 | --- | --- |
 | Heraclitus-Forge | `2.0.x` |
-| HeraclitusDB e SDK Python | `1.0.5` |
+| HeraclitusDB API | `heraclitus.v1` |
+| SDK Rust de produção | `heraclitus-client` pinado em `cda5ba5e332a023a39aa1e35eb5b390e989103ab` |
+| SDK Python legado | `1.0.5` (compatibilidade de `bridge.py`) |
 | Envelope JSONL | `forge-heraclitusdb/2` |
 | Fato canônico | `operational-fact/1.0` |
 | API gRPC | `heraclitus.v1` |
@@ -18,8 +20,10 @@ do primeiro `Append`.
 
 1. `export_facts` copia uma fotografia privada do `.hdb` e sidecars.
 2. Verifica CRC-32C, cadeia BLAKE3, chave pública fixada e assinatura Ed25519.
-3. Emite JSONL estrito em ordem crescente de LSN com atestado repetido por fato.
-4. `bridge.py` valida contrato, campos obrigatórios e atestado.
+3. A bridge Rust lê o snapshot HDB2 diretamente, sem JSONL intermediário, e
+   valida contrato, campos obrigatórios e atestado antes do primeiro `Append`.
+   O `export_facts` continua a emitir JSONL estrito para auditoria/offline.
+4. A bridge usa o SDK Rust oficial `heraclitus-client` sobre `heraclitus.v1`.
 5. Identifica o titular por HMAC-SHA-256 de `actor.id`; o valor bruto não entra
    no seletor de chave do HeraclitusDB.
 6. Pseudonimiza `session_id` por HMAC com domínio `session`; a versão de
@@ -28,6 +32,9 @@ do primeiro `Append`.
    `SHA-256("forge:" + source_id + ":" + lsn + ":" + fact_id)`.
 8. Só avança o checkpoint local após o ACK. Se cair entre ACK e checkpoint, o
    retry retorna o mesmo `event_id`/LSN com `deduplicated=true`.
+9. Em `--follow`, a bridge observa apenas o LSN da âncora até haver trabalho;
+   então cria snapshot verificado, faz preflight sem rede e envia com canal
+   limitado, preservando backpressure.
 
 ## Campos de custódia preservados
 

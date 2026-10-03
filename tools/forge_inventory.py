@@ -30,6 +30,7 @@ BINARY_CLASS = {
     "fabric": "demo",
     "coverage": "production",
     "export_facts": "production",
+    "bridge": "production",
     "ingest": "production",
     "quarantine": "production",
     # Harness de fuzzing do descodificador HFB2: existe para ser corrido contra

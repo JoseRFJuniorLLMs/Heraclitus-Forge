@@ -4,3 +4,6 @@
 pip-audit>=2.9
 pytest>=8.0
 ruff>=0.12
+
+# PYSEC-2026-4175/4176/4177 corrigidos em 2.8.0.
+urllib3>=2.8.0
