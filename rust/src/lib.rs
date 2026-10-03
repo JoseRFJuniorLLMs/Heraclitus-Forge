@@ -6,6 +6,7 @@
 //! lendo os artefatos `.hcx` ja homologados.
 
 pub mod auditd_adapter;
+pub mod bridge;
 pub mod buffer_fonte;
 pub mod checkpoint;
 pub mod crc32c;
@@ -13,6 +14,7 @@ pub mod datasource;
 pub mod db;
 pub mod enquadramento;
 pub mod error;
+pub mod export;
 pub mod fact;
 pub mod hcx;
 pub mod hfb2;
