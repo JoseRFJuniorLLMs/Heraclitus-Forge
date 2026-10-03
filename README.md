@@ -6,8 +6,8 @@
 
 O Heraclitus-Forge 2.0 transforma logs em **Fatos Operacionais** determinísticos,
 assina a cadeia de custódia na borda e envia os fatos ao HeraclitusDB sem
-duplicação. O runtime de ingestão é Rust; compilação de conectores, CKE e a ponte
-gRPC são ferramentas Python fora do caminho crítico.
+duplicação. O runtime de ingestão e a ponte gRPC de produção são Rust; Python
+permanece apenas em ferramentas auxiliares de compilação, CKE e compatibilidade.
 
 ## Limite do produto
 
@@ -19,8 +19,8 @@ gRPC são ferramentas Python fora do caminho crítico.
   domínio + âncora Ed25519 na camada criptográfica. Ficheiros da geração
   anterior (HDB1) são **recusados por nome**, sem migração automática — ver
   [md/HDB2-HFB2.md](md/HDB2-HFB2.md). O HeraclitusDB em rede usa segmentos
-  `HRKL`/`HFTR`; os formatos não são intercambiáveis e `export_facts` +
-  `bridge.py` é a fronteira oficial.
+  `HRKL`/`HFTR`; os formatos não são intercambiáveis. A fronteira oficial de
+  produção é a `bridge` Rust; `export_facts` permanece para auditoria/offline.
 - `tenant_id`, `datasource_id` e `sensor_id` são campos autenticados de todo o
   registo, não metadados opcionais: alterá-los muda a folha e a raiz Merkle. Não
   existe valor por omissão para eles, e o ingestor recusa arrancar sem os três.
