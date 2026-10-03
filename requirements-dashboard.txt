@@ -4,6 +4,6 @@
 # FORGE_ENABLE_DEMO_DASHBOARD=1 não for definido.
 GPUtil>=1.4
 numpy>=2.0
-pandas>=2.2
+pandas>=2.3.3
 psutil>=6.0
 streamlit>=1.40
