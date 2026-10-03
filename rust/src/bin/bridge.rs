@@ -473,7 +473,7 @@ async fn main() -> Result<()> {
     }
 
     let secret = match env::var(SUBJECT_HMAC_ENV) {
-        Ok(value) if value.as_bytes().len() >= 32 => value.into_bytes(),
+        Ok(value) if value.len() >= 32 => value.into_bytes(),
         _ if args.apply => {
             bail!("{SUBJECT_HMAC_ENV} é obrigatório em --apply e deve ter ao menos 32 bytes")
         }
