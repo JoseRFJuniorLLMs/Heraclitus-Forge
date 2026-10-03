@@ -320,10 +320,10 @@ pub fn validate_security(fact: &Value) -> Vec<String> {
     if !category.is_some_and(|value| SECURITY_CATEGORIES.contains(&value)) {
         errors.push(format!("categoria fora do vocabulário v1: {category:?}"));
     }
-    if !security
+    if security
         .get("event_type")
         .and_then(Value::as_str)
-        .is_some_and(|value| !value.trim().is_empty())
+        .is_none_or(|value| value.trim().is_empty())
     {
         errors.push("fact.security.event_type ausente".to_string());
     }
@@ -338,10 +338,10 @@ pub fn validate_security(fact: &Value) -> Vec<String> {
         _ => errors.push("fact.security.severity fora da escala 0..10".to_string()),
     }
     for field in ["tenant_id", "datasource_id", "sensor_id"] {
-        if !security
+        if security
             .get(field)
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_none_or(|value| value.trim().is_empty())
         {
             errors.push(format!("fact.security.{field} ausente"));
         }
@@ -368,10 +368,10 @@ pub fn validate_security(fact: &Value) -> Vec<String> {
         "raw_observation_hash",
         "matched_rule",
     ] {
-        if !provenance
+        if provenance
             .get(field)
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_none_or(|value| value.trim().is_empty())
         {
             errors.push(format!("fact.security.provenance.{field} ausente"));
         }
@@ -478,12 +478,12 @@ pub fn validate_fact(lsn: u64, fact: &Value, attestation: &Value) -> Vec<String>
     {
         errors.push("assinatura Ed25519 da âncora inválida".to_string());
     }
-    if !attestation["source_id"]
+    if attestation["source_id"]
         .as_str()
-        .is_some_and(|value| !value.is_empty())
-        || !attestation["verified_root"]
+        .is_none_or(|value| value.is_empty())
+        || attestation["verified_root"]
             .as_str()
-            .is_some_and(|value| !value.is_empty())
+            .is_none_or(|value| value.is_empty())
     {
         errors.push("identidade/raiz verificadas da origem ausentes".to_string());
     }
@@ -556,11 +556,11 @@ pub fn validate_telemetry(
             if parsed["schema"].as_str() != Some(TELEMETRY_SCHEMA_VERSION) {
                 errors.push("schema de telemetria incompatível".to_string());
             }
-            if !parsed
+            if parsed
                 .get("event")
                 .and_then(|event| event.get("type"))
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
+                .is_none_or(|value| value.is_empty())
             {
                 errors.push("envelope sem tipo de evento".to_string());
             }
@@ -716,6 +716,7 @@ impl StateLock {
         }
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)?;
