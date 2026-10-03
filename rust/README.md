@@ -1,10 +1,10 @@
 # heraclitus-forge (Rust) — runtime nativo line-rate
 
-Porte para Rust do **caminho quente de produção**: o **Runner** (transformação
-line-rate) e o **HeraclitusDB** (append-only). O **Forge** (compilação de
-conhecimento, com IA) permanece em Python — como manda a spec, a esteira de IA é
-isolada do runtime determinístico. O runtime Rust apenas **lê os artefatos `.hcx`**
-já compilados e homologados.
+Porte para Rust do **caminho quente de produção**: coleta, **Runner**
+(transformação line-rate), HDB2 e agora a **bridge gRPC** para o HeraclitusDB.
+O **Forge de design-time** (compilação de conhecimento, CKE e IA) permanece em
+Python; a esteira de IA fica isolada do runtime determinístico. Em produção,
+Python não participa do caminho quente.
 
 ```
 Forge (Python, design-time)  ──>  .hcx  ──>  Runner + HeraclitusDB (Rust, runtime)
